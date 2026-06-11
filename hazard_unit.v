@@ -19,9 +19,8 @@ module hazard_unit (
 );
     always @(*) begin
         // Load-use stall
-        stall = (id_ex_wb_sel == 2'b01) &&
+        stall = (id_ex_wb_sel == 2'b01) && (id_ex_rd != 5'b0) &&
                 ((id_ex_rd == if_id_rs1) || (id_ex_rd == if_id_rs2));
-
         // Branch flush
         flush = pc_sel;
 

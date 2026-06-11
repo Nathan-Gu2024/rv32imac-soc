@@ -135,7 +135,6 @@
 module cpu_pipelined ( 
     input wire clk, rst
 );
-    wire pc_sel;
     // IF 
     wire [31:0] pc, if_inst;
 
@@ -144,7 +143,7 @@ module cpu_pipelined (
 
     // ID
     wire [31:0] rs1_data, rs2_data, imm;
-    wire pc_sel, reg_wen, br_un, a_sel, b_sel, mem_rw, br_eq, br_lt;
+    wire pc_sel, reg_wen, a_sel, b_sel, mem_rw;
     wire [1:0] wb_sel;
     wire [2:0] imm_sel;
     wire [3:0] alu_sel;
@@ -185,6 +184,7 @@ module cpu_pipelined (
         .clk(clk), 
         .rst(rst),
         .stall(stall), 
+        .pc_sel(pc_sel), 
         .mem_address(alu_out), 
         .pc(pc)
     );
@@ -198,7 +198,7 @@ module cpu_pipelined (
         .clk(clk), 
         .rst(rst), 
         .stall(stall), 
-        .flush(flush), 
+        .flush(pc_sel), 
         .pc_in(pc), 
         .inst_in(if_inst), 
         .pc_out(if_id_pc),
@@ -208,12 +208,8 @@ module cpu_pipelined (
     // ID
     control_logic CL (
         .inst(if_id_inst), 
-        .br_eq(br_eq), 
-        .br_lt(br_lt), 
-        .pc_sel(pc_sel),
         .reg_wen(reg_wen), 
         .imm_sel(imm_sel), 
-        .br_un(br_un), 
         .a_sel(a_sel), 
         .b_sel(b_sel),
         .alu_sel(alu_sel),
@@ -238,30 +234,20 @@ module cpu_pipelined (
         .imm(imm)
     );
 
-    branch_comp BC (
-        .br_data1(rs1_data),
-        .br_data2(rs2_data),
-        .br_un(br_un),
-        .br_eq(br_eq),
-        .br_lt(br_lt)
-    );
-
-    id_ex_reg ID_EX (
+id_ex_reg ID_EX (
         .clk(clk), 
         .rst(rst),
-        .stall(1'b0), 
+        .flush(pc_sel || stall), // Connected to .flush instead of .stall
         .pc_in(if_id_pc), 
         .rs1_in(rs1_data), 
         .rs2_in(rs2_data),
         .imm_in(imm), 
-        .imm_sel_in(imm_sel),
         .rd_in(if_id_inst[11:7]),
         .inst_in(if_id_inst),
         .reg_wen_in(reg_wen), 
         .mem_rw_in(mem_rw),
         .a_sel_in(a_sel), 
         .b_sel_in(b_sel), 
-        .br_un_in(br_un),
         .wb_sel_in(wb_sel),
         .alu_sel_in(alu_sel), 
         .pc_out(id_ex_pc), 
@@ -276,9 +262,60 @@ module cpu_pipelined (
         .b_sel_out(id_ex_b_sel), 
         .wb_sel_out(id_ex_wb_sel), 
         .alu_sel_out(id_ex_alu_sel)
-    ); 
+    );
 
     // EX 
+    // Forwarding
+    assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_alu :
+                    (fwd_a == 2'b10) ? wb_data : 
+                    id_ex_rs1;
+
+    assign fwd_rs2 = (fwd_b == 2'b01) ? ex_mem_alu :
+                    (fwd_b == 2'b10) ? wb_data : 
+                    id_ex_rs2;
+    
+    assign alu_a = id_ex_a_sel ? id_ex_pc : fwd_rs1;
+    assign alu_b = id_ex_b_sel ? id_ex_imm : fwd_rs2;
+
+    alu ALU (
+        .a(alu_a), 
+        .b(alu_b),
+        .alu_sel(id_ex_alu_sel),
+        .alu_res(alu_out)
+    );
+
+    wire [6:0] ex_opcode = id_ex_inst[6:0];
+    wire [2:0] ex_funct3 = id_ex_inst[14:12];
+
+    wire id_ex_is_branch = (ex_opcode == 7'b1100011);
+    wire id_ex_is_beq    = id_ex_is_branch && (ex_funct3 == 3'b000);
+    wire id_ex_is_bne    = id_ex_is_branch && (ex_funct3 == 3'b001);
+    wire id_ex_is_blt    = id_ex_is_branch && (ex_funct3 == 3'b100);
+    wire id_ex_is_bge    = id_ex_is_branch && (ex_funct3 == 3'b101);
+    wire id_ex_is_bltu   = id_ex_is_branch && (ex_funct3 == 3'b110);
+    wire id_ex_is_bgeu   = id_ex_is_branch && (ex_funct3 == 3'b111);
+    wire id_ex_is_jal    = (ex_opcode == 7'b1101111);
+    wire id_ex_is_jalr   = (ex_opcode == 7'b1100111);
+
+    wire id_ex_br_eq, id_ex_br_lt;
+    branch_comp BC (
+        .br_data1(fwd_rs1),
+        .br_data2(fwd_rs2),
+        .br_un(ex_funct3[1]),
+        .br_eq(id_ex_br_eq),
+        .br_lt(id_ex_br_lt)
+    );
+
+    assign pc_sel = (id_ex_br_eq &  id_ex_is_beq) |
+                (~id_ex_br_eq & id_ex_is_bne) |
+                (id_ex_br_lt & (id_ex_is_blt|id_ex_is_bltu)) |
+                (~id_ex_br_lt & (id_ex_is_bge|id_ex_is_bgeu)) |
+                id_ex_is_jal | id_ex_is_jalr;
+
+        
+    // assign flush_if_id = pc_sel;
+    // assign flush_id_ex = pc_sel;
+
     hazard_unit HU (
         .id_ex_rd(id_ex_rd), 
         .id_ex_wb_sel(id_ex_wb_sel),
@@ -296,26 +333,7 @@ module cpu_pipelined (
         .fwd_a(fwd_a), 
         .fwd_b(fwd_b)
     );
-
-    // Forwarding
-    assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_alu :
-                    (fwd_a == 2'b10) ? wb_data : 
-                    id_ex_rs1;
-
-    assign fwd_rs2 = (fwd_b == 2'b01) ? ex_mem_alu :
-                    (fwd_b == 2'b10) ? wb_data : 
-                    id_ex_rs2;
     
-    assign alu_a = id_ex_a_sel ? id_ex_pc : fwd_rs1;
-    assign alu_b = id_ex_b_sel ? id_ex_imm : fwd_rs2;
-    
-    alu ALU (
-        .a(alu_a), 
-        .b(alu_b),
-        .alu_sel(id_ex_alu_sel),
-        .alu_res(alu_out)
-    ); 
-
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
@@ -396,7 +414,7 @@ module program_counter (
 );
     wire [31:0] next_pc = pc_sel ? mem_address : (pc + 32'd4);
 
-    always @(posedge clk, posedge rst) begin
+    always @(posedge clk) begin
         if (rst) 
             pc <= 32'b0;
         else if (!stall) 
@@ -425,25 +443,23 @@ module if_id_reg (
 endmodule
 
 module id_ex_reg (
-    input wire clk, rst, stall,
+    input wire clk, rst, flush,
     input wire [31:0] pc_in, rs1_in, rs2_in, imm_in, 
     input wire [4:0] rd_in, 
-    input wire reg_wen_in, mem_rw_in, a_sel_in, b_sel_in, br_un_in, 
+    input wire reg_wen_in, mem_rw_in, a_sel_in, b_sel_in, 
     input wire [1:0] wb_sel_in, 
-    input wire [2:0] imm_sel_in, 
     input wire [3:0] alu_sel_in,
     input wire [31:0] inst_in,
     output reg [31:0] pc_out, rs1_out, rs2_out, imm_out,
     output reg [4:0] rd_out,
-    output reg reg_wen_out, mem_rw_out, a_sel_out, b_sel_out, br_un_out, 
+    output reg reg_wen_out, mem_rw_out, a_sel_out, b_sel_out, 
     output reg [1:0] wb_sel_out, 
-    output reg [2:0] imm_sel_out, 
     output reg [3:0] alu_sel_out, 
     output reg [31:0] inst_out
 ); 
 
     always @(posedge clk) begin
-        if (rst || stall) begin
+        if (rst || flush) begin
             mem_rw_out <= 0;
             rd_out <= 5'b0;
             pc_out <= 0;
@@ -453,9 +469,7 @@ module id_ex_reg (
             reg_wen_out <= 0;
             a_sel_out <= 0;
             b_sel_out <= 0;
-            br_un_out <= 0;
             wb_sel_out <= 0;
-            imm_sel_out <= 0;
             alu_sel_out <= 0;
             inst_out <= 32'h00000013;
         end else begin
@@ -468,9 +482,7 @@ module id_ex_reg (
             reg_wen_out <= reg_wen_in;
             a_sel_out <= a_sel_in;
             b_sel_out <= b_sel_in;
-            br_un_out <= br_un_in;
             wb_sel_out <= wb_sel_in;
-            imm_sel_out <= imm_sel_in;
             alu_sel_out <= alu_sel_in;
             inst_out <= inst_in;
         end 
@@ -517,7 +529,7 @@ endmodule
 
 module mem_wb_reg (
     input wire clk, rst,
-    input wire [31:0] alu_res_in, mem_data_in, pc_in, inst_in
+    input wire [31:0] alu_res_in, mem_data_in, pc_in, inst_in,
     input wire [4:0] rd_in,
     input wire reg_wen_in,
     input wire [1:0] wb_sel_in,

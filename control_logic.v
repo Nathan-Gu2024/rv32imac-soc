@@ -1,7 +1,6 @@
 module control_logic (
-    input  wire [31:0] inst,
-    input  wire br_eq, br_lt,
-    output wire pc_sel, reg_wen, br_un, a_sel, b_sel, mem_rw,
+    input wire [31:0] inst,
+    output wire reg_wen, a_sel, b_sel, mem_rw,
     output wire [1:0] wb_sel,
     output wire [2:0] imm_sel,
     output wire [3:0] alu_sel
@@ -17,7 +16,6 @@ module control_logic (
     rom rom_inst (
         .rom_address(rom_address),
         .reg_wen(reg_wen),
-        .br_un(br_un),
         .a_sel(a_sel),
         .b_sel(b_sel),
         .mem_rw(mem_rw),
@@ -26,45 +24,29 @@ module control_logic (
         .alu_sel(alu_sel)
     );
 
-    wire is_beq = (rom_address == 6'd26);
-    wire is_bne = (rom_address == 6'd27);
-    wire is_blt = (rom_address == 6'd28);
-    wire is_bge = (rom_address == 6'd29);
-    wire is_bltu = (rom_address == 6'd30);
-    wire is_bgeu = (rom_address == 6'd31);
-    wire is_jal = (rom_address == 6'd34);
-    wire is_jalr = (rom_address == 6'd35);
-
-    assign pc_sel = (br_eq  &  is_beq)|
-                    (~br_eq &  is_bne) |
-                    (br_lt  & (is_blt | is_bltu)) |
-                    (~br_lt & (is_bge | is_bgeu)) |
-                    is_jal | is_jalr;
-
 endmodule
 
 module rom (
     input wire [5:0] rom_address,
-    output reg reg_wen, br_un, a_sel, b_sel, mem_rw,
+    output reg reg_wen, a_sel, b_sel, mem_rw,
     output reg [1:0] wb_sel,
     output reg [2:0] imm_sel,
     output reg [3:0] alu_sel
 );
-
     reg [15:0] mem [0:35];
 
     initial begin
         // {RegWEn, ImmSel[2:0], BrUn, ASel, BSel, ALUSel[3:0], MemRW, WBSel[1:0]}
-        mem[0]  = 16'h1001; // add
-        mem[1]  = 16'h1401; // mul
-        mem[2]  = 16'h1601; // sub
-        mem[3]  = 16'h1081; // sll
-        mem[4]  = 16'h1481; // mulh
-        mem[5]  = 16'h1581; // mulhu
-        mem[6]  = 16'h1101; // slt
-        mem[7]  = 16'h1201; // xor
-        mem[8]  = 16'h1281; // srl
-        mem[9]  = 16'h1681; // sra
+        mem[0] = 16'h1001; // add
+        mem[1] = 16'h1401; // mul
+        mem[2] = 16'h1601; // sub
+        mem[3] = 16'h1081; // sll
+        mem[4] = 16'h1481; // mulh
+        mem[5] = 16'h1581; // mulhu
+        mem[6] = 16'h1101; // slt
+        mem[7] = 16'h1201; // xor
+        mem[8] = 16'h1281; // srl
+        mem[9] = 16'h1681; // sra
         mem[10] = 16'h1301; // or
         mem[11] = 16'h1381; // and
         mem[12] = 16'h0041; // lb
@@ -94,11 +76,9 @@ module rom (
     end
 
     wire [15:0] rom_out = mem[rom_address];
-
     always @(*) begin
         reg_wen = rom_out[0];
         imm_sel = rom_out[3:1];
-        br_un = rom_out[4];
         a_sel = rom_out[5];
         b_sel = rom_out[6];
         alu_sel = rom_out[10:7];
@@ -110,56 +90,55 @@ endmodule
 
 
 module rom_decoder (
-    input  wire [31:0] inst,
-    output reg  [5:0]  rom_address
+    input wire [31:0] inst,
+    output reg [5:0] rom_address
 );
-
     wire [4:0] opcode = inst[6:2];
     wire [2:0] funct3 = inst[14:12];
     wire f7_bit5 = inst[30];
     wire f7_bit0 = inst[25];
 
     always @(*) begin
+        // Changed prefix from 9'b to 10'b to avoid 10-bit truncation
         case ({opcode, funct3, f7_bit5, f7_bit0})
-            9'b01100_000_00: rom_address = 6'd0; // add
-            9'b01100_000_01: rom_address = 6'd1; // mul
-            9'b01100_000_10: rom_address = 6'd2; // sub
-            9'b01100_001_00: rom_address = 6'd3; // sll
-            9'b01100_001_01: rom_address = 6'd4; // mulh
-            9'b01100_011_01: rom_address = 6'd5; // mulhu
-            9'b01100_010_00: rom_address = 6'd6; // slt
-            9'b01100_100_00: rom_address = 6'd7; // xor
-            9'b01100_101_00: rom_address = 6'd8; // srl
-            9'b01100_101_10: rom_address = 6'd9; // sra
-            9'b01100_110_00: rom_address = 6'd10; // or
-            9'b01100_111_00: rom_address = 6'd11; // and
-            9'b00000_000_00: rom_address = 6'd12; // lb
-            9'b00000_001_00: rom_address = 6'd13; // lh
-            9'b00000_010_00: rom_address = 6'd14; // lw
-            9'b00100_000_00: rom_address = 6'd15; // addi
-            9'b00100_001_00: rom_address = 6'd16; // slli
-            9'b00100_010_00: rom_address = 6'd17; // slti
-            9'b00100_100_00: rom_address = 6'd18; // xori
-            9'b00100_101_00: rom_address = 6'd19; // srli
-            9'b00100_101_10: rom_address = 6'd20; // srai
-            9'b00100_110_00: rom_address = 6'd21; // ori
-            9'b00100_111_00: rom_address = 6'd22; // andi
-            9'b01000_000_00: rom_address = 6'd23; // sb
-            9'b01000_001_00: rom_address = 6'd24; // sh
-            9'b01000_010_00: rom_address = 6'd25; // sw
-            9'b11000_000_00: rom_address = 6'd26; // beq
-            9'b11000_001_00: rom_address = 6'd27; // bne
-            9'b11000_100_00: rom_address = 6'd28; // blt
-            9'b11000_101_00: rom_address = 6'd29; // bge
-            9'b11000_110_00: rom_address = 6'd30; // bltu
-            9'b11000_111_00: rom_address = 6'd31; // bgeu
-            9'b00101_000_00: rom_address = 6'd32; // auipc
-            9'b01101_000_00: rom_address = 6'd33; // lui
-            9'b11011_000_00: rom_address = 6'd34; // jal
-            9'b11001_000_00: rom_address = 6'd35; // jalr
+            10'b01100_000_00: rom_address = 6'd0; // add
+            10'b01100_000_01: rom_address = 6'd1; // mul
+            10'b01100_000_10: rom_address = 6'd2; // sub
+            10'b01100_001_00: rom_address = 6'd3; // sll
+            10'b01100_001_01: rom_address = 6'd4; // mulh
+            10'b01100_011_01: rom_address = 6'd5; // mulhu
+            10'b01100_010_00: rom_address = 6'd6; // slt
+            10'b01100_100_00: rom_address = 6'd7; // xor
+            10'b01100_101_00: rom_address = 6'd8; // srl
+            10'b01100_101_10: rom_address = 6'd9; // sra
+            10'b01100_110_00: rom_address = 6'd10; // or
+            10'b01100_111_00: rom_address = 6'd11; // and
+            10'b00000_000_00: rom_address = 6'd12; // lb
+            10'b00000_001_00: rom_address = 6'd13; // lh
+            10'b00000_010_00: rom_address = 6'd14; // lw
+            10'b00100_000_00: rom_address = 6'd15; // addi
+            10'b00100_001_00: rom_address = 6'd16; // slli
+            10'b00100_010_00: rom_address = 6'd17; // slti
+            10'b00100_100_00: rom_address = 6'd18; // xori
+            10'b00100_101_00: rom_address = 6'd19; // srli
+            10'b00100_101_10: rom_address = 6'd20; // srai
+            10'b00100_110_00: rom_address = 6'd21; // ori
+            10'b00100_111_00: rom_address = 6'd22; // andi
+            10'b01000_000_00: rom_address = 6'd23; // sb
+            10'b01000_001_00: rom_address = 6'd24; // sh
+            10'b01000_010_00: rom_address = 6'd25; // sw
+            10'b11000_000_00: rom_address = 6'd26; // beq
+            10'b11000_001_00: rom_address = 6'd27; // bne
+            10'b11000_100_00: rom_address = 6'd28; // blt
+            10'b11000_101_00: rom_address = 6'd29; // bge
+            10'b11000_110_00: rom_address = 6'd30; // bltu
+            10'b11000_111_00: rom_address = 6'd31; // bgeu
+            10'b00101_000_00: rom_address = 6'd32; // auipc
+            10'b01101_000_00: rom_address = 6'd33; // lui
+            10'b11011_000_00: rom_address = 6'd34; // jal
+            10'b11001_000_00: rom_address = 6'd35; // jalr
             default: rom_address = 6'd0;
         endcase
     end
 
 endmodule
-
