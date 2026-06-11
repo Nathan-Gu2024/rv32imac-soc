@@ -7,6 +7,7 @@
 `include "immgen.v"
 `include "partial_load.v"
 `include "partial_store.v"
+`include "hazard_unit.v"
 
 // Single cycle 
 // module cpu_single_cycle (
@@ -177,7 +178,7 @@ module cpu_pipelined (
 
     // WB
     wire [31:0] wb_data;
-    wire stall, flush;
+    wire stall;
 
     // IF
     program_counter PC (
@@ -306,15 +307,11 @@ id_ex_reg ID_EX (
         .br_lt(id_ex_br_lt)
     );
 
-    assign pc_sel = (id_ex_br_eq &  id_ex_is_beq) |
+    assign pc_sel = (id_ex_br_eq & id_ex_is_beq) |
                 (~id_ex_br_eq & id_ex_is_bne) |
                 (id_ex_br_lt & (id_ex_is_blt|id_ex_is_bltu)) |
                 (~id_ex_br_lt & (id_ex_is_bge|id_ex_is_bgeu)) |
                 id_ex_is_jal | id_ex_is_jalr;
-
-        
-    // assign flush_if_id = pc_sel;
-    // assign flush_id_ex = pc_sel;
 
     hazard_unit HU (
         .id_ex_rd(id_ex_rd), 
@@ -329,7 +326,6 @@ id_ex_reg ID_EX (
         .id_ex_rs2(id_ex_inst[24:20]),
         .pc_sel(pc_sel),
         .stall(stall), 
-        .flush(flush),
         .fwd_a(fwd_a), 
         .fwd_b(fwd_b)
     );
