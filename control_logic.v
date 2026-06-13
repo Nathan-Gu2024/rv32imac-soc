@@ -99,8 +99,8 @@ module rom_decoder (
     wire f7_bit0 = inst[25];
 
     always @(*) begin
-        // Changed prefix from 9'b to 10'b to avoid 10-bit truncation
-        case ({opcode, funct3, f7_bit5, f7_bit0})
+        casex ({opcode, funct3, f7_bit5, f7_bit0})
+            // R-Types (All bits matter)
             10'b01100_000_00: rom_address = 6'd0; // add
             10'b01100_000_01: rom_address = 6'd1; // mul
             10'b01100_000_10: rom_address = 6'd2; // sub
@@ -113,32 +113,46 @@ module rom_decoder (
             10'b01100_101_10: rom_address = 6'd9; // sra
             10'b01100_110_00: rom_address = 6'd10; // or
             10'b01100_111_00: rom_address = 6'd11; // and
-            10'b00000_000_00: rom_address = 6'd12; // lb
-            10'b00000_001_00: rom_address = 6'd13; // lh
-            10'b00000_010_00: rom_address = 6'd14; // lw
-            10'b00100_000_00: rom_address = 6'd15; // addi
-            10'b00100_001_00: rom_address = 6'd16; // slli
-            10'b00100_010_00: rom_address = 6'd17; // slti
-            10'b00100_100_00: rom_address = 6'd18; // xori
-            10'b00100_101_00: rom_address = 6'd19; // srli
-            10'b00100_101_10: rom_address = 6'd20; // srai
-            10'b00100_110_00: rom_address = 6'd21; // ori
-            10'b00100_111_00: rom_address = 6'd22; // andi
-            10'b01000_000_00: rom_address = 6'd23; // sb
-            10'b01000_001_00: rom_address = 6'd24; // sh
-            10'b01000_010_00: rom_address = 6'd25; // sw
-            10'b11000_000_00: rom_address = 6'd26; // beq
-            10'b11000_001_00: rom_address = 6'd27; // bne
-            10'b11000_100_00: rom_address = 6'd28; // blt
-            10'b11000_101_00: rom_address = 6'd29; // bge
-            10'b11000_110_00: rom_address = 6'd30; // bltu
-            10'b11000_111_00: rom_address = 6'd31; // bgeu
-            10'b00101_000_00: rom_address = 6'd32; // auipc
-            10'b01101_000_00: rom_address = 6'd33; // lui
-            10'b11011_000_00: rom_address = 6'd34; // jal
-            10'b11001_000_00: rom_address = 6'd35; // jalr
+            
+            // Memory Loads (I-Type: f7 bits are part of immediate)
+            10'b00000_000_?_?: rom_address = 6'd12; // lb
+            10'b00000_001_?_?: rom_address = 6'd13; // lh
+            10'b00000_010_?_?: rom_address = 6'd14; // lw
+            
+            // Memory Stores (S-Type: f7 bits are part of immediate)
+            10'b01000_000_?_?: rom_address = 6'd23; // sb
+            10'b01000_001_?_?: rom_address = 6'd24; // sh
+            10'b01000_010_?_?: rom_address = 6'd25; // sw
+            
+            // I-Type ALU (f7 bits are part of immediate)
+            10'b00100_000_?_?: rom_address = 6'd15; // addi
+            10'b00100_010_?_?: rom_address = 6'd17; // slti
+            10'b00100_100_?_?: rom_address = 6'd18; // xori
+            10'b00100_110_?_?: rom_address = 6'd21; // ori
+            10'b00100_111_?_?: rom_address = 6'd22; // andi
+            
+            // I-Type Shifts (f7_bit5 is a modifier, f7_bit0 mask to be safe)
+            10'b00100_001_0_?: rom_address = 6'd16; // slli
+            10'b00100_101_0_?: rom_address = 6'd19; // srli
+            10'b00100_101_1_?: rom_address = 6'd20; // srai
+            
+            // B-Type Branches (f7 bits are part of immediate)
+            10'b11000_000_?_?: rom_address = 6'd26; // beq
+            10'b11000_001_?_?: rom_address = 6'd27; // bne
+            10'b11000_100_?_?: rom_address = 6'd28; // blt
+            10'b11000_101_?_?: rom_address = 6'd29; // bge
+            10'b11000_110_?_?: rom_address = 6'd30; // bltu
+            10'b11000_111_?_?: rom_address = 6'd31; // bgeu
+            
+            // U-Type and J-Type (funct3 and f7 bits are all part of immediate)
+            10'b00101_???_?_?: rom_address = 6'd32; // auipc
+            10'b01101_???_?_?: rom_address = 6'd33; // lui
+            10'b11011_???_?_?: rom_address = 6'd34; // jal
+            
+            // JALR (I-Type, funct3 is 000)
+            10'b11001_000_?_?: rom_address = 6'd35; // jalr
+            
             default: rom_address = 6'd0;
         endcase
     end
-
 endmodule

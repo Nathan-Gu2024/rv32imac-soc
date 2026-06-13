@@ -6,7 +6,8 @@ module partial_store (
 );
 
     wire [31:0] sb, sh;
-    wire [3:0] sb_mask, sh_mask, temp;
+    wire [3:0] sh_mask;
+    reg [3:0] sb_mask, temp;
     assign sb = {4{data_from_reg[7:0]}};
     assign sh = {{2{data_from_reg[15:0]}}};
     assign sh_mask = mem_address[1] ? 4'b1100 : 4'b0011;

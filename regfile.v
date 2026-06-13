@@ -19,7 +19,13 @@ module regfile (
         end
     endgenerate
 
-    assign read_data1 = (read_index1 == 5'd0) ? 32'd0 : regs[read_index1];
-    assign read_data2 = (read_index2 == 5'd0) ? 32'd0 : regs[read_index2];
+    // Internaal bypass added as well 
+    assign read_data1 = (read_index1 == 5'b0) ? 32'b0 :
+                        (reg_wen && write_index == read_index1) ? write_data :
+                        regs[read_index1];
+
+    assign read_data2 = (read_index2 == 5'b0) ? 32'b0 :
+                        (reg_wen && write_index == read_index2) ? write_data :
+                        regs[read_index2];
 
 endmodule

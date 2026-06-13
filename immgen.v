@@ -1,4 +1,4 @@
-module immGen (
+module immgen (
     input wire [31:0]inst,    
     input wire [2:0] imm_sel, 
     output reg [31:0] imm  

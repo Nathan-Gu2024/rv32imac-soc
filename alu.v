@@ -20,7 +20,7 @@ module alu (
             4'd2: // slt
                 alu_res = ($signed(a) < $signed(b)) ? 32'd1 : 32'd0;
             4'd3: // sltu
-                alur_res = (a < b) ? 32'd1 : 32'd0;
+                alu_res = (a < b) ? 32'd1 : 32'd0;
             4'd4: // xor
                 alu_res = a ^ b;
             4'd5: // srl

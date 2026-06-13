@@ -289,14 +289,14 @@ id_ex_reg ID_EX (
     wire [2:0] ex_funct3 = id_ex_inst[14:12];
 
     wire id_ex_is_branch = (ex_opcode == 7'b1100011);
-    wire id_ex_is_beq    = id_ex_is_branch && (ex_funct3 == 3'b000);
-    wire id_ex_is_bne    = id_ex_is_branch && (ex_funct3 == 3'b001);
-    wire id_ex_is_blt    = id_ex_is_branch && (ex_funct3 == 3'b100);
-    wire id_ex_is_bge    = id_ex_is_branch && (ex_funct3 == 3'b101);
-    wire id_ex_is_bltu   = id_ex_is_branch && (ex_funct3 == 3'b110);
-    wire id_ex_is_bgeu   = id_ex_is_branch && (ex_funct3 == 3'b111);
-    wire id_ex_is_jal    = (ex_opcode == 7'b1101111);
-    wire id_ex_is_jalr   = (ex_opcode == 7'b1100111);
+    wire id_ex_is_beq = id_ex_is_branch && (ex_funct3 == 3'b000);
+    wire id_ex_is_bne = id_ex_is_branch && (ex_funct3 == 3'b001);
+    wire id_ex_is_blt = id_ex_is_branch && (ex_funct3 == 3'b100);
+    wire id_ex_is_bge = id_ex_is_branch && (ex_funct3 == 3'b101);
+    wire id_ex_is_bltu = id_ex_is_branch && (ex_funct3 == 3'b110);
+    wire id_ex_is_bgeu = id_ex_is_branch && (ex_funct3 == 3'b111);
+    wire id_ex_is_jal = (ex_opcode == 7'b1101111);
+    wire id_ex_is_jalr = (ex_opcode == 7'b1100111);
 
     wire id_ex_br_eq, id_ex_br_lt;
     branch_comp BC (
@@ -354,7 +354,7 @@ id_ex_reg ID_EX (
     // MEM
     partial_store PS (
         .inst(ex_mem_inst), 
-        .mem_add(ex_mem_alu), 
+        .mem_address(ex_mem_alu), 
         .data_from_reg(ex_mem_rs2), 
         .mem_rw(ex_mem_mem_rw), 
         .mem_write_mask(mem_write_mask), 
@@ -396,9 +396,9 @@ id_ex_reg ID_EX (
         .data_to_reg(partial_load_out)
     );
 
-    assign wb_data = (mem_wb_wb_sel == 2'b00) ? mem_wb_alu : 
-                    (mem_wb_wb_sel == 2'b01) ? partial_load_out : 
-                    (mem_wb_wb_sel == 2'b10) ? (mem_wb_pc + 32'd4) : 
+    assign wb_data = (mem_wb_wb_sel == 2'b01) ? mem_wb_alu : // ALU
+                    (mem_wb_wb_sel == 2'b00) ? partial_load_out : // MEM
+                    (mem_wb_wb_sel == 2'b10) ? (mem_wb_pc + 32'd4) : // PC + 4
                     32'b0;
 
 endmodule
