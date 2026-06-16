@@ -8,131 +8,8 @@
 `include "partial_load.v"
 `include "partial_store.v"
 `include "hazard_unit.v"
+`include "direct_mapped_cache.v"
 
-// Single cycle 
-// module cpu_single_cycle (
-//     input wire clk, rst
-// );
-//     wire [31:0] pc, exe_pc;
-//     wire [31:0] inst;
-
-//     wire pc_sel, reg_wen, br_un, a_sel, b_sel, mem_rw;
-//     wire [1:0] wb_sel;
-//     wire [2:0] imm_sel;
-//     wire [3:0] alu_sel;
-
-//     wire [31:0] rs1_data, rs2_data;
-
-//     wire [31:0] imm; 
-
-//     wire [31:0] alu_out, alu_a, alu_b;
-
-//     wire br_eq, br_lt;
-
-//     wire [31:0] mem_read_data, store_data;
-//     wire [3:0] mem_write_mask;
-
-//     wire [31:0] wb_data, partial_load_out;
-
-//     assign exe_pc = pc;
-//     program_counter PC (
-//         .clk(clk), 
-//         .rst(rst),
-//         .pc_sel(pc_sel),
-//         .mem_address(alu_out),
-//         .pc(pc),
-//     );
-
-//     imem IMEM (
-//         .pc(pc),
-//         .inst(inst)
-//     );
-
-    
-//     control_logic CL (
-//         .inst(inst),
-//         .br_eq(br_eq), 
-//         .br_lt(br_lt),
-//         .pc_sel(pc_sel),
-//         .reg_wen(reg_wen),
-//         .imm_sel(imm_sel),
-//         .br_un(br_un),
-//         .a_sel(a_sel),
-//         .b_sel(b_sel),
-//         .alu_sel(alu_sel),
-//         .mem_rw(mem_rw),
-//         .wb_sel(wb_sel)
-//     );
-
-//     regfile RF (
-//         .clk(clk),
-//         .reg_wen(reg_wen),
-//         .read_index1(inst[19:15]),
-//         .read_index2(inst[24:20]),
-//         .write_index(inst[11:7]), 
-//         .write_data(wb_data),
-//         .read_data1(rs1_data),
-//         .read_data2(rs2_data)
-//     );
-
-//     immgen IMM (
-//         .inst(inst), 
-//         .imm_sel(imm_sel),
-//         .imm(imm)
-//     );
-
-//     branch_comp BC (
-//         .br_data1(rs1_data),
-//         .br_data2(rs2_data),
-//         .br_un(br_un),
-//         .br_eq(br_eq),
-//         .br_lt(br_lt)
-//     );
-
-//     assign alu_a = a_sel ? exe_pc : rs1_data;
-//     assign alu_b = b_sel ? imm : rs2_data;
-
-//     alu ALU (
-//         .a(alu_a),
-//         .b(alu_b),
-//         .alu_sel(alu_sel),
-//         .alu_res(alu_out)
-//     );
-
-//     partial_store PS (
-//         .inst(inst),
-//         .mem_address(alu_out),
-//         .data_from_reg(rs2_data),
-//         .mem_rw(mem_rw),
-//         .mem_write_mask(mem_write_mask),
-//         .data_to_mem(store_data)
-//     );
-
-//     dmem DMEM (
-//         .clk(clk), 
-//         .mem_address(alu_out),
-//         .mem_write_data(store_data),
-//         .mem_write_mask(mem_write_mask),
-//         .mem_read_data(mem_read_data)
-//     ); 
-
-//     partial_load PL (
-//         .inst(inst),
-//         .mem_address(alu_out), 
-//         .data_from_mem(mem_read_data),
-//         .data_to_reg(partial_load_out)
-//     );
-
-//     assign wb_data = (wb_sel == 2'b00) ? alu_out : 
-//                     (wb_sel == 2'b01) ? partial_load_out :
-//                     (wb_sel == 2'b10) ? (pc + 32'd4) :
-//                     32'b0;
-
-// endmodule
-
-
-
-// 5 Stage 
 module cpu_pipelined ( 
     input wire clk, rst
 );
@@ -180,31 +57,115 @@ module cpu_pipelined (
     wire [31:0] wb_data;
     wire stall;
 
+
+    // Caching / Memory flags
+    // CPU asserts Valid if it is a Load or Store instruction in the MEM stage
+    wire is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen; 
+    wire is_store = (ex_mem_mem_rw == 1'b1);  
+    wire dcache_valid = is_load | is_store;
+    
+    wire dcache_ready; 
+    wire dmem_stall = dcache_valid & (~dcache_ready);
+    wire [31:0] dcache_read_data;
+
+    wire cache_ready;
+    wire [31:0] icache_mem_req_addr;
+    wire [127:0] icache_mem_read_data;
+    wire icache_mem_ready;
+    wire icache_mem_req_valid; 
+
+    direct_mapped_cache ICACHE (
+        .clk(clk), 
+        .rst(rst), 
+        .cpu_req_addr(pc),
+        .cpu_write_data(32'b0), 
+        .cpu_read_req(1'b1), 
+        .cpu_write_req(1'b0), 
+        .mem_write_mask(4'b0000),
+        .mem_ready(icache_mem_ready), 
+        .mem_read_data(icache_mem_read_data), 
+        .cpu_read_data(if_inst), 
+        .mem_req_addr(icache_mem_req_addr), 
+        .cpu_ready(cache_ready), 
+        .mem_req_valid(icache_mem_req_valid)
+    ); 
+
+    // Same for the Instruction Memory
+    wire icache_valid = 1'b1; // The CPU is ALWAYS trying to fetch instructions!
+    wire imem_stall = icache_valid & (~cache_ready);
+
+    // Master Pipeline Stall
+    // Freeze the whole CPU if either memory is stalling
+    wire global_mem_stall = dmem_stall | imem_stall;
+
+    wire [127:0] imem_read_data;
+    wire imem_ready;
+    wire [31:0] icache_mem_addr;
+
+    wire dcache_mem_req_valid;
+    wire dcache_mem_ready;
+    wire [127:0] dcache_mem_read_data;
+    wire [31:0] dcache_mem_req_addr;
+
+    wire [127:0] dcache_mem_read_data_block;
+    
+    direct_mapped_cache DCACHE (
+        .clk(clk),
+        .rst(rst),
+        .cpu_req_addr(ex_mem_alu),  
+        .cpu_write_data(store_data), 
+        .mem_write_mask(mem_write_mask),
+        .cpu_read_req(is_load),
+        .cpu_write_req(is_store),        
+        .mem_ready(dcache_mem_ready),
+        .mem_read_data(dcache_mem_read_data_block),        
+        .cpu_read_data(dcache_read_data),
+        .mem_req_addr(dcache_mem_req_addr),
+        .cpu_ready(dcache_ready),         
+        .mem_req_valid(dcache_mem_req_valid)
+    );
+
+    dmem DMEM (
+        .clk(clk),
+        .mem_req_valid(dcache_mem_req_valid),
+        .mem_address(is_store ? ex_mem_alu : dcache_mem_req_addr),
+        .mem_write_data(store_data),    
+        .mem_write_mask(mem_write_mask),    
+        .mem_read_data(mem_read_data),
+        .mem_ready(dcache_mem_ready),
+        .mem_read_data_block(dcache_mem_read_data_block)
+    );
+
     // IF
     program_counter PC (
         .clk(clk), 
         .rst(rst),
-        .stall(stall), 
+        .stall(stall | global_mem_stall), 
         .pc_sel(pc_sel), 
         .mem_address(alu_out), 
         .pc(pc)
     );
 
-    imem IMEM (
-        .pc(pc),
-        .inst(if_inst)
-    ); 
-
     if_id_reg IF_ID (
         .clk(clk), 
         .rst(rst), 
         .stall(stall), 
+        .mem_stall(global_mem_stall),
         .flush(pc_sel), 
         .pc_in(pc), 
         .inst_in(if_inst), 
         .pc_out(if_id_pc),
         .inst_out(if_id_inst)
     ); 
+                
+    imem IMEM (
+        .clk(clk), 
+        .rst(rst), 
+        .mem_req_valid(icache_mem_req_valid), 
+        .mem_req_addr(icache_mem_req_addr), 
+        .mem_read_data(icache_mem_read_data), 
+        .mem_ready(icache_mem_ready)
+    );
 
     // ID
     control_logic CL (
@@ -235,10 +196,11 @@ module cpu_pipelined (
         .imm(imm)
     );
 
-id_ex_reg ID_EX (
+    id_ex_reg ID_EX (
         .clk(clk), 
         .rst(rst),
-        .flush(pc_sel || stall), // Connected to .flush instead of .stall
+        .flush(pc_sel || stall), 
+        .mem_stall(global_mem_stall),
         .pc_in(if_id_pc), 
         .rs1_in(rs1_data), 
         .rs2_in(rs2_data),
@@ -299,6 +261,7 @@ id_ex_reg ID_EX (
     wire id_ex_is_jalr = (ex_opcode == 7'b1100111);
 
     wire id_ex_br_eq, id_ex_br_lt;
+
     branch_comp BC (
         .br_data1(fwd_rs1),
         .br_data2(fwd_rs2),
@@ -333,6 +296,7 @@ id_ex_reg ID_EX (
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
+        .mem_stall(global_mem_stall),
         .alu_res_in(alu_out), 
         .rs2_in(fwd_rs2), 
         .inst_in(id_ex_inst), 
@@ -361,20 +325,13 @@ id_ex_reg ID_EX (
         .data_to_mem(store_data)
     ); 
 
-    dmem DMEM (
-        .clk(clk), 
-        .mem_address(ex_mem_alu),
-        .mem_write_data(store_data), 
-        .mem_write_mask(mem_write_mask),
-        .mem_read_data(mem_read_data)
-    );
-
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 
+        .mem_stall(global_mem_stall),
         .inst_in(ex_mem_inst),
         .alu_res_in(ex_mem_alu), 
-        .mem_data_in(mem_read_data), 
+        .mem_data_in(dcache_read_data), 
         .pc_in(ex_mem_pc),
         .rd_in(ex_mem_rd),
         .reg_wen_in(ex_mem_reg_wen),
@@ -422,24 +379,28 @@ endmodule
 
 
 module if_id_reg (
-    input wire clk, rst, stall, flush,
+    input wire clk, rst, stall, flush, mem_stall, 
     input wire [31:0] pc_in, inst_in,
     output reg [31:0] pc_out, inst_out
 );
     always @(posedge clk) begin
-        if (rst || flush) begin
+        if (rst) begin
+            pc_out <= 32'b0;
+            inst_out <= 32'h00000013;
+        end else if (mem_stall) begin
+            // Freeze
+        end else if (flush) begin
             pc_out <= 32'b0;
             inst_out <= 32'h00000013;
         end else if (!stall) begin
             pc_out <= pc_in;
             inst_out <= inst_in;
-        end
-    end
-    
+        end 
+    end    
 endmodule
 
 module id_ex_reg (
-    input wire clk, rst, flush,
+    input wire clk, rst, flush, mem_stall,
     input wire [31:0] pc_in, rs1_in, rs2_in, imm_in, 
     input wire [4:0] rd_in, 
     input wire reg_wen_in, mem_rw_in, a_sel_in, b_sel_in, 
@@ -455,40 +416,34 @@ module id_ex_reg (
 ); 
 
     always @(posedge clk) begin
-        if (rst || flush) begin
+        if (rst) begin
             mem_rw_out <= 0;
-            rd_out <= 5'b0;
-            pc_out <= 0;
-            rs1_out <= 0;
-            rs2_out <= 0;
-            imm_out <= 0;
-            reg_wen_out <= 0;
-            a_sel_out <= 0;
-            b_sel_out <= 0;
-            wb_sel_out <= 0;
-            alu_sel_out <= 0;
+            rd_out <= 5'b0; pc_out <= 0; rs1_out <= 0; rs2_out <= 0;
+            imm_out <= 0; reg_wen_out <= 0; a_sel_out <= 0;
+            b_sel_out <= 0; wb_sel_out <= 0; alu_sel_out <= 0;
+            inst_out <= 32'h00000013;
+        end else if (mem_stall) begin
+            // Freeze 
+        end else if (flush) begin
+            mem_rw_out <= 0;
+            rd_out <= 5'b0; pc_out <= 0; rs1_out <= 0; rs2_out <= 0;
+            imm_out <= 0; reg_wen_out <= 0; a_sel_out <= 0;
+            b_sel_out <= 0; wb_sel_out <= 0; alu_sel_out <= 0;
             inst_out <= 32'h00000013;
         end else begin
             mem_rw_out <= mem_rw_in;
-            rd_out <= rd_in;
-            pc_out <= pc_in;
-            rs1_out <= rs1_in;
-            rs2_out <= rs2_in;
-            imm_out <= imm_in;
-            reg_wen_out <= reg_wen_in;
-            a_sel_out <= a_sel_in;
-            b_sel_out <= b_sel_in;
-            wb_sel_out <= wb_sel_in;
-            alu_sel_out <= alu_sel_in;
+            rd_out <= rd_in; pc_out <= pc_in; rs1_out <= rs1_in; rs2_out <= rs2_in;
+            imm_out <= imm_in; reg_wen_out <= reg_wen_in; a_sel_out <= a_sel_in;
+            b_sel_out <= b_sel_in; wb_sel_out <= wb_sel_in; alu_sel_out <= alu_sel_in;
             inst_out <= inst_in;
         end 
-    end 
+    end
 
 endmodule
 
 
 module ex_mem_reg (
-    input wire  clk, rst,
+    input wire clk, rst, mem_stall,
     input wire [31:0] alu_res_in, rs2_in, inst_in, pc_in,
     input wire [4:0] rd_in,
     input wire reg_wen_in, mem_rw_in,
@@ -508,6 +463,8 @@ module ex_mem_reg (
              wb_sel_out <= 0;
             inst_out <= 32'h00000013;
             pc_out <= 0;                    
+        end else if (mem_stall) begin
+            // Freeze
         end else begin
             alu_res_out <= alu_res_in;
             rs2_out <= rs2_in;
@@ -524,7 +481,7 @@ endmodule
 
 
 module mem_wb_reg (
-    input wire clk, rst,
+    input wire clk, rst, mem_stall,
     input wire [31:0] alu_res_in, mem_data_in, pc_in, inst_in,
     input wire [4:0] rd_in,
     input wire reg_wen_in,
@@ -543,6 +500,8 @@ module mem_wb_reg (
             pc_out <= 0;  
             wb_sel_out <= 0;
             inst_out <= 32'h00000013;
+        end else if (mem_stall) begin
+            // Freeze 
         end else begin
             alu_res_out <= alu_res_in;
             mem_data_out <= mem_data_in;

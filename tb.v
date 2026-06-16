@@ -28,15 +28,18 @@ module testbench;
         $dumpvars(0, testbench);
 
         // Basic ALU 
+        reset_pipeline();
         $readmemh("Mems/test_alu_basics.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 1: Basic ALU");
-        check(3, 32'd8);    // add
-        check(4, 32'd2);    // sub
-        check(5, 32'd1);    // and
-        check(6, 32'd7);    // or
-        check(7, 32'd6);    // xor
+        $monitor("Time: %0t | PC: %0d | Stall: %b | Cache State: %b | Hit: %b", 
+          $time, DUT.PC.pc, DUT.global_mem_stall, DUT.ICACHE.state, DUT.ICACHE.is_hit);
+        check(3, 32'd8); // add
+        check(4, 32'd2); // sub
+        check(5, 32'd1); // and
+        check(6, 32'd7); // or
+        check(7, 32'd6); // xor
 
         // EX Forwarding
         reset_pipeline();
