@@ -113,8 +113,18 @@ module testbench;
         $readmemh("Mems/test_load_use_stall_before_branch.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
-        $display("--- Test 9: Load-Use + Branch");
+        $display("Test 9: Load-Use + Branch");
         check(4, 32'd1);
+
+        // RVC
+        reset_pipeline();
+        $readmemh("Mems/test_rvc_basics.mem", DUT.IMEM.rom);
+        reset_dut();
+        repeat(50) @(posedge clk);
+        $display("Test10: RVC Compressed Instructions");
+        check(1, 32'd5); // x1 should be 5
+        check(2, 32'd2); // x2 should be 2
+        check(3, 32'd7); // x3 should be 7
 
         $finish;
     end

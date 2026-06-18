@@ -9,16 +9,17 @@
 `include "partial_store.v"
 `include "hazard_unit.v"
 `include "direct_mapped_cache.v"
+`include "rvc_expansion.v"
 
 module cpu_pipelined ( 
     input wire clk, rst
 );
     // IF 
-    wire [31:0] pc, if_inst;
+    wire [31:0] pc, if_inst, inst_expanded;
 
     // IF/ID out
     wire [31:0] if_id_pc, if_id_inst;
-
+    wire is_compressed;
     // ID
     wire [31:0] rs1_data, rs2_data, imm;
     wire pc_sel, reg_wen, a_sel, b_sel, mem_rw;
@@ -136,16 +137,25 @@ module cpu_pipelined (
         .mem_read_data_block(dcache_mem_read_data_block)
     );
 
+    wire [15:0] current_16bit_half = pc[1] ? if_inst[31:16] : if_inst[15:0];
+    rvc_expand RVC (
+        .inst_c(current_16bit_half), 
+        .inst_expanded(inst_expanded), 
+        .is_compressed(is_compressed)
+    );
+    wire [31:0] muxed_if_inst = is_compressed ? inst_expanded : if_inst;
+
     // IF
     program_counter PC (
         .clk(clk), 
         .rst(rst),
         .stall(stall | global_mem_stall), 
+        .is_compressed(is_compressed), 
         .pc_sel(pc_sel), 
         .mem_address(alu_out), 
         .pc(pc)
     );
-
+    
     if_id_reg IF_ID (
         .clk(clk), 
         .rst(rst), 
@@ -153,7 +163,7 @@ module cpu_pipelined (
         .mem_stall(global_mem_stall),
         .flush(pc_sel), 
         .pc_in(pc), 
-        .inst_in(if_inst), 
+        .inst_in(muxed_if_inst), 
         .pc_out(if_id_pc),
         .inst_out(if_id_inst)
     ); 
@@ -360,12 +370,13 @@ module cpu_pipelined (
 
 endmodule
 
+
 module program_counter (
     input wire [31:0] mem_address,
-    input wire clk, rst, pc_sel, stall,
+    input wire clk, rst, pc_sel, stall, is_compressed,
     output reg [31:0] pc
 );
-    wire [31:0] next_pc = pc_sel ? mem_address : (pc + 32'd4);
+    wire [31:0] next_pc = pc_sel ? mem_address : pc + (is_compressed ? 32'd2 : 32'd4);
 
     always @(posedge clk) begin
         if (rst) 

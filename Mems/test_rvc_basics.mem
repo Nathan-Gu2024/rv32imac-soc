@@ -1,0 +1,7 @@
+// Line 0 (PC=0): Two 16-bit compressed instructions packed
+// Lower 16-bits (PC=0): c.addi x1, 5  -> 0x0095
+// Upper 16-bits (PC=2): c.addi x2, 2  -> 0x0109
+01090095
+
+// Line 1 (PC=4): add x3, x1, x2
+002081b3
