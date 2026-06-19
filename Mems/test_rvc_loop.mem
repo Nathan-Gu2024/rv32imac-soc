@@ -1,0 +1,17 @@
+// PC = 0 (Setup)
+// Lower: c.li x1, 5    (Hex: 4095) -> Loop Counter (5 to 0)
+// Upper: c.li x2, 0    (Hex: 4101) -> Sum Accumulator
+41014095
+
+// PC = 4 (Loop Body Start)
+// Lower: c.add x2, x1  (Hex: 9106) -> x2 = x2 + x1
+// Upper: c.addi x1, -1 (Hex: 10fd) -> x1 = x1 - 1
+10fd9106
+
+// PC = 8 (Branch)
+// Standard BNE instruction to safely jump back to aligned PC=4
+// bne x1, x0, -4       (Hex: fe009ee3) -> If x1 != 0, go back 4 bytes
+fe009ee3
+
+// PC = 12 (End)
+// x2 should now hold 5 + 4 + 3 + 2 + 1 = 15

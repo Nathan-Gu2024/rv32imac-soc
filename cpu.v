@@ -137,25 +137,59 @@ module cpu_pipelined (
         .mem_read_data_block(dcache_mem_read_data_block)
     );
 
-    wire [15:0] current_16bit_half = pc[1] ? if_inst[31:16] : if_inst[15:0];
+    // IF
+    // wire [15:0] current_16bit_half = pc[1] ? if_inst[31:16] : if_inst[15:0];
+
+    // wire [31:0] muxed_if_inst = is_compressed ? inst_expanded : if_inst;
+    
+    // Fetch buffer state
+    reg [15:0] fetch_buffer;
+    reg buffer_valid;
+
+    wire [1:0] opcode_check = pc[1] ? if_inst[17:16] : if_inst[1:0];
+    wire is_32_bit_opcode = (opcode_check == 2'b11);
+    wire unaligned_32_bit_fetch = (pc[1] == 1'b1) && is_32_bit_opcode && !buffer_valid;
+
+    always @(posedge clk) begin
+        if (rst || pc_sel) begin
+            buffer_valid <= 1'b0;
+            fetch_buffer <= 16'b0;
+        end else if (!global_mem_stall && !stall) begin
+            if (unaligned_32_bit_fetch) begin
+                fetch_buffer <= if_inst[31:16];
+                buffer_valid <= 1'b1;
+            end else begin
+                buffer_valid <= 1'b0;
+            end 
+        end 
+    end
+    // Detection
+
+    // Instruction assembly
+    wire [31:0] raw_inst = buffer_valid ? {if_inst[15:0], fetch_buffer} : (pc[1] ? {16'b0, if_inst[31:16]} : if_inst);
+
     rvc_expand RVC (
-        .inst_c(current_16bit_half), 
+        .inst_c(raw_inst[15:0]), 
         .inst_expanded(inst_expanded), 
         .is_compressed(is_compressed)
     );
-    wire [31:0] muxed_if_inst = is_compressed ? inst_expanded : if_inst;
+    // Pipeline routing
+    wire [31:0] final_inst = is_compressed ? inst_expanded : raw_inst;
 
-    // IF
+    wire [31:0] muxed_if_inst = unaligned_32_bit_fetch ? 32'h00000013 : final_inst;
+
+    wire [31:0] pc_inc = (unaligned_32_bit_fetch || buffer_valid || is_compressed) ? 32'd2 : 32'd4;
+
     program_counter PC (
         .clk(clk), 
         .rst(rst),
         .stall(stall | global_mem_stall), 
-        .is_compressed(is_compressed), 
         .pc_sel(pc_sel), 
         .mem_address(alu_out), 
+        .pc_inc(pc_inc),
         .pc(pc)
     );
-    
+
     if_id_reg IF_ID (
         .clk(clk), 
         .rst(rst), 
@@ -372,11 +406,11 @@ endmodule
 
 
 module program_counter (
-    input wire [31:0] mem_address,
-    input wire clk, rst, pc_sel, stall, is_compressed,
+    input wire [31:0] mem_address, pc_inc, 
+    input wire clk, rst, pc_sel, stall,
     output reg [31:0] pc
 );
-    wire [31:0] next_pc = pc_sel ? mem_address : pc + (is_compressed ? 32'd2 : 32'd4);
+    wire [31:0] next_pc = pc_sel ? mem_address : pc + pc_inc;
 
     always @(posedge clk) begin
         if (rst) 

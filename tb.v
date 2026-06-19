@@ -126,7 +126,38 @@ module testbench;
         check(2, 32'd2); // x2 should be 2
         check(3, 32'd7); // x3 should be 7
 
+        // RVC Corner Cases
+        reset_pipeline();
+        $readmemh("Mems/test_rvc_corner.mem", DUT.IMEM.rom);
+        reset_dut();
+        repeat(50) @(posedge clk);
+        $display("Test 11: RVC Corner Cases (Hazards & Negatives)");
+        check(1, 32'd5);  // 10 - 5 = 5
+        check(2, 32'd5);  // 0 + 5 = 5
+        check(3, 32'd15); // 5 + 10 = 15
+
+        // RVC Loop
+        reset_pipeline();
+        $readmemh("Mems/test_rvc_loop.mem", DUT.IMEM.rom);
+        reset_dut();
+        repeat(100) @(posedge clk); // Needs more time for loops!
+        $display("Test 12: RVC Loop Accumulator");
+        check(1, 32'd0);  // Counter should reach 0
+        check(2, 32'd15); // Sum should be 15
+
+        // RVC Buffer
+        reset_pipeline();
+        $readmemh("Mems/test_rvc_buffer.mem", DUT.IMEM.rom);
+        reset_dut();
+        repeat(100) @(posedge clk); 
+        $display("Test 13: RVC Buffer");
+        check(1, 32'd5);  
+        // Check the compressed instruction immediately following it
+        check(2, 32'd10); 
+        // Check the subsequent 32-bit instruction
+        check(3, 32'd15);        
         $finish;
+
     end
 
     // Global simulation watchdog timeout

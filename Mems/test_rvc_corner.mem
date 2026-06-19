@@ -1,0 +1,14 @@
+// PC = 0
+// Lower: c.li x1, 10   (Hex: 40a9) -> Load 10 into x1
+// Upper: c.nop         (Hex: 0001) -> Padding
+000140a9
+
+// PC = 4
+// Lower: c.addi x1, -5 (Hex: 10ed) -> Subtract 5 from x1 (Tests negative sign extension!)
+// Upper: c.add x2, x1  (Hex: 9106) -> x2 = x2 + x1 (Tests pipeline forwarding from C.ADDI to C.ADD!)
+910610ed
+
+// PC = 8
+// Standard 32-bit instruction to catch the result
+// addi x3, x2, 10      (Hex: 00a10193) -> x3 = 5 + 10 = 15
+00a10193

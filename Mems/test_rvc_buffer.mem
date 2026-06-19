@@ -1,0 +1,14 @@
+// PC = 0 (Word 0)
+// Lower 16-bits (PC=0): c.nop (Hex: 0001)
+// Upper 16-bits (PC=2): Lower half of "addi x1, x0, 5" (Hex: 0093)
+00930001
+
+// PC = 4 (Word 1)
+// Lower 16-bits (PC=4): Upper half of "addi x1, x0, 5" (Hex: 0050)
+// Upper 16-bits (PC=6): c.li x2, 10 (Hex: 4129) -> Load 10 into x2
+41290050
+
+// PC = 8 (Word 2)
+// Standard 32-bit instruction to catch the results
+// add x3, x1, x2 (Hex: 002081b3) -> 5 + 10 = 15
+002081b3
