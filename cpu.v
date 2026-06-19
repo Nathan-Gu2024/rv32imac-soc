@@ -12,7 +12,8 @@
 `include "rvc_expansion.v"
 
 module cpu_pipelined ( 
-    input wire clk, rst
+    input wire clk, rst,
+    output reg [2:0] leds
 );
     // IF 
     wire [31:0] pc, if_inst, inst_expanded;
@@ -137,15 +138,12 @@ module cpu_pipelined (
         .mem_read_data_block(dcache_mem_read_data_block)
     );
 
-    // IF
-    // wire [15:0] current_16bit_half = pc[1] ? if_inst[31:16] : if_inst[15:0];
-
-    // wire [31:0] muxed_if_inst = is_compressed ? inst_expanded : if_inst;
-    
+    // IF    
     // Fetch buffer state
     reg [15:0] fetch_buffer;
     reg buffer_valid;
 
+    // Detection
     wire [1:0] opcode_check = pc[1] ? if_inst[17:16] : if_inst[1:0];
     wire is_32_bit_opcode = (opcode_check == 2'b11);
     wire unaligned_32_bit_fetch = (pc[1] == 1'b1) && is_32_bit_opcode && !buffer_valid;
@@ -163,7 +161,6 @@ module cpu_pipelined (
             end 
         end 
     end
-    // Detection
 
     // Instruction assembly
     wire [31:0] raw_inst = buffer_valid ? {if_inst[15:0], fetch_buffer} : (pc[1] ? {16'b0, if_inst[31:16]} : if_inst);
@@ -358,6 +355,16 @@ module cpu_pipelined (
         .mem_rw_out(ex_mem_mem_rw), 
         .wb_sel_out(ex_mem_wb_sel)
     );
+
+    always @(posedge clk) begin
+        if (rst) begin
+            leds <= 16'b0;
+        end else if (ex_mem_mem_rw) begin
+            if (ex_mem_alu == 32'h00002000) begin
+                leds <= ex_mem_rs2[15:0];
+            end 
+        end 
+    end 
 
     // MEM
     partial_store PS (
