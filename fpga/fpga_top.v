@@ -1,4 +1,4 @@
-`include "uart_tx.v"
+`include "../src/uart_tx.v"
 
 module fpga_top (
     input wire clk_hz,
