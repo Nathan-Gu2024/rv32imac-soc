@@ -12,7 +12,9 @@
 `include "rvc_expansion.v"
 
 module cpu_pipelined ( 
-    input wire clk, rst,
+    input wire clk, rst, uart_tx_ready, 
+    output reg uart_tx_start, 
+    output reg [7:0] uart_tx_data, 
     output reg [3:0] leds
 );
     // IF 
@@ -365,6 +367,24 @@ module cpu_pipelined (
             end 
         end 
     end 
+
+    always @(posedge clk) begin
+        if (rst) begin
+            leds <= 3'b0; 
+            uart_tx_start <= 1'b0;
+        end else begin
+            uart_tx_start <= 1'b0; 
+            if (ex_mem_mem_rw) begin
+                if (ex_mem_alu == 32'h00002000) begin
+                    leds <= ex_mem_rs2[2:0]; 
+                end else if (ex_mem_alu == 32'h00003000) begin
+                    uart_tx_data <= ex_mem_rs2[7:0];
+                    uart_tx_start <= 1'b1;
+                end 
+            end 
+        end 
+    end 
+
 
     // MEM
     partial_store PS (
