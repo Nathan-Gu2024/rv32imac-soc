@@ -13,7 +13,7 @@
 
 module cpu_pipelined ( 
     input wire clk, rst,
-    output reg [2:0] leds
+    output reg [3:0] leds
 );
     // IF 
     wire [31:0] pc, if_inst, inst_expanded;

@@ -16,7 +16,7 @@ module direct_mapped_cache
     reg [127:0] data_array [0:63];
     reg [21:0] tag_array [0:63];
     reg [63:0] valid_array;
-
+    integer i;
     wire is_hit = valid_array[index] && (tag_array[index] == tag);
 
     localparam IDLE = 1'b0;
@@ -68,7 +68,6 @@ module direct_mapped_cache
 
     always @(posedge clk) begin
         if (rst) begin
-            integer i;
             for (i = 0; i < 64; i = i + 1)
                 valid_array[i] <= 1'b0;
         end else if (state == FETCH && mem_ready) begin

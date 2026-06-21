@@ -1,7 +1,7 @@
 module partial_store (
     input wire [31:0] inst, mem_address, data_from_reg,
     input wire mem_rw,
-    output reg [3:0] mem_write_mask,
+    output wire [3:0] mem_write_mask, 
     output reg [31:0] data_to_mem
 );
 

@@ -1,16 +1,23 @@
 module fpga_top (
     input wire clk_hz,
     input wire [1:0] btn, 
-    output wire [2:0] led
+    output wire [3:0] led
 );
     reg [3:0] clk_div;
     always @(posedge clk_hz) begin
         clk_div <= clk_div + 1;
     end 
 
-    wire cpu_clk = clk_div[3];
+    wire slow_clk = clk_div[3];
+    wire cpu_clk;
 
-    reg [15:0] tick_counter; 
+    BUFG clk_buffer (
+        .I(slow_clk),
+        .O(cpu_clk)
+    ); 
+
+    reg [15:0] tick_counter;
+      
     always @(posedge cpu_clk) begin
         if (tick_counter == 16'd62500)
             tick_counter <= 16'd0;

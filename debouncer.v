@@ -17,7 +17,7 @@ module debouncer
     localparam N = 19; // counter bits (2^N * 20ns = 10ms tick)
 
     reg [N-1:0] q_reg;
-    reg [N-1:0] q_next;
+    wire [N-1:0] q_next;
     wire m_tick;
     reg [2:0] state_reg, state_next;
 
