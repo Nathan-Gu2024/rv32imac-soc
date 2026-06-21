@@ -1,4 +1,4 @@
-`include "cpu.v"
+`include "../src/cpu.v"
 
 module testbench;
     reg clk, rst;
@@ -29,7 +29,7 @@ module testbench;
 
         // Basic ALU 
         reset_pipeline();
-        $readmemh("Mems/test_alu_basics.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_alu_basics.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 1: Basic ALU");
@@ -43,7 +43,7 @@ module testbench;
 
         // EX Forwarding
         reset_pipeline();
-        $readmemh("Mems/test_ex_forwarding.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_ex_forwarding.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 2: EX Forwarding");
@@ -53,7 +53,7 @@ module testbench;
 
         // MEM Forwarding 
         reset_pipeline();
-        $readmemh("Mems/test_mem_ex_forwarding.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_mem_ex_forwarding.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 3: MEM Forwarding");
@@ -61,7 +61,7 @@ module testbench;
 
         // Load-Use Stall 
         reset_pipeline();
-        $readmemh("Mems/test_load_use_stall.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_load_use_stall.mem", DUT.IMEM.rom);
         reset_dut();
         DUT.DMEM.ram[0] = 32'd42;
         repeat(50) @(posedge clk);
@@ -77,7 +77,7 @@ module testbench;
 
         // Store then Load
         reset_pipeline();
-        $readmemh("Mems/test_store_load.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_store_load.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 5: Store then Load");
@@ -86,7 +86,7 @@ module testbench;
 
         // Branch Not Taken / Taken 
         reset_pipeline();
-        $readmemh("Mems/test_branch_taken.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_branch_taken.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 6: Branch");
@@ -94,7 +94,7 @@ module testbench;
 
         // Branch on Forwarded Values
         reset_pipeline();
-        $readmemh("Mems/test_branch_taken.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_branch_taken.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 7: Branch + Forwarding");
@@ -102,7 +102,7 @@ module testbench;
 
         // JAL / JALR 
         reset_pipeline();
-        $readmemh("Mems/test_jal_jalr.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_jal_jalr.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 8: JAL/JALR");
@@ -110,7 +110,7 @@ module testbench;
 
         // Load-Use + Branch
         reset_pipeline();
-        $readmemh("Mems/test_load_use_stall_before_branch.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_load_use_stall_before_branch.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 9: Load-Use + Branch");
@@ -118,7 +118,7 @@ module testbench;
 
         // RVC
         reset_pipeline();
-        $readmemh("Mems/test_rvc_basics.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_basics.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test10: RVC Compressed Instructions");
@@ -128,7 +128,7 @@ module testbench;
 
         // RVC Corner Cases
         reset_pipeline();
-        $readmemh("Mems/test_rvc_corner.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_corner.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 11: RVC Corner Cases (Hazards & Negatives)");
@@ -138,7 +138,7 @@ module testbench;
 
         // RVC Loop
         reset_pipeline();
-        $readmemh("Mems/test_rvc_loop.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_loop.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(100) @(posedge clk); // Needs more time for loops!
         $display("Test 12: RVC Loop Accumulator");
@@ -147,7 +147,7 @@ module testbench;
 
         // RVC Buffer
         reset_pipeline();
-        $readmemh("Mems/test_rvc_buffer.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_buffer.mem", DUT.IMEM.rom);
         reset_dut();
         repeat(100) @(posedge clk); 
         $display("Test 13: RVC Buffer");
