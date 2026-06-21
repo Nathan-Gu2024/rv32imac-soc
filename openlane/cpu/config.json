@@ -1,0 +1,9 @@
+{ 
+    "DESIGN_NAME" : "cpu", 
+    "VERILOG_FILES": "dir::../../src*.v",
+    "CLOCK_PORT": "clk", 
+    "CLOCK_PERIOD": 20.0, 
+    "FP_CORE_UTIL": 35, 
+    "PL_TARGET_DENSITY": 0.40, 
+    "SYNTH_MAX_FANOUT": 4
+}

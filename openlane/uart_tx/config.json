@@ -3,6 +3,6 @@
     "VERILOG_FILES": "dir::../../src/uart_tx.v",
     "CLOCK_PORT": "clk",
     "CLOCK_PERIOD": 20.0,
-    "FP_CORE_UTIL": 45,
-    "PL_TARGET_DENSITY": 0.50
+    "FP_CORE_UTIL": 35,
+    "PL_TARGET_DENSITY": 0.55
 }
