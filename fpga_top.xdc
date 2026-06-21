@@ -13,13 +13,16 @@ set_property PACKAGE_PIN K3 [get_ports {btn[1]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {btn[1]}]
 
 # LEDs (Outputs) - ONLY PL LEDS
-set_property PACKAGE_PIN D1 [get_ports {led[0]}]
+set_property PACKAGE_PIN D2 [get_ports {led[0]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {led[0]}]
 
-set_property PACKAGE_PIN D2 [get_ports {led[1]}]
+set_property PACKAGE_PIN D3 [get_ports {led[1]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {led[1]}]
 
-set_property PACKAGE_PIN D3 [get_ports {led[2]}]
+set_property PACKAGE_PIN D4 [get_ports {led[2]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {led[2]}]
+
+set_property PACKAGE_PIN D5 [get_ports {led[2]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {led[2]}]
 
 set_property PACKAGE_PIN D4 [get_ports {led[3]}]
