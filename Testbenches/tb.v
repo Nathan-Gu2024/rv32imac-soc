@@ -2,7 +2,75 @@
 
 module testbench;
     reg clk, rst;
-    cpu_pipelined DUT (.clk(clk), .rst(rst));
+    reg uart_tx_ready;
+    wire uart_tx_start;
+    wire [7:0] uart_tx_data;
+    wire [3:0] leds;
+
+    // CPU Memory Bus Signals
+    wire [31:0] icache_mem_req_addr; 
+    wire icache_mem_req_valid; 
+    wire [127:0] icache_mem_read_data; 
+    wire icache_mem_ready; 
+    
+    wire [31:0] dmem_req_addr; 
+    wire [31:0] store_data; 
+    wire [3:0] mem_write_mask; 
+    wire dcache_mem_req_valid; 
+    wire [127:0] dcache_mem_read_data_block; 
+    wire dcache_mem_ready;
+
+    // Instantiate Device Under Test (DUT)
+    cpu_pipelined DUT (
+        .clk(clk), .rst(rst), .uart_tx_ready(uart_tx_ready),
+        .uart_tx_start(uart_tx_start), .uart_tx_data(uart_tx_data), .leds(leds),
+        
+        .icache_mem_req_addr(icache_mem_req_addr),
+        .icache_mem_req_valid(icache_mem_req_valid),
+        .icache_mem_read_data(icache_mem_read_data),
+        .icache_mem_ready(icache_mem_ready),
+        
+        .dmem_req_addr(dmem_req_addr),
+        .store_data(store_data),
+        .mem_write_mask(mem_write_mask),
+        .dcache_mem_req_valid(dcache_mem_req_valid),
+        .dcache_mem_read_data_block(dcache_mem_read_data_block),
+        .dcache_mem_ready(dcache_mem_ready)
+    );
+
+    // ==========================================
+    //   BEHAVIORAL MEMORY BLOCKS FOR SIMULATION
+    // ==========================================
+    reg [31:0] mock_imem [0:16383]; // 64KB Instruction Memory array
+    reg [31:0] mock_dmem [0:4095];  // 16KB Data Memory array
+
+    // Instruction Memory interface (serves 128-bit lines to your I-Cache)
+    assign icache_mem_ready = icache_mem_req_valid;
+    assign icache_mem_read_data = {
+        mock_imem[{icache_mem_req_addr[31:4], 2'b11}],
+        mock_imem[{icache_mem_req_addr[31:4], 2'b10}],
+        mock_imem[{icache_mem_req_addr[31:4], 2'b01}],
+        mock_imem[{icache_mem_req_addr[31:4], 2'b00}]
+    };
+
+    // Data Memory Interface (serves 128-bit lines to your D-Cache)
+    assign dcache_mem_ready = dcache_mem_req_valid;
+    assign dcache_mem_read_data_block = {
+        mock_dmem[{dmem_req_addr[31:4], 2'b11}],
+        mock_dmem[{dmem_req_addr[31:4], 2'b10}],
+        mock_dmem[{dmem_req_addr[31:4], 2'b01}],
+        mock_dmem[{dmem_req_addr[31:4], 2'b00}]
+    };
+
+    // Handle standard memory write requests straight to mock_dmem
+    always @(posedge clk) begin
+        if (dcache_mem_req_valid && mem_write_mask != 4'b0000) begin
+            if (mem_write_mask[0]) mock_dmem[dmem_req_addr[31:2]][7:0]   <= store_data[7:0];
+            if (mem_write_mask[1]) mock_dmem[dmem_req_addr[31:2]][15:8]  <= store_data[15:8];
+            if (mem_write_mask[2]) mock_dmem[dmem_req_addr[31:2]][23:16] <= store_data[23:16];
+            if (mem_write_mask[3]) mock_dmem[dmem_req_addr[31:2]][31:24] <= store_data[31:24];
+        end
+    end
 
     integer i;
     integer cycle;
@@ -29,7 +97,7 @@ module testbench;
 
         // Basic ALU 
         reset_pipeline();
-        $readmemh("../Mems/test_alu_basics.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_alu_basics.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 1: Basic ALU");
@@ -43,7 +111,7 @@ module testbench;
 
         // EX Forwarding
         reset_pipeline();
-        $readmemh("../Mems/test_ex_forwarding.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_ex_forwarding.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 2: EX Forwarding");
@@ -53,7 +121,7 @@ module testbench;
 
         // MEM Forwarding 
         reset_pipeline();
-        $readmemh("../Mems/test_mem_ex_forwarding.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_mem_ex_forwarding.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 3: MEM Forwarding");
@@ -61,14 +129,14 @@ module testbench;
 
         // Load-Use Stall 
         reset_pipeline();
-        $readmemh("../Mems/test_load_use_stall.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_load_use_stall.mem", mock_imem);
         reset_dut();
         DUT.DMEM.ram[0] = 32'd42;
         repeat(50) @(posedge clk);
 
-        $display("DMEM[0] = %h", DUT.DMEM.ram[0]);
-        $display("x1=%0d x2=%0d x3=%0d", 
-          DUT.RF.regs[1], DUT.RF.regs[2], DUT.RF.regs[3]);
+        // $display("DMEM[0] = %h", DUT.DMEM.ram[0]);
+        // $display("x1=%0d x2=%0d x3=%0d", 
+        //   DUT.RF.regs[1], DUT.RF.regs[2], DUT.RF.regs[3]);
 
         $display("Test 4: Load-Use Stall");
         check(3, 32'd42);
@@ -77,7 +145,7 @@ module testbench;
 
         // Store then Load
         reset_pipeline();
-        $readmemh("../Mems/test_store_load.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_store_load.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 5: Store then Load");
@@ -86,7 +154,7 @@ module testbench;
 
         // Branch Not Taken / Taken 
         reset_pipeline();
-        $readmemh("../Mems/test_branch_taken.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_branch_taken.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 6: Branch");
@@ -94,7 +162,7 @@ module testbench;
 
         // Branch on Forwarded Values
         reset_pipeline();
-        $readmemh("../Mems/test_branch_taken.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_branch_taken.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 7: Branch + Forwarding");
@@ -102,7 +170,7 @@ module testbench;
 
         // JAL / JALR 
         reset_pipeline();
-        $readmemh("../Mems/test_jal_jalr.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_jal_jalr.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 8: JAL/JALR");
@@ -110,7 +178,7 @@ module testbench;
 
         // Load-Use + Branch
         reset_pipeline();
-        $readmemh("../Mems/test_load_use_stall_before_branch.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_load_use_stall_before_branch.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 9: Load-Use + Branch");
@@ -118,7 +186,7 @@ module testbench;
 
         // RVC
         reset_pipeline();
-        $readmemh("../Mems/test_rvc_basics.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_basics.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test10: RVC Compressed Instructions");
@@ -128,7 +196,7 @@ module testbench;
 
         // RVC Corner Cases
         reset_pipeline();
-        $readmemh("../Mems/test_rvc_corner.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_corner.mem", mock_imem);
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 11: RVC Corner Cases (Hazards & Negatives)");
@@ -138,7 +206,7 @@ module testbench;
 
         // RVC Loop
         reset_pipeline();
-        $readmemh("../Mems/test_rvc_loop.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_loop.mem", mock_imem);
         reset_dut();
         repeat(100) @(posedge clk); // Needs more time for loops!
         $display("Test 12: RVC Loop Accumulator");
@@ -147,7 +215,7 @@ module testbench;
 
         // RVC Buffer
         reset_pipeline();
-        $readmemh("../Mems/test_rvc_buffer.mem", DUT.IMEM.rom);
+        $readmemh("../Mems/test_rvc_buffer.mem", mock_imem);
         reset_dut();
         repeat(100) @(posedge clk); 
         $display("Test 13: RVC Buffer");
@@ -172,7 +240,7 @@ module testbench;
         begin
             // Clear IMEM so stale instructions don't execute
             for (k = 0; k < 16384; k = k + 1)
-                DUT.IMEM.rom[k] = 32'h00000013; 
+                mock_imem[k] = 32'h00000013; 
         end
     endtask
 
@@ -180,14 +248,16 @@ module testbench;
         integer k;
         begin
             rst = 1;
+            uart_tx_ready = 1;
             repeat(2) @(posedge clk);
             rst = 0;
             // Clear regfile to 0 between tests
             for (k = 0; k < 32; k = k + 1)
                 DUT.RF.regs[k] = 32'b0;
             // Clear DMEM
-            for (k = 0; k < 1024; k = k + 1)
-                DUT.DMEM.ram[k] = 32'b0;
+            for (k = 0; k < 4096; k = k + 1)
+                mock_dmem[k] = 32'b0;
         end
     endtask
+
 endmodule

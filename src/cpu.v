@@ -10,6 +10,7 @@
 // `include "../src/hazard_unit.v"
 // `include "../src/direct_mapped_cache.v"
 // `include "../src/rvc_expansion.v"
+// `include "../src/reservation_monitor.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
@@ -225,6 +226,9 @@ module cpu_pipelined (
     // );
 
     // ID
+    wire is_lr, is_sc, is_amo;
+    wire [4:0] atomic_op;
+
     control_logic CL (
         .inst(if_id_inst), 
         .reg_wen(reg_wen), 
@@ -234,6 +238,10 @@ module cpu_pipelined (
         .alu_sel(alu_sel),
         .mem_rw(mem_rw), 
         .wb_sel(wb_sel)
+        .out_is_lr(is_lr),
+        .out_is_sc(is_sc),
+        .out_is_amo(is_amo),
+        .out_atomic_op(atomic_op),
     );
 
     regfile RF (
@@ -252,7 +260,8 @@ module cpu_pipelined (
         .imm_sel(imm_sel), 
         .imm(imm)
     );
-
+    wire id_ex_is_lr, id_ex_is_sc, id_ex_is_amo; 
+    wire [4:0] id_ex_atomic_op;
     id_ex_reg ID_EX (
         .clk(clk), 
         .rst(rst),
@@ -270,6 +279,14 @@ module cpu_pipelined (
         .b_sel_in(b_sel), 
         .wb_sel_in(wb_sel),
         .alu_sel_in(alu_sel), 
+        .is_lr_in(is_lr), 
+        .is_sc_in(is_sc), 
+        .is_amo_in(is_amo), 
+        .atomic_op_in(atomic_op), 
+        .is_lr_out(id_ex_is_lr), 
+        .is_sc_out(id_ex_is_sc), 
+        .is_amo_out(id_ex_is_amo), 
+        .atomic_op_out(id_ex_atomic_op), 
         .pc_out(id_ex_pc), 
         .rs1_out(id_ex_rs1), 
         .rs2_out(id_ex_rs2), 
@@ -349,7 +366,8 @@ module cpu_pipelined (
         .fwd_a(fwd_a), 
         .fwd_b(fwd_b)
     );
-    
+    wire ex_mem_is_lr, ex_mem_is_sc, ex_mem_is_amo;
+    wire [4:0] ex_mem_atomic_op;
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
@@ -362,6 +380,14 @@ module cpu_pipelined (
         .reg_wen_in(id_ex_reg_wen),
         .mem_rw_in(id_ex_mem_rw), 
         .wb_sel_in(id_ex_wb_sel),
+        .is_lr_in(id_ex_is_lr), 
+        .is_sc_in(id_ex_is_sc), 
+        .is_amo_in(id_ex_is_amo), 
+        .atomic_op_in(id_ex_atomic_op), 
+        .is_lr_out(ex_mem_is_lr), 
+        .is_sc_out(ex_mem_is_sc), 
+        .is_amo_out(ex_mem_is_amo), 
+        .atomic_op_out(ex_mem_atomic_op), 
         .alu_res_out(ex_mem_alu),
         .rs2_out(ex_mem_rs2), 
         .inst_out(ex_mem_inst),
@@ -418,21 +444,39 @@ module cpu_pipelined (
 
 
     // MEM
+    wire [3:0] raw_write_mask;
     partial_store PS (
         .inst(ex_mem_inst), 
         .mem_address(ex_mem_alu), 
         .data_from_reg(ex_mem_rs2), 
         .mem_rw(ex_mem_mem_rw), 
-        .mem_write_mask(mem_write_mask), 
+        .mem_write_mask(raw_write_mask), 
         .data_to_mem(store_data)
     ); 
+    reservation_monitor RM (
+        .clk(clk), 
+        .rst(rst), 
+        .is_lr_mem(ex_mem_is_lr), 
+        is_sc_mem(ex_mem_is_sc), 
+        .trap_taken(1'b0), // temp
+        .mem_req_addr(ex_mem_alu), 
+        .sc_success(sc_success_flag), 
+        .block_sc_store(block_sc_store)
+    );
+
+    assign mem_write_mask = block_sc_store ? 4'b0000 : raw_write_mask;
+
+    wire [31:0] final_alu_to_wb;
+    assign final_alu_to_wb = ex_mem_is_sc ? 
+                             (sc_success_flag ? 32'd0 : 32'd1) :
+                             ex_mem_alu;     
 
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 
         .mem_stall(global_mem_stall),
         .inst_in(ex_mem_inst),
-        .alu_res_in(ex_mem_alu), 
+        .alu_res_in(final_alu_to_wb), 
         .mem_data_in(dcache_read_data), 
         .pc_in(ex_mem_pc),
         .rd_in(ex_mem_rd),
@@ -510,6 +554,10 @@ module id_ex_reg (
     input wire [1:0] wb_sel_in, 
     input wire [3:0] alu_sel_in,
     input wire [31:0] inst_in,
+    input wire is_lr_in, is_sc_in, is_amo_in, 
+    input wire [4:0] atomic_op_in,
+    output reg is_lr_out, is_sc_out, is_amo_out, 
+    output reg [4:0] atomic_op_out,
     output reg [31:0] pc_out, rs1_out, rs2_out, imm_out,
     output reg [4:0] rd_out,
     output reg reg_wen_out, mem_rw_out, a_sel_out, b_sel_out, 
@@ -521,24 +569,53 @@ module id_ex_reg (
     always @(posedge clk) begin
         if (rst) begin
             mem_rw_out <= 0;
-            rd_out <= 5'b0; pc_out <= 0; rs1_out <= 0; rs2_out <= 0;
-            imm_out <= 0; reg_wen_out <= 0; a_sel_out <= 0;
-            b_sel_out <= 0; wb_sel_out <= 0; alu_sel_out <= 0;
+            rd_out <= 5'b0; 
+            pc_out <= 0; 
+            rs1_out <= 0; 
+            rs2_out <= 0;
+            imm_out <= 0; 
+            reg_wen_out <= 0; 
+            a_sel_out <= 0;
+            b_sel_out <= 0; 
+            wb_sel_out <= 0; 
+            alu_sel_out <= 0;
             inst_out <= 32'h00000013;
         end else if (mem_stall) begin
             // Freeze 
         end else if (flush) begin
             mem_rw_out <= 0;
-            rd_out <= 5'b0; pc_out <= 0; rs1_out <= 0; rs2_out <= 0;
-            imm_out <= 0; reg_wen_out <= 0; a_sel_out <= 0;
-            b_sel_out <= 0; wb_sel_out <= 0; alu_sel_out <= 0;
+            rd_out <= 5'b0; 
+            pc_out <= 0; 
+            rs1_out <= 0; 
+            rs2_out <= 0;
+            imm_out <= 0; 
+            reg_wen_out <= 0; 
+            a_sel_out <= 0;
+            b_sel_out <= 0; 
+            wb_sel_out <= 0; 
+            alu_sel_out <= 0;
             inst_out <= 32'h00000013;
+            is_lr_out <= 1'b0;
+            is_sc_out <= 1'b0;
+            is_amo_out <= 1'b0;
+            atomic_op_out <= 5'b0;
         end else begin
             mem_rw_out <= mem_rw_in;
-            rd_out <= rd_in; pc_out <= pc_in; rs1_out <= rs1_in; rs2_out <= rs2_in;
-            imm_out <= imm_in; reg_wen_out <= reg_wen_in; a_sel_out <= a_sel_in;
-            b_sel_out <= b_sel_in; wb_sel_out <= wb_sel_in; alu_sel_out <= alu_sel_in;
+            rd_out <= rd_in; 
+            pc_out <= pc_in; 
+            rs1_out <= rs1_in; 
+            rs2_out <= rs2_in;
+            imm_out <= imm_in; 
+            reg_wen_out <= reg_wen_in; 
+            a_sel_out <= a_sel_in;
+            b_sel_out <= b_sel_in;
+            wb_sel_out <= wb_sel_in; 
+            alu_sel_out <= alu_sel_in;
             inst_out <= inst_in;
+            is_lr_out <= is_lr_in;
+            is_sc_out <= is_sc_in;
+            is_amo_out <= is_amo_in;
+            atomic_op_out <= atomic_op_in;
         end 
     end
 
@@ -551,6 +628,10 @@ module ex_mem_reg (
     input wire [4:0] rd_in,
     input wire reg_wen_in, mem_rw_in,
     input wire [1:0] wb_sel_in,
+    input wire is_lr_in, is_sc_in, is_amo_in, 
+    input wire [4:0] atomic_op_in,
+    output reg is_lr_out, is_sc_out, is_amo_out,
+    output reg [4:0] atomic_op_out,
     output reg [31:0] alu_res_out, rs2_out, inst_out, pc_out, 
     output reg [4:0] rd_out,
     output reg reg_wen_out, mem_rw_out,
@@ -565,7 +646,11 @@ module ex_mem_reg (
             rs2_out <= 0;
              wb_sel_out <= 0;
             inst_out <= 32'h00000013;
-            pc_out <= 0;                    
+            pc_out <= 0;
+            is_lr_out <= 1'b0;
+            is_sc_out <= 1'b0;
+            is_amo_out <= 1'b0;
+            atomic_op_out <= 5'b0;    
         end else if (mem_stall) begin
             // Freeze
         end else begin
@@ -576,7 +661,11 @@ module ex_mem_reg (
             reg_wen_out <= reg_wen_in;
             mem_rw_out <= mem_rw_in;
             wb_sel_out <= wb_sel_in;
-            pc_out <= pc_in;                
+            pc_out <= pc_in;   
+            is_lr_out <= is_lr_in;
+            is_sc_out <= is_sc_in;
+            is_amo_out <= is_amo_in;
+            atomic_op_out <= atomic_op_in;
         end
     end
 

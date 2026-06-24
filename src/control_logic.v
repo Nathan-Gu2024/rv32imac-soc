@@ -4,10 +4,18 @@ module control_logic (
     output wire [1:0] wb_sel,
     output wire [2:0] imm_sel,
     output wire [3:0] alu_sel
+    output wire out_is_lr, out_is_sc, out_is_amo,
+    output wire [4:0] out_atomic_op
 );
 
     wire [5:0] rom_address;
+    wire is_atomic_inst = (inst[6:0] == 7'b0101111);
+    wire [4:0] atomic_funct5 = inst[31:27];
 
+    wire is_lr = is_atomic_inst && (atomic_funct5 == 5'b0010);
+    wire is_sc = is_atomic_inst && (atomic_funct5 == 5'00011);
+    wire is_amo = is_atomic_inst && !is_lr && !is_sc;
+    
     rom_decoder decoder (
         .inst(inst),
         .rom_address(rom_address)
