@@ -10,12 +10,17 @@ module direct_mapped_cache
         output wire mem_req_valid
     );
     wire [3:0] offset = cpu_req_addr[3:0];
-    wire [5:0] index = cpu_req_addr[9:4];
-    wire [21:0] tag = cpu_req_addr [31:10];
+    // wire [5:0] index = cpu_req_addr[9:4];
+    wire [1:0] index = cpu_req_addr[5:4];
+    // wire [21:0] tag = cpu_req_addr [31:6];
+    wire [25:0] tag = cpu_req_addr [31:6];
 
-    reg [127:0] data_array [0:63];
-    reg [21:0] tag_array [0:63];
-    reg [63:0] valid_array;
+    // reg [127:0] data_array [0:63];
+    reg [127:0] data_array [0:3];
+    // reg [21:0] tag_array [0:63];
+    reg [25:0] tag_array [0:3];
+    // reg [63:0] valid_array;
+    reg [3:0] valid_array;
     integer i;
     wire is_hit = valid_array[index] && (tag_array[index] == tag);
 
@@ -68,7 +73,9 @@ module direct_mapped_cache
 
     always @(posedge clk) begin
         if (rst) begin
-            for (i = 0; i < 64; i = i + 1)
+            // for (i = 0; i < 64; i = i + 1)
+            //     valid_array[i] <= 1'b0;
+            for (i = 0; i < 4; i = i + 1)
                 valid_array[i] <= 1'b0;
         end else if (state == FETCH && mem_ready) begin
             data_array[index] <= mem_read_data;

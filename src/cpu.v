@@ -1,21 +1,33 @@
-`include "../fpga/imem.v"
-`include "../fpga/dmem.v"
-`include "../src/regfile.v"
-`include "../src/alu.v"
-`include "../src/branch_comp.v"
-`include "../src/control_logic.v"
-`include "../src/immgen.v"
-`include "../src/partial_load.v"
-`include "../src/partial_store.v"
-`include "../src/hazard_unit.v"
-`include "../src/direct_mapped_cache.v"
-`include "../src/rvc_expansion.v"
+// `include "../fpga/imem.v"
+// `include "../fpga/dmem.v"
+// `include "../src/regfile.v"
+// `include "../src/alu.v"
+// `include "../src/branch_comp.v"
+// `include "../src/control_logic.v"
+// `include "../src/immgen.v"
+// `include "../src/partial_load.v"
+// `include "../src/partial_store.v"
+// `include "../src/hazard_unit.v"
+// `include "../src/direct_mapped_cache.v"
+// `include "../src/rvc_expansion.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
     output reg uart_tx_start, 
     output reg [7:0] uart_tx_data, 
-    output reg [3:0] leds
+    output reg [3:0] leds,
+
+    output wire [31:0] icache_mem_req_addr, 
+    output wire icache_mem_req_valid, 
+    input wire [127:0] icache_mem_read_data, 
+    input wire icache_mem_ready, 
+    
+    output wire [31:0] dmem_req_addr, 
+    output wire [31:0] store_data, 
+    output wire [3:0] mem_write_mask, 
+    output wire dcache_mem_req_valid, 
+    input wire [127:0] dcache_mem_read_data_block, 
+    input wire dcache_mem_ready
 );
     // IF 
     wire [31:0] pc, if_inst, inst_expanded;
@@ -48,8 +60,9 @@ module cpu_pipelined (
     wire [1:0] ex_mem_wb_sel;
 
     // MEM
-    wire [31:0] mem_read_data, store_data, partial_load_out;
-    wire [3:0] mem_write_mask;
+    wire [31:0] mem_read_data, partial_load_out;
+    // wire [31:0] store_data;
+    // wire [3:0] mem_write_mask;
 
     // MEM/WB out
     wire [31:0] mem_wb_alu, mem_wb_memdata, mem_wb_pc, mem_wb_inst;
@@ -73,10 +86,10 @@ module cpu_pipelined (
     wire [31:0] dcache_read_data;
 
     wire cache_ready;
-    wire [31:0] icache_mem_req_addr;
-    wire [127:0] icache_mem_read_data;
-    wire icache_mem_ready;
-    wire icache_mem_req_valid; 
+    // wire [31:0] icache_mem_req_addr;
+    // wire [127:0] icache_mem_read_data;
+    // wire icache_mem_ready;
+    // wire icache_mem_req_valid; 
 
     direct_mapped_cache ICACHE (
         .clk(clk), 
@@ -106,12 +119,12 @@ module cpu_pipelined (
     wire imem_ready;
     wire [31:0] icache_mem_addr;
 
-    wire dcache_mem_req_valid;
-    wire dcache_mem_ready;
+    // wire dcache_mem_req_valid;
+    // wire dcache_mem_ready;
     wire [127:0] dcache_mem_read_data;
     wire [31:0] dcache_mem_req_addr;
 
-    wire [127:0] dcache_mem_read_data_block;
+    // wire [127:0] dcache_mem_read_data_block;
     
     direct_mapped_cache DCACHE (
         .clk(clk),
@@ -129,16 +142,17 @@ module cpu_pipelined (
         .mem_req_valid(dcache_mem_req_valid)
     );
 
-    dmem DMEM (
-        .clk(clk),
-        .mem_req_valid(dcache_mem_req_valid),
-        .mem_address(is_store ? ex_mem_alu : dcache_mem_req_addr),
-        .mem_write_data(store_data),    
-        .mem_write_mask(mem_write_mask),    
-        .mem_read_data(mem_read_data),
-        .mem_ready(dcache_mem_ready),
-        .mem_read_data_block(dcache_mem_read_data_block)
-    );
+    assign dmem_req_addr = is_store ? ex_mem_alu : dcache_mem_req_addr;
+    // dmem DMEM (
+    //     .clk(clk),
+    //     .mem_req_valid(dcache_mem_req_valid),
+    //     .mem_address(is_store ? ex_mem_alu : dcache_mem_req_addr),
+    //     .mem_write_data(store_data),    
+    //     .mem_write_mask(mem_write_mask),    
+    //     .mem_read_data(mem_read_data),
+    //     .mem_ready(dcache_mem_ready),
+    //     .mem_read_data_block(dcache_mem_read_data_block)
+    // );
 
     // IF    
     // Fetch buffer state
@@ -201,14 +215,14 @@ module cpu_pipelined (
         .inst_out(if_id_inst)
     ); 
                 
-    imem IMEM (
-        .clk(clk), 
-        .rst(rst), 
-        .mem_req_valid(icache_mem_req_valid), 
-        .mem_req_addr(icache_mem_req_addr), 
-        .mem_read_data(icache_mem_read_data), 
-        .mem_ready(icache_mem_ready)
-    );
+    // imem IMEM (
+    //     .clk(clk), 
+    //     .rst(rst), 
+    //     .mem_req_valid(icache_mem_req_valid), 
+    //     .mem_req_addr(icache_mem_req_addr), 
+    //     .mem_read_data(icache_mem_read_data), 
+    //     .mem_ready(icache_mem_ready)
+    // );
 
     // ID
     control_logic CL (
@@ -358,32 +372,49 @@ module cpu_pipelined (
         .wb_sel_out(ex_mem_wb_sel)
     );
 
-    always @(posedge clk) begin
-        if (rst) begin
-            leds <= 16'b0;
-        end else if (ex_mem_mem_rw) begin
-            if (ex_mem_alu == 32'h00002000) begin
-                leds <= ex_mem_rs2[15:0];
-            end 
-        end 
-    end 
+    // always @(posedge clk) begin
+    //     if (rst) begin
+    //         leds <= 16'b0;
+    //     end else if (ex_mem_mem_rw) begin
+    //         if (ex_mem_alu == 32'h00002000) begin
+    //             leds <= ex_mem_rs2[15:0];
+    //         end 
+    //     end 
+    // end 
 
+    // always @(posedge clk) begin
+    //     if (rst) begin
+    //         leds <= 3'b0; 
+    //         uart_tx_start <= 1'b0;
+    //     end else begin
+    //         uart_tx_start <= 1'b0; 
+    //         if (ex_mem_mem_rw) begin
+    //             if (ex_mem_alu == 32'h00002000) begin
+    //                 leds <= ex_mem_rs2[2:0]; 
+    //             end else if (ex_mem_alu == 32'h00003000) begin
+    //                 uart_tx_data <= ex_mem_rs2[7:0];
+    //                 uart_tx_start <= 1'b1;
+    //             end 
+    //         end 
+    //     end 
+    // end 
     always @(posedge clk) begin
         if (rst) begin
-            leds <= 3'b0; 
+            leds <= 4'b0;
             uart_tx_start <= 1'b0;
+            uart_tx_data <= 8'b0;
         end else begin
-            uart_tx_start <= 1'b0; 
+            uart_tx_start <= 1'b0;
             if (ex_mem_mem_rw) begin
                 if (ex_mem_alu == 32'h00002000) begin
-                    leds <= ex_mem_rs2[2:0]; 
+                    leds <= ex_mem_rs2[3:0];
                 end else if (ex_mem_alu == 32'h00003000) begin
                     uart_tx_data <= ex_mem_rs2[7:0];
                     uart_tx_start <= 1'b1;
                 end 
             end 
         end 
-    end 
+    end
 
 
     // MEM

@@ -1,9 +1,22 @@
-{ 
-    "DESIGN_NAME" : "cpu", 
-    "VERILOG_FILES": "dir::../../src*.v",
-    "CLOCK_PORT": "clk", 
-    "CLOCK_PERIOD": 20.0, 
-    "FP_CORE_UTIL": 35, 
-    "PL_TARGET_DENSITY": 0.40, 
-    "SYNTH_MAX_FANOUT": 4
+{
+    "DESIGN_NAME": "cpu_pipelined",
+    "VERILOG_FILES": [
+        "dir::../../src/cpu.v",
+        "dir::../../src/alu.v",
+        "dir::../../src/regfile.v",
+        "dir::../../src/branch_comp.v",
+        "dir::../../src/control_logic.v",
+        "dir::../../src/immgen.v",
+        "dir::../../src/partial_load.v",
+        "dir::../../src/partial_store.v",
+        "dir::../../src/hazard_unit.v",
+        "dir::../../src/direct_mapped_cache.v",
+        "dir::../../src/rvc_expansion.v"
+    ],
+    "CLOCK_PORT": "clk",
+    "CLOCK_PERIOD": 20.0,
+    "FP_CORE_UTIL": 35,
+    "PL_TARGET_DENSITY": 0.40,
+    "MAX_FANOUT_CONSTRAINT": 4,
+    "SYNTH_STRATEGY": "AREA 1"
 }
