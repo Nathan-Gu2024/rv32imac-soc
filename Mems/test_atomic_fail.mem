@@ -1,0 +1,9 @@
+01000293  // addi x5, x0, 16    -> x5 = 0x00000010 (Memory address target)
+02a00313  // addi x6, x0, 42    -> x6 = 42         (SC value)
+05900493  // addi x9, x0, 89    -> x9 = 89         (Intervening normal write value)
+1002a3af  // lr.w x7, (x5)      -> Load word from 0x10, set reservation
+0092a023  // sw x9, 0(x5)       -> Standard store word to 0x10 (Clears reservation!)
+1862a42f  // sc.w x8, x6, (x5)  -> This store conditional should fail!
+00000013  // nop
+00000013  // nop  
+0002a503  // lw x10, 0(x5)

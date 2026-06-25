@@ -1,35 +1,45 @@
 module reservation_monitor (
-    input wire clk, rst, is_lr_mem, is_sc_mem, trap_taken,
-    input wire [31:0] mem_req_addr, 
-    output reg sc_success, 
-    output wire block_sc_store
+    input wire clk,
+    input wire rst,
+    input wire lr_en,        
+    input wire sc_en,       
+    input wire any_store_en,
+    input wire trap_taken,
+    input wire [31:0] mem_addr,
+    output wire sc_successful 
 );
-    reg [31:0] lock_addr; 
-    reg lock_valid; 
+
+    reg [31:0] reserved_addr;
+    reg lock_valid;
+
+    // SC succeeds ONLY if the lock is valid AND the target address matches the reservation
+    assign sc_successful = sc_en & lock_valid & (mem_addr == reserved_addr);
 
     always @(posedge clk) begin
-        if (rst || trap_taken) begin
+        if (rst) begin
             lock_valid <= 1'b0;
-            lock_addr <= 32'b0;
-            sc_success <= 1'b0;
+            reserved_addr <= 32'b0;
         end else begin
-            sc_success <= 1'b0;
-            
-            if (is_lr_mem) begin
-                lock_addr <= mem_req_addr;
-                lock_valid <= 1'b1;
-            end else if (is_sc_mem) begin
-                if (lock_valid && (lock_addr == mem_req_addr)) begin
-                    sc_success <= 1'b1;
-                end else begin
-                    sc_success <= 1'b0;
-                end 
-
+            // Invalidate on interrupts/traps 
+            if (trap_taken) begin
                 lock_valid <= 1'b0;
-            end 
-        end 
-    end 
-    // if SC instruction but lock invalid -> block the memory write
-    assign block_sc_store = is_sc_mem && !(lock_valid && (lock_addr == mem_req_addr));
-
+            end
+            
+            // Load-Reserved places the reservation
+            else if (lr_en) begin
+                lock_valid <= 1'b1;
+                reserved_addr <= mem_addr;
+            end
+            
+            // Store-Conditional always clears the reservation
+            else if (sc_en) begin
+                lock_valid <= 1'b0;
+            end
+            
+            // Any standard store invalidates the reservation
+            else if (any_store_en) begin
+                lock_valid <= 1'b0;
+            end
+        end
+    end
 endmodule

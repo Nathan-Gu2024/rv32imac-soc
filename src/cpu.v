@@ -1,16 +1,16 @@
-// `include "../fpga/imem.v"
-// `include "../fpga/dmem.v"
-// `include "../src/regfile.v"
-// `include "../src/alu.v"
-// `include "../src/branch_comp.v"
-// `include "../src/control_logic.v"
-// `include "../src/immgen.v"
-// `include "../src/partial_load.v"
-// `include "../src/partial_store.v"
-// `include "../src/hazard_unit.v"
-// `include "../src/direct_mapped_cache.v"
-// `include "../src/rvc_expansion.v"
-// `include "../src/reservation_monitor.v"
+`include "../fpga/imem.v"
+`include "../fpga/dmem.v"
+`include "../src/regfile.v"
+`include "../src/alu.v"
+`include "../src/branch_comp.v"
+`include "../src/control_logic.v"
+`include "../src/immgen.v"
+`include "../src/partial_load.v"
+`include "../src/partial_store.v"
+`include "../src/hazard_unit.v"
+`include "../src/direct_mapped_cache.v"
+`include "../src/rvc_expansion.v"
+`include "../src/reservation_monitor.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
@@ -237,11 +237,11 @@ module cpu_pipelined (
         .b_sel(b_sel),
         .alu_sel(alu_sel),
         .mem_rw(mem_rw), 
-        .wb_sel(wb_sel)
+        .wb_sel(wb_sel),
         .out_is_lr(is_lr),
         .out_is_sc(is_sc),
         .out_is_amo(is_amo),
-        .out_atomic_op(atomic_op),
+        .out_atomic_op(atomic_op)
     );
 
     regfile RF (
@@ -453,24 +453,28 @@ module cpu_pipelined (
         .mem_write_mask(raw_write_mask), 
         .data_to_mem(store_data)
     ); 
+
+    wire sc_success_flag;
+    
     reservation_monitor RM (
-        .clk(clk), 
-        .rst(rst), 
-        .is_lr_mem(ex_mem_is_lr), 
-        is_sc_mem(ex_mem_is_sc), 
-        .trap_taken(1'b0), // temp
-        .mem_req_addr(ex_mem_alu), 
-        .sc_success(sc_success_flag), 
-        .block_sc_store(block_sc_store)
-    );
+    .clk(clk),
+    .rst(rst),
+    .lr_en(ex_mem_is_lr & ~global_mem_stall),
+    .sc_en(ex_mem_is_sc & ~global_mem_stall),
+    .any_store_en(is_store & ~ex_mem_is_sc & ~global_mem_stall),
+    .trap_taken(1'b0), // temp
+    .mem_addr(ex_mem_alu),
+    .sc_successful(sc_success_flag)
+     );
 
+    wire block_sc_store = ex_mem_is_sc & ~sc_success_flag;
     assign mem_write_mask = block_sc_store ? 4'b0000 : raw_write_mask;
-
     wire [31:0] final_alu_to_wb;
     assign final_alu_to_wb = ex_mem_is_sc ? 
                              (sc_success_flag ? 32'd0 : 32'd1) :
-                             ex_mem_alu;     
+                             ex_mem_alu;  
 
+    
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 

@@ -3,7 +3,7 @@ module control_logic (
     output wire reg_wen, a_sel, b_sel, mem_rw,
     output wire [1:0] wb_sel,
     output wire [2:0] imm_sel,
-    output wire [3:0] alu_sel
+    output wire [3:0] alu_sel,
     output wire out_is_lr, out_is_sc, out_is_amo,
     output wire [4:0] out_atomic_op
 );
@@ -12,8 +12,8 @@ module control_logic (
     wire is_atomic_inst = (inst[6:0] == 7'b0101111);
     wire [4:0] atomic_funct5 = inst[31:27];
 
-    wire is_lr = is_atomic_inst && (atomic_funct5 == 5'b0010);
-    wire is_sc = is_atomic_inst && (atomic_funct5 == 5'00011);
+    wire is_lr = is_atomic_inst && (atomic_funct5 == 5'b00010);
+    wire is_sc = is_atomic_inst && (atomic_funct5 == 5'b00011);
     wire is_amo = is_atomic_inst && !is_lr && !is_sc;
     
     rom_decoder decoder (
@@ -31,6 +31,11 @@ module control_logic (
         .imm_sel(imm_sel),
         .alu_sel(alu_sel)
     );
+    assign out_is_lr  = is_lr;
+    assign out_is_sc  = is_sc;
+    assign out_is_amo = is_amo;
+    assign out_atomic_op = atomic_funct5;
+
 
 endmodule
 
@@ -82,6 +87,8 @@ module rom (
             6'd33: rom_out = 16'h17C7; // lui
             6'd34: rom_out = 16'h2069; // jal
             6'd35: rom_out = 16'h2041; // jalr
+            6'd36: rom_out = 16'h004F; // lr.w
+            6'd37: rom_out = 16'h184F; // sc.w
             default: rom_out = 16'h0000;
         endcase
     end
@@ -145,6 +152,8 @@ endmodule
 //         mem[33] = 16'h17C7; // lui
 //         mem[34] = 16'h2069; // jal
 //         mem[35] = 16'h2041; // jalr
+//         mem[36] = 16'h004F; // lr.w
+//         mem[37] = 16'h184F; // sc.w
 //     end
 
 //     wire [15:0] rom_out = mem[rom_address];
@@ -169,62 +178,73 @@ module rom_decoder (
     wire [2:0] funct3 = inst[14:12];
     wire f7_bit5 = inst[30];
     wire f7_bit0 = inst[25];
+    wire [4:0] funct5 = inst[31:27];
 
     always @(*) begin
-        casex ({opcode, funct3, f7_bit5, f7_bit0})
-            // R-Types (All bits matter)
-            10'b01100_000_00: rom_address = 6'd0; // add
-            10'b01100_000_01: rom_address = 6'd1; // mul
-            10'b01100_000_10: rom_address = 6'd2; // sub
-            10'b01100_001_00: rom_address = 6'd3; // sll
-            10'b01100_001_01: rom_address = 6'd4; // mulh
-            10'b01100_011_01: rom_address = 6'd5; // mulhu
-            10'b01100_010_00: rom_address = 6'd6; // slt
-            10'b01100_100_00: rom_address = 6'd7; // xor
-            10'b01100_101_00: rom_address = 6'd8; // srl
-            10'b01100_101_10: rom_address = 6'd9; // sra
-            10'b01100_110_00: rom_address = 6'd10; // or
-            10'b01100_111_00: rom_address = 6'd11; // and
-            
-            // Memory Loads (I-Type: f7 bits are part of immediate)
-            10'b00000_000_?_?: rom_address = 6'd12; // lb
-            10'b00000_001_?_?: rom_address = 6'd13; // lh
-            10'b00000_010_?_?: rom_address = 6'd14; // lw
-            
-            // Memory Stores (S-Type: f7 bits are part of immediate)
-            10'b01000_000_?_?: rom_address = 6'd23; // sb
-            10'b01000_001_?_?: rom_address = 6'd24; // sh
-            10'b01000_010_?_?: rom_address = 6'd25; // sw
-            
-            // I-Type ALU (f7 bits are part of immediate)
-            10'b00100_000_?_?: rom_address = 6'd15; // addi
-            10'b00100_010_?_?: rom_address = 6'd17; // slti
-            10'b00100_100_?_?: rom_address = 6'd18; // xori
-            10'b00100_110_?_?: rom_address = 6'd21; // ori
-            10'b00100_111_?_?: rom_address = 6'd22; // andi
-            
-            // I-Type Shifts (f7_bit5 is a modifier, f7_bit0 mask to be safe)
-            10'b00100_001_0_?: rom_address = 6'd16; // slli
-            10'b00100_101_0_?: rom_address = 6'd19; // srli
-            10'b00100_101_1_?: rom_address = 6'd20; // srai
-            
-            // B-Type Branches (f7 bits are part of immediate)
-            10'b11000_000_?_?: rom_address = 6'd26; // beq
-            10'b11000_001_?_?: rom_address = 6'd27; // bne
-            10'b11000_100_?_?: rom_address = 6'd28; // blt
-            10'b11000_101_?_?: rom_address = 6'd29; // bge
-            10'b11000_110_?_?: rom_address = 6'd30; // bltu
-            10'b11000_111_?_?: rom_address = 6'd31; // bgeu
-            
-            // U-Type and J-Type (funct3 and f7 bits are all part of immediate)
-            10'b00101_???_?_?: rom_address = 6'd32; // auipc
-            10'b01101_???_?_?: rom_address = 6'd33; // lui
-            10'b11011_???_?_?: rom_address = 6'd34; // jal
-            
-            // JALR (I-Type, funct3 is 000)
-            10'b11001_000_?_?: rom_address = 6'd35; // jalr
-            
-            default: rom_address = 6'd0;
-        endcase
+        // Intercept Atomics (Opcode: 01011)
+        if (opcode == 5'b01011) begin
+            if (funct5 == 5'b00010)
+                rom_address = 6'd36; // lr.w
+            else if (funct5 == 5'b00011)
+                rom_address = 6'd37; // sc.w
+            else
+                rom_address = 6'd0;  // Fallback for AMO (add) until implemented
+        end else begin 
+            casex ({opcode, funct3, f7_bit5, f7_bit0})
+                // R-Types (All bits matter)
+                10'b01100_000_00: rom_address = 6'd0; // add
+                10'b01100_000_01: rom_address = 6'd1; // mul
+                10'b01100_000_10: rom_address = 6'd2; // sub
+                10'b01100_001_00: rom_address = 6'd3; // sll
+                10'b01100_001_01: rom_address = 6'd4; // mulh
+                10'b01100_011_01: rom_address = 6'd5; // mulhu
+                10'b01100_010_00: rom_address = 6'd6; // slt
+                10'b01100_100_00: rom_address = 6'd7; // xor
+                10'b01100_101_00: rom_address = 6'd8; // srl
+                10'b01100_101_10: rom_address = 6'd9; // sra
+                10'b01100_110_00: rom_address = 6'd10; // or
+                10'b01100_111_00: rom_address = 6'd11; // and
+                
+                // Memory Loads (I-Type: f7 bits are part of immediate)
+                10'b00000_000_?_?: rom_address = 6'd12; // lb
+                10'b00000_001_?_?: rom_address = 6'd13; // lh
+                10'b00000_010_?_?: rom_address = 6'd14; // lw
+                
+                // Memory Stores (S-Type: f7 bits are part of immediate)
+                10'b01000_000_?_?: rom_address = 6'd23; // sb
+                10'b01000_001_?_?: rom_address = 6'd24; // sh
+                10'b01000_010_?_?: rom_address = 6'd25; // sw
+                
+                // I-Type ALU (f7 bits are part of immediate)
+                10'b00100_000_?_?: rom_address = 6'd15; // addi
+                10'b00100_010_?_?: rom_address = 6'd17; // slti
+                10'b00100_100_?_?: rom_address = 6'd18; // xori
+                10'b00100_110_?_?: rom_address = 6'd21; // ori
+                10'b00100_111_?_?: rom_address = 6'd22; // andi
+                
+                // I-Type Shifts (f7_bit5 is a modifier, f7_bit0 mask to be safe)
+                10'b00100_001_0_?: rom_address = 6'd16; // slli
+                10'b00100_101_0_?: rom_address = 6'd19; // srli
+                10'b00100_101_1_?: rom_address = 6'd20; // srai
+                
+                // B-Type Branches (f7 bits are part of immediate)
+                10'b11000_000_?_?: rom_address = 6'd26; // beq
+                10'b11000_001_?_?: rom_address = 6'd27; // bne
+                10'b11000_100_?_?: rom_address = 6'd28; // blt
+                10'b11000_101_?_?: rom_address = 6'd29; // bge
+                10'b11000_110_?_?: rom_address = 6'd30; // bltu
+                10'b11000_111_?_?: rom_address = 6'd31; // bgeu
+                
+                // U-Type and J-Type (funct3 and f7 bits are all part of immediate)
+                10'b00101_???_?_?: rom_address = 6'd32; // auipc
+                10'b01101_???_?_?: rom_address = 6'd33; // lui
+                10'b11011_???_?_?: rom_address = 6'd34; // jal
+                
+                // JALR (I-Type, funct3 is 000)
+                10'b11001_000_?_?: rom_address = 6'd35; // jalr
+                
+                default: rom_address = 6'd0;
+            endcase
+        end 
     end
 endmodule

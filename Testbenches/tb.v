@@ -38,13 +38,10 @@ module testbench;
         .dcache_mem_ready(dcache_mem_ready)
     );
 
-    // ==========================================
-    //   BEHAVIORAL MEMORY BLOCKS FOR SIMULATION
-    // ==========================================
     reg [31:0] mock_imem [0:16383]; // 64KB Instruction Memory array
     reg [31:0] mock_dmem [0:4095];  // 16KB Data Memory array
 
-    // Instruction Memory interface (serves 128-bit lines to your I-Cache)
+    // Instruction Memory interface (serves 128-bit lines to I-Cache)
     assign icache_mem_ready = icache_mem_req_valid;
     assign icache_mem_read_data = {
         mock_imem[{icache_mem_req_addr[31:4], 2'b11}],
@@ -53,7 +50,7 @@ module testbench;
         mock_imem[{icache_mem_req_addr[31:4], 2'b00}]
     };
 
-    // Data Memory Interface (serves 128-bit lines to your D-Cache)
+    // Data Memory Interface (serves 128-bit lines to D-Cache)
     assign dcache_mem_ready = dcache_mem_req_valid;
     assign dcache_mem_read_data_block = {
         mock_dmem[{dmem_req_addr[31:4], 2'b11}],
@@ -79,14 +76,14 @@ module testbench;
     always #5 clk = ~clk;
 
     task check;
-        input [4:0]  reg_num;
+        input [4:0] reg_num;
         input [31:0] expected;
         begin
             if (DUT.RF.regs[reg_num] === expected)
                 $display("PASS: x%0d = %0d", reg_num, expected);
             else
                 $display("FAIL: x%0d = %0d, expected %0d",
-                          reg_num, DUT.RF.regs[reg_num], expected);
+                    reg_num, DUT.RF.regs[reg_num], expected);
         end
     endtask
 
@@ -131,12 +128,12 @@ module testbench;
         reset_pipeline();
         $readmemh("../Mems/test_load_use_stall.mem", mock_imem);
         reset_dut();
-        DUT.DMEM.ram[0] = 32'd42;
+        mock_dmem[0] = 32'd42;
         repeat(50) @(posedge clk);
 
         // $display("DMEM[0] = %h", DUT.DMEM.ram[0]);
         // $display("x1=%0d x2=%0d x3=%0d", 
-        //   DUT.RF.regs[1], DUT.RF.regs[2], DUT.RF.regs[3]);
+        // DUT.RF.regs[1], DUT.RF.regs[2], DUT.RF.regs[3]);
 
         $display("Test 4: Load-Use Stall");
         check(3, 32'd42);
@@ -200,8 +197,8 @@ module testbench;
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 11: RVC Corner Cases (Hazards & Negatives)");
-        check(1, 32'd5);  // 10 - 5 = 5
-        check(2, 32'd5);  // 0 + 5 = 5
+        check(1, 32'd5); // 10 - 5 = 5
+        check(2, 32'd5); // 0 + 5 = 5
         check(3, 32'd15); // 5 + 10 = 15
 
         // RVC Loop
@@ -210,7 +207,7 @@ module testbench;
         reset_dut();
         repeat(100) @(posedge clk); // Needs more time for loops!
         $display("Test 12: RVC Loop Accumulator");
-        check(1, 32'd0);  // Counter should reach 0
+        check(1, 32'd0); // Counter should reach 0
         check(2, 32'd15); // Sum should be 15
 
         // RVC Buffer
@@ -224,6 +221,30 @@ module testbench;
         check(2, 32'd10); 
         // Check the subsequent 32-bit instruction
         check(3, 32'd15);        
+
+        // Atomic Success
+        reset_pipeline();
+        $readmemh("../Mems/test_atomic_success.mem", mock_imem);
+        reset_dut();
+        repeat(100) @(posedge clk); 
+        $display("Test 15: Atomic Success");     
+        check(5, 32'd16); // x5 should be 16
+        check(6, 32'd42); // x6 should be 42
+        check(8, 32'd0); // x8 should be 0 because Store-Conditional succeeded
+        check(10, 32'd42);
+
+
+        // Atomic Fail
+        reset_pipeline();
+        $readmemh("../Mems/test_atomic_fail.mem", mock_imem);
+        reset_dut();
+        repeat(100) @(posedge clk); 
+        $display("Test 16: Atomic Fail");     
+        check(5, 32'd16); // x5 should be 16
+        check(6, 32'd42); // x6 should be 42
+        check(9, 32'd89); // x9 should be 89
+        check(8, 32'd1); 
+        check(10, 32'd89);    
         $finish;
 
     end
