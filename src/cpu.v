@@ -11,6 +11,7 @@
 `include "../src/direct_mapped_cache.v"
 `include "../src/rvc_expansion.v"
 `include "../src/reservation_monitor.v"
+`include "../src/csr_file.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
@@ -36,17 +37,19 @@ module cpu_pipelined (
     // IF/ID out
     wire [31:0] if_id_pc, if_id_inst;
     wire is_compressed;
+
     // ID
     wire [31:0] rs1_data, rs2_data, imm;
-    wire pc_sel, reg_wen, a_sel, b_sel, mem_rw;
+    wire pc_sel, reg_wen, a_sel, b_sel, mem_rw, is_lr, is_sc, is_amo, csr_wen;
     wire [1:0] wb_sel;
     wire [2:0] imm_sel;
     wire [3:0] alu_sel;
+    wire [4:0] atomic_op;
 
     // ID/EX out
     wire [31:0] id_ex_pc, id_ex_rs1, id_ex_rs2, id_ex_imm, id_ex_inst;
-    wire [4:0] id_ex_rd;
-    wire id_ex_reg_wen, id_ex_mem_rw, id_ex_a_sel, id_ex_b_sel;
+    wire [4:0] id_ex_rd, id_ex_atomic_op;
+    wire id_ex_reg_wen, id_ex_mem_rw, id_ex_a_sel, id_ex_b_sel, id_ex_is_lr, id_ex_is_sc, id_ex_is_amo; 
     wire [1:0] id_ex_wb_sel;
     wire [3:0] id_ex_alu_sel;
 
@@ -56,12 +59,15 @@ module cpu_pipelined (
 
     // EX/MEM out
     wire [31:0] ex_mem_alu, ex_mem_rs2, ex_mem_inst, ex_mem_pc;
-    wire [4:0] ex_mem_rd;
-    wire ex_mem_reg_wen, ex_mem_mem_rw;
+    wire [4:0] ex_mem_rd, ex_mem_atomic_op;
+    wire ex_mem_reg_wen, ex_mem_mem_rw, ex_mem_is_lr, ex_mem_is_sc, ex_mem_is_amo;
     wire [1:0] ex_mem_wb_sel;
 
     // MEM
     wire [31:0] mem_read_data, partial_load_out;
+    wire sc_success_flag;
+    wire [3:0] raw_write_mask;
+    wire [31:0] final_alu_to_wb;
     // wire [31:0] store_data;
     // wire [3:0] mem_write_mask;
 
@@ -189,9 +195,7 @@ module cpu_pipelined (
     );
     // Pipeline routing
     wire [31:0] final_inst = is_compressed ? inst_expanded : raw_inst;
-
     wire [31:0] muxed_if_inst = unaligned_32_bit_fetch ? 32'h00000013 : final_inst;
-
     wire [31:0] pc_inc = (unaligned_32_bit_fetch || buffer_valid || is_compressed) ? 32'd2 : 32'd4;
 
     program_counter PC (
@@ -226,9 +230,6 @@ module cpu_pipelined (
     // );
 
     // ID
-    wire is_lr, is_sc, is_amo;
-    wire [4:0] atomic_op;
-
     control_logic CL (
         .inst(if_id_inst), 
         .reg_wen(reg_wen), 
@@ -241,7 +242,8 @@ module cpu_pipelined (
         .out_is_lr(is_lr),
         .out_is_sc(is_sc),
         .out_is_amo(is_amo),
-        .out_atomic_op(atomic_op)
+        .out_atomic_op(atomic_op),
+        .csr_wen(csr_wen)
     );
 
     regfile RF (
@@ -260,8 +262,7 @@ module cpu_pipelined (
         .imm_sel(imm_sel), 
         .imm(imm)
     );
-    wire id_ex_is_lr, id_ex_is_sc, id_ex_is_amo; 
-    wire [4:0] id_ex_atomic_op;
+
     id_ex_reg ID_EX (
         .clk(clk), 
         .rst(rst),
@@ -333,7 +334,6 @@ module cpu_pipelined (
     wire id_ex_is_bgeu = id_ex_is_branch && (ex_funct3 == 3'b111);
     wire id_ex_is_jal = (ex_opcode == 7'b1101111);
     wire id_ex_is_jalr = (ex_opcode == 7'b1100111);
-
     wire id_ex_br_eq, id_ex_br_lt;
 
     branch_comp BC (
@@ -366,13 +366,32 @@ module cpu_pipelined (
         .fwd_a(fwd_a), 
         .fwd_b(fwd_b)
     );
-    wire ex_mem_is_lr, ex_mem_is_sc, ex_mem_is_amo;
-    wire [4:0] ex_mem_atomic_op;
+    
+    wire ex_is_csrrw = (id_ex_inst[6:0] == 7'b1110011) && (id_ex_inst[14:12] == 3'b001);
+    wire ex_csr_wen = ex_is_csrrw && !global_mem_stall && !stall;
+    wire [31:0] csr_rdata;
+    wire [31:0] mtvec_out, mepc_out;
+    csr_file CSR (
+        .clk(clk), 
+        .rst(rst), 
+        .csr_addr(id_ex_inst[31:20]), 
+        .csr_wdata(fwd_rs1),
+        .csr_wen(ex_csr_wen), 
+        .csr_rdata(csr_rdata),
+        .trap_taken(1'b0), 
+        .trap_taken(1'b0),
+        .trap_cause(32'b0),
+        .mret_exec(1'b0),
+        .mtvec_out(mtvec_out),
+        .mepc_out(mepc_out)
+    ); 
+    wire [31:0] actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
+
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
         .mem_stall(global_mem_stall),
-        .alu_res_in(alu_out), 
+        .alu_res_in(actual_ex_result), 
         .rs2_in(fwd_rs2), 
         .inst_in(id_ex_inst), 
         .pc_in(id_ex_pc),
@@ -442,9 +461,7 @@ module cpu_pipelined (
         end 
     end
 
-
     // MEM
-    wire [3:0] raw_write_mask;
     partial_store PS (
         .inst(ex_mem_inst), 
         .mem_address(ex_mem_alu), 
@@ -454,22 +471,20 @@ module cpu_pipelined (
         .data_to_mem(store_data)
     ); 
 
-    wire sc_success_flag;
     
     reservation_monitor RM (
-    .clk(clk),
-    .rst(rst),
-    .lr_en(ex_mem_is_lr & ~global_mem_stall),
-    .sc_en(ex_mem_is_sc & ~global_mem_stall),
-    .any_store_en(is_store & ~ex_mem_is_sc & ~global_mem_stall),
-    .trap_taken(1'b0), // temp
-    .mem_addr(ex_mem_alu),
-    .sc_successful(sc_success_flag)
-     );
+        .clk(clk),
+        .rst(rst),
+        .lr_en(ex_mem_is_lr & ~global_mem_stall),
+        .sc_en(ex_mem_is_sc & ~global_mem_stall),
+        .any_store_en(is_store & ~ex_mem_is_sc & ~global_mem_stall),
+        .trap_taken(1'b0), // temp
+        .mem_addr(ex_mem_alu),
+        .sc_successful(sc_success_flag)
+    );
 
     wire block_sc_store = ex_mem_is_sc & ~sc_success_flag;
     assign mem_write_mask = block_sc_store ? 4'b0000 : raw_write_mask;
-    wire [31:0] final_alu_to_wb;
     assign final_alu_to_wb = ex_mem_is_sc ? 
                              (sc_success_flag ? 32'd0 : 32'd1) :
                              ex_mem_alu;  
@@ -528,7 +543,6 @@ module program_counter (
 endmodule
 
 
-
 module if_id_reg (
     input wire clk, rst, stall, flush, mem_stall, 
     input wire [31:0] pc_in, inst_in,
@@ -549,6 +563,7 @@ module if_id_reg (
         end 
     end    
 endmodule
+
 
 module id_ex_reg (
     input wire clk, rst, flush, mem_stall,

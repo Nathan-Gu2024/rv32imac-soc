@@ -247,6 +247,18 @@ module testbench;
         check(10, 32'd89);    
         $finish;
 
+        // CSR Read/Write (ALU Hijack)
+        reset_pipeline();
+        $readmemh("../Mems/test_csr_rw.mem", mock_imem);
+        reset_dut();
+        repeat(100) @(posedge clk); 
+        $display("Test 17: CSR Read/Write");     
+        // Check 1: Did the first csrrw read the default reset value of mtvec?
+        check(6, 32'd0);   // x6 should be 0
+        
+        // Check 2: Did the second csrrw successfully read the 89 we wrote earlier?
+        check(8, 32'd89);  // x8 should be 89
+        
     end
 
     // Global simulation watchdog timeout

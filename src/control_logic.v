@@ -5,17 +5,18 @@ module control_logic (
     output wire [2:0] imm_sel,
     output wire [3:0] alu_sel,
     output wire out_is_lr, out_is_sc, out_is_amo,
-    output wire [4:0] out_atomic_op
+    output wire [4:0] out_atomic_op,
+    output wire csr_wen
 );
 
     wire [5:0] rom_address;
     wire is_atomic_inst = (inst[6:0] == 7'b0101111);
     wire [4:0] atomic_funct5 = inst[31:27];
-
     wire is_lr = is_atomic_inst && (atomic_funct5 == 5'b00010);
     wire is_sc = is_atomic_inst && (atomic_funct5 == 5'b00011);
     wire is_amo = is_atomic_inst && !is_lr && !is_sc;
-    
+    wire is_system_inst = (inst[6:0] == 7'b1110011);
+
     rom_decoder decoder (
         .inst(inst),
         .rom_address(rom_address)
@@ -35,7 +36,7 @@ module control_logic (
     assign out_is_sc  = is_sc;
     assign out_is_amo = is_amo;
     assign out_atomic_op = atomic_funct5;
-
+    assign csr_wen = is_system_inst && (inst[14:12] == 3'b001);
 
 endmodule
 
@@ -88,7 +89,8 @@ module rom (
             6'd34: rom_out = 16'h2069; // jal
             6'd35: rom_out = 16'h2041; // jalr
             6'd36: rom_out = 16'h004F; // lr.w
-            6'd37: rom_out = 16'h184F; // sc.w
+            6'd37: rom_out = 16'h184F; // sc.w 
+            6'd38: rom_out = 16'h8030F; // csrrw
             default: rom_out = 16'h0000;
         endcase
     end
@@ -188,7 +190,9 @@ module rom_decoder (
             else if (funct5 == 5'b00011)
                 rom_address = 6'd37; // sc.w
             else
-                rom_address = 6'd0;  // Fallback for AMO (add) until implemented
+                rom_address = 6'd0; // Fallback for AMO (add) until implemented / needed
+        end else if (inst[6:2] == 5'b11100) begin
+            rom_address = 6'd0; 
         end else begin 
             casex ({opcode, funct3, f7_bit5, f7_bit0})
                 // R-Types (All bits matter)

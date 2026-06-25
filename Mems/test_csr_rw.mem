@@ -1,0 +1,7 @@
+05900293  // addi x5, x0, 89    -> x5 = 89
+30529373  // csrrw x6, mtvec, x5 -> Write 89 to mtvec. Old mtvec (0) goes to x6.
+02a00393  // addi x7, x0, 42    -> x7 = 42
+30539473  // csrrw x8, mtvec, x7 -> Write 42 to mtvec. Old mtvec (89) goes to x8.
+00000013  // nop
+00000013  // nop
+00000013  // nop
