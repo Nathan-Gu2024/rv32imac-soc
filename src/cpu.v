@@ -54,8 +54,9 @@ module cpu_pipelined (
     wire [3:0] id_ex_alu_sel;
 
     // EX
-    wire [31:0] alu_a, alu_b, alu_out, fwd_rs1, fwd_rs2;
+    wire [31:0] alu_a, alu_b, alu_out, fwd_rs1, fwd_rs2, csr_rdata, mtvec_out, mepc_out, trap_cause, trap_pc, trap_target_pc;
     wire [1:0] fwd_a, fwd_b;
+    wire trap_taken, mret_exec, flush_if, flush_id, flush_ex, pc_trap_override;
 
     // EX/MEM out
     wire [31:0] ex_mem_alu, ex_mem_rs2, ex_mem_inst, ex_mem_pc;
@@ -193,17 +194,20 @@ module cpu_pipelined (
         .inst_expanded(inst_expanded), 
         .is_compressed(is_compressed)
     );
+
     // Pipeline routing
     wire [31:0] final_inst = is_compressed ? inst_expanded : raw_inst;
     wire [31:0] muxed_if_inst = unaligned_32_bit_fetch ? 32'h00000013 : final_inst;
     wire [31:0] pc_inc = (unaligned_32_bit_fetch || buffer_valid || is_compressed) ? 32'd2 : 32'd4;
 
+    wire actual_pc_sel = pc_trap_override | pc_sel;
+    wire [31:0] actual_jump_target = pc_trap_override ? trap_target_pc : alu_out;
     program_counter PC (
         .clk(clk), 
         .rst(rst),
         .stall(stall | global_mem_stall), 
-        .pc_sel(pc_sel), 
-        .mem_address(alu_out), 
+        .pc_sel(actual_pc_sel), 
+        .mem_address(actual_jump_target), 
         .pc_inc(pc_inc),
         .pc(pc)
     );
@@ -213,7 +217,7 @@ module cpu_pipelined (
         .rst(rst), 
         .stall(stall), 
         .mem_stall(global_mem_stall),
-        .flush(pc_sel), 
+        .flush(pc_sel | flush_if), 
         .pc_in(pc), 
         .inst_in(muxed_if_inst), 
         .pc_out(if_id_pc),
@@ -266,7 +270,7 @@ module cpu_pipelined (
     id_ex_reg ID_EX (
         .clk(clk), 
         .rst(rst),
-        .flush(pc_sel || stall), 
+        .flush(pc_sel || stall || flush_id), 
         .mem_stall(global_mem_stall),
         .pc_in(if_id_pc), 
         .rs1_in(rs1_data), 
@@ -367,10 +371,25 @@ module cpu_pipelined (
         .fwd_b(fwd_b)
     );
     
+    trap_controller TRAP_CTRL (
+        .ex_pc(id_ex_pc),
+        .ex_inst(id_ex_inst),
+        .external_interrupt(1'b0), // temp until timer
+        .mtvec_out(mtvec_out),
+        .mepc_out(mepc_out),
+        .trap_taken(trap_taken),
+        .trap_cause(trap_cause),
+        .trap_pc(trap_pc),
+        .mret_exec(mret_exec),
+        .flush_if(flush_if),
+        .flush_id(flush_id),
+        .flush_ex(flush_ex),
+        .pc_trap_override(pc_trap_override),
+        .trap_target_pc(trap_target_pc)
+    );
+
     wire ex_is_csrrw = (id_ex_inst[6:0] == 7'b1110011) && (id_ex_inst[14:12] == 3'b001);
     wire ex_csr_wen = ex_is_csrrw && !global_mem_stall && !stall;
-    wire [31:0] csr_rdata;
-    wire [31:0] mtvec_out, mepc_out;
     csr_file CSR (
         .clk(clk), 
         .rst(rst), 
@@ -378,22 +397,22 @@ module cpu_pipelined (
         .csr_wdata(fwd_rs1),
         .csr_wen(ex_csr_wen), 
         .csr_rdata(csr_rdata),
-        .trap_taken(1'b0), 
-        .trap_taken(1'b0),
-        .trap_cause(32'b0),
-        .mret_exec(1'b0),
+        .trap_taken(trap_taken),
+        .trap_pc(trap_pc),
+        .trap_cause(trap_cause),
+        .mret_exec(mret_exec),
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out)
     ); 
-    wire [31:0] actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
 
+    wire [31:0] actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
         .mem_stall(global_mem_stall),
         .alu_res_in(actual_ex_result), 
         .rs2_in(fwd_rs2), 
-        .inst_in(id_ex_inst), 
+        .inst_in(flush_ex ? 32'h00000013 : id_ex_inst), 
         .pc_in(id_ex_pc),
         .rd_in(id_ex_rd), 
         .reg_wen_in(id_ex_reg_wen),

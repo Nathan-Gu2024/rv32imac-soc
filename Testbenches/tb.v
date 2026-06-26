@@ -245,7 +245,6 @@ module testbench;
         check(9, 32'd89); // x9 should be 89
         check(8, 32'd1); 
         check(10, 32'd89);    
-        $finish;
 
         // CSR Read/Write (ALU Hijack)
         reset_pipeline();
@@ -258,7 +257,27 @@ module testbench;
         
         // Check 2: Did the second csrrw successfully read the 89 we wrote earlier?
         check(8, 32'd89);  // x8 should be 89
+
+
+        // Hardware Trap & OS Context Switch
+        reset_pipeline();
+        $readmemh("../Mems/test_trap_ecall.mem", mock_imem);
+        reset_dut();
+        repeat(100) @(posedge clk); 
+        $display("Test 18: Hardware Trap & OS Context Switch");     
         
+        // Check 1: Did the User Program run before the trap?
+        check(6, 32'd10);
+        check(7, 32'd20);
+        
+        // Check 2: Did the trap successfully jump to the Kernel at 0x40?
+        check(29, 32'd99); // If x29 is 99, the Trap Controller successfully overrode the PC!
+        
+        // Check 3: Did the kernel successfully return to the User Program?
+        check(28, 32'd30); // If x28 is 30, mret flawlessly restored the PC!
+        $finish;
+
+
     end
 
     // Global simulation watchdog timeout

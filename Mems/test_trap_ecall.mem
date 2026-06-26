@@ -1,0 +1,33 @@
+// OS BOOT: Setup mtvec to point to 0x40 (Word index 16)
+04000293  // addi x5, x0, 64   (x5 = 64)
+30529073  // csrrw x0, mtvec, x5 
+
+// USER PROGRAM: Do some normal math
+00a00313  // addi x6, x0, 10   (x6 = 10)
+01400393  // addi x7, x0, 20   (x7 = 20)
+
+// THE TRAP: Ask the OS for help!
+00000073  // ecall             (Flushes pipeline, saves PC to mepc, Jumps to 0x40!)
+
+// RETURN TARGET: The OS will return us exactly here.
+00730e33  // add x28, x6, x7   (x28 = 30)
+
+// PADDING: Fill the space between the user program and the OS kernel
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+
+// ==========================================
+// THE OS KERNEL (Located at memory address 0x40)
+// ==========================================
+06300e93  // addi x29, x0, 99  (x29 = 99 -> Proves the hardware jumped here!)
+30200073  // mret              (Restores PC from mepc, jumping back to the add instruction)
+00000013  // nop
+00000013  // nop
