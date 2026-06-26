@@ -1,0 +1,28 @@
+// 1. SETUP mtvec = 0x40
+04000293  // addi x5, x0, 64
+30529073  // csrrw x0, mtvec, x5
+
+// 2. SETUP mtimecmp = 50 (MMIO Address 0x4000_0008)
+40000337  // lui x6, 0x40000
+00830313  // addi x6, x6, 8     (x6 = 0x40000008)
+03200393  // addi x7, x0, 50    (x7 = 50)
+00732023  // sw x7, 0(x6)       (mtimecmp[31:0] = 50)
+
+// 3. INFINITE LOOP
+00100413  // addi x8, x8, 1     (x8++) 
+ffdff06f  // j -4               (Jump back to the addi instruction)
+
+// PADDING: Fill the space up to 0x40
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+
+// 4. THE OS KERNEL (Located at memory address 0x40)
+06300493  // addi x9, x0, 99    (x9 = 99 -> Proves the timer hijacked the CPU!)
+00000013  // nop
+00000013  // nop

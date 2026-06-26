@@ -13,6 +13,7 @@
 `include "../src/reservation_monitor.v"
 `include "../src/csr_file.v"
 `include "../src/trap_controller.v"
+`include "../src/clint_timer.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
@@ -372,10 +373,11 @@ module cpu_pipelined (
         .fwd_b(fwd_b)
     );
     
+    wire timer_interrupt;
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
         .ex_inst(id_ex_inst),
-        .external_interrupt(1'b0), // temp until timer
+        .external_interrupt(timer_interrupt), // temp until timer
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out),
         .trap_taken(trap_taken),
@@ -491,7 +493,6 @@ module cpu_pipelined (
         .data_to_mem(store_data)
     ); 
 
-    
     reservation_monitor RM (
         .clk(clk),
         .rst(rst),
@@ -509,7 +510,22 @@ module cpu_pipelined (
                              (sc_success_flag ? 32'd0 : 32'd1) :
                              ex_mem_alu;  
 
-    
+
+    wire is_mmio = (mem_alu_res[31:28] == 4'h4); 
+    wire actual_mem_rw = mem_mem_rw & (~mem_is_sc | sc_successful);
+    wire dcache_wen = actual_mem_rw & ~is_mmio;
+    wire clint_wen  = actual_mem_rw & is_mmio;
+    wire [31:0] clint_rdata;
+    clint_timer CLINT (
+        .clk(clk),
+        .rst(rst),
+        .addr(ex_mem_alu),
+        .wdata(ex_mem_rs2),
+        .wen(clint_wen),
+        .rdata(clint_rdata),
+        .timer_interrupt(timer_interrupt)
+    );
+
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 

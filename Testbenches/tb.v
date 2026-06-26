@@ -277,7 +277,6 @@ module testbench;
         check(28, 32'd30); // If x28 is 30, mret flawlessly restored the PC!
         $finish;
 
-
     end
 
     // Global simulation watchdog timeout
