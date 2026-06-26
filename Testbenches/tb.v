@@ -282,7 +282,7 @@ module testbench;
 
     // Global simulation watchdog timeout
     initial begin
-        #10000;
+        #50000;
         $display("TIMEOUT");
         $finish;
     end

@@ -90,7 +90,7 @@ module rom (
             6'd35: rom_out = 16'h2041; // jalr
             6'd36: rom_out = 16'h004F; // lr.w
             6'd37: rom_out = 16'h184F; // sc.w 
-            6'd38: rom_out = 16'h8030F; // csrrw
+            6'd38: rom_out = 16'h8030; // csrrw
             default: rom_out = 16'h0000;
         endcase
     end

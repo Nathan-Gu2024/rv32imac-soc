@@ -12,6 +12,7 @@
 `include "../src/rvc_expansion.v"
 `include "../src/reservation_monitor.v"
 `include "../src/csr_file.v"
+`include "../src/trap_controller.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
