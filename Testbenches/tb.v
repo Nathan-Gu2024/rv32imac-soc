@@ -227,7 +227,7 @@ module testbench;
         $readmemh("../Mems/test_atomic_success.mem", mock_imem);
         reset_dut();
         repeat(100) @(posedge clk); 
-        $display("Test 15: Atomic Success");     
+        $display("Test 14: Atomic Success");     
         check(5, 32'd16); // x5 should be 16
         check(6, 32'd42); // x6 should be 42
         check(8, 32'd0); // x8 should be 0 because Store-Conditional succeeded
@@ -239,7 +239,7 @@ module testbench;
         $readmemh("../Mems/test_atomic_fail.mem", mock_imem);
         reset_dut();
         repeat(100) @(posedge clk); 
-        $display("Test 16: Atomic Fail");     
+        $display("Test 15: Atomic Fail");     
         check(5, 32'd16); // x5 should be 16
         check(6, 32'd42); // x6 should be 42
         check(9, 32'd89); // x9 should be 89
@@ -251,7 +251,7 @@ module testbench;
         $readmemh("../Mems/test_csr_rw.mem", mock_imem);
         reset_dut();
         repeat(100) @(posedge clk); 
-        $display("Test 17: CSR Read/Write");     
+        $display("Test 16: CSR Read/Write");     
         // Check 1: Did the first csrrw read the default reset value of mtvec?
         check(6, 32'd0);   // x6 should be 0
         
@@ -264,7 +264,7 @@ module testbench;
         $readmemh("../Mems/test_trap_ecall.mem", mock_imem);
         reset_dut();
         repeat(100) @(posedge clk); 
-        $display("Test 18: Hardware Trap & OS Context Switch");     
+        $display("Test 17: Hardware Trap & OS Context Switch");     
         
         // Check 1: Did the User Program run before the trap?
         check(6, 32'd10);
@@ -275,7 +275,36 @@ module testbench;
         
         // Check 3: Did the kernel successfully return to the User Program?
         check(28, 32'd30); // If x28 is 30, mret flawlessly restored the PC!
+
+
+        // Hardware Trap & OS Context Switch
+        reset_pipeline();
+        $readmemh("../Mems/test_timer_trap.mem", mock_imem);
+        reset_dut();
+        repeat(150) @(posedge clk); 
+        $display("Test 18: Preemptive Timer Interrupt");
+        $display(
+            "PC=%h timer=%b gated=%b mie=%b mtime=%0d mtimecmp=%0d mtvec=%h trap=%b x8=%0d x9=%0d",
+            DUT.pc,
+            DUT.timer_interrupt,
+            DUT.gated_interrupt,
+            DUT.mie,
+            DUT.CLINT.mtime,
+            DUT.CLINT.mtimecmp,
+            DUT.mtvec_out,
+            DUT.trap_taken,
+            DUT.RF.regs[8],
+            DUT.RF.regs[9]
+        );     
+        check(9, 32'd99);
+        if (DUT.RF.regs[8] > 0) begin
+            $display("[PASS] Register x8 > 0 (Actual: %d) - User loop ran before trap", DUT.RF.regs[8]);
+        end else begin 
+            $display("[FAIL] Register x8 = 0 - USer loop never executed");
+        end 
+              
         $finish;
+
 
     end
 

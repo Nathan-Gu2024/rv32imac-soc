@@ -46,7 +46,7 @@ module trap_controller (
         end else if (is_ecall) begin // Software ASKED for interrupt (ECALL)
             trap_taken = 1'b1;
             trap_cause = 32'd11; // Environment Call from M-Mode
-            trap_pc = ex_pc; 
+            trap_pc = ex_pc + 32'd4; 
             flush_if = 1'b1;
             flush_id = 1'b1;
             flush_ex = 1'b1;

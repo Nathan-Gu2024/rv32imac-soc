@@ -84,17 +84,18 @@ module cpu_pipelined (
     wire [31:0] wb_data;
     wire stall;
 
-
+    wire is_mmio = (ex_mem_alu[31:28] == 4'h4);
     // Caching / Memory flags
     // CPU asserts Valid if it is a Load or Store instruction in the MEM stage
     wire is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen; 
-    wire is_store = (ex_mem_mem_rw == 1'b1);  
-    wire dcache_valid = is_load | is_store;
-    
+    wire is_store = ex_mem_mem_rw;
+    wire store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
+    wire dcache_valid = dcache_ren || dcache_wen;
+    wire dcache_ren = is_load & ~is_mmio;
+    wire dcache_wen = store_commits & ~is_mmio;    
     wire dcache_ready; 
-    wire dmem_stall = dcache_valid & (~dcache_ready);
+    wire dmem_stall = dcache_valid && !dcache_ready;
     wire [31:0] dcache_read_data;
-
     wire cache_ready;
     // wire [31:0] icache_mem_req_addr;
     // wire [127:0] icache_mem_read_data;
@@ -106,7 +107,7 @@ module cpu_pipelined (
         .rst(rst), 
         .cpu_req_addr(pc),
         .cpu_write_data(32'b0), 
-        .cpu_read_req(1'b1), 
+        .cpu_read_req(1'b1),        
         .cpu_write_req(1'b0), 
         .mem_write_mask(4'b0000),
         .mem_ready(icache_mem_ready), 
@@ -116,7 +117,6 @@ module cpu_pipelined (
         .cpu_ready(cache_ready), 
         .mem_req_valid(icache_mem_req_valid)
     ); 
-
     // Same for the Instruction Memory
     wire icache_valid = 1'b1; // The CPU is ALWAYS trying to fetch instructions!
     wire imem_stall = icache_valid & (~cache_ready);
@@ -142,8 +142,8 @@ module cpu_pipelined (
         .cpu_req_addr(ex_mem_alu),  
         .cpu_write_data(store_data), 
         .mem_write_mask(mem_write_mask),
-        .cpu_read_req(is_load),
-        .cpu_write_req(is_store),        
+        .cpu_read_req(dcache_ren),      
+        .cpu_write_req(dcache_wen),    
         .mem_ready(dcache_mem_ready),
         .mem_read_data(dcache_mem_read_data_block),        
         .cpu_read_data(dcache_read_data),
@@ -152,7 +152,7 @@ module cpu_pipelined (
         .mem_req_valid(dcache_mem_req_valid)
     );
 
-    assign dmem_req_addr = is_store ? ex_mem_alu : dcache_mem_req_addr;
+    assign dmem_req_addr = dcache_wen ? ex_mem_alu : dcache_mem_req_addr;    
     // dmem DMEM (
     //     .clk(clk),
     //     .mem_req_valid(dcache_mem_req_valid),
@@ -307,14 +307,20 @@ module cpu_pipelined (
         .wb_sel_out(id_ex_wb_sel), 
         .alu_sel_out(id_ex_alu_sel)
     );
-
+        
     // EX 
     // Forwarding
-    assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_alu :
+    // SC writes 0/1 to rd, not the address in ex_mem_alu.
+    // JAL/JALR write PC+4, not the jump target in ex_mem_alu.
+    wire [31:0] ex_mem_forward_data = ex_mem_is_sc ? final_alu_to_wb :
+                                    (ex_mem_wb_sel == 2'b10) ? (ex_mem_pc + 32'd4) :
+                                    ex_mem_alu;
+
+    assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_forward_data :
                     (fwd_a == 2'b10) ? wb_data : 
                     id_ex_rs1;
 
-    assign fwd_rs2 = (fwd_b == 2'b01) ? ex_mem_alu :
+    assign fwd_rs2 = (fwd_b == 2'b01) ? ex_mem_forward_data :
                     (fwd_b == 2'b10) ? wb_data : 
                     id_ex_rs2;
     
@@ -374,10 +380,21 @@ module cpu_pipelined (
     );
     
     wire timer_interrupt;
+    reg mie; // Machine Interrupt Enable (MIE)
+    always @(posedge clk) begin
+        if (rst) 
+            mie <= 1'b1;
+        else if (trap_taken) 
+            mie <= 1'b0; // Disable interrupts inside the OS kernel
+        else if (mret_exec) 
+            mie <= 1'b1;  // Re-enable when returning to user code
+    end
+    
+    wire gated_interrupt = timer_interrupt & mie & ~global_mem_stall & ~stall;
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
         .ex_inst(id_ex_inst),
-        .external_interrupt(timer_interrupt), // temp until timer
+        .external_interrupt(gated_interrupt),
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out),
         .trap_taken(trap_taken),
@@ -493,13 +510,27 @@ module cpu_pipelined (
         .data_to_mem(store_data)
     ); 
 
+    // LR/SC reservation bookkeeping should follow the MEM-stage operation,
+    // not unrelated front-end stalls. LR may complete while the I-cache is
+    // fetching the next line, so set the reservation when the D-cache load is ready.
+    //
+    // Keep SC clear gated by global_mem_stall so the combinational SC result
+    // remains stable until the SC instruction can advance to WB.
+    wire lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
+
+    wire sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
+
+    wire normal_store_reservation_clear =
+        is_store && !ex_mem_is_sc &&
+        (is_mmio || (dcache_wen && dcache_ready));
+
     reservation_monitor RM (
         .clk(clk),
         .rst(rst),
-        .lr_en(ex_mem_is_lr & ~global_mem_stall),
-        .sc_en(ex_mem_is_sc & ~global_mem_stall),
-        .any_store_en(is_store & ~ex_mem_is_sc & ~global_mem_stall),
-        .trap_taken(1'b0), // temp
+        .lr_en(lr_reservation_set),
+        .sc_en(sc_reservation_clear),
+        .any_store_en(normal_store_reservation_clear),
+        .trap_taken(trap_taken),
         .mem_addr(ex_mem_alu),
         .sc_successful(sc_success_flag)
     );
@@ -511,11 +542,13 @@ module cpu_pipelined (
                              ex_mem_alu;  
 
 
-    wire is_mmio = (mem_alu_res[31:28] == 4'h4); 
-    wire actual_mem_rw = mem_mem_rw & (~mem_is_sc | sc_successful);
-    wire dcache_wen = actual_mem_rw & ~is_mmio;
-    wire clint_wen  = actual_mem_rw & is_mmio;
+    // wire is_mmio = (ex_mem_alu[31:28] == 4'h4); 
+    wire actual_mem_rw = ex_mem_mem_rw & (~ex_mem_is_sc | sc_success_flag);
+    // wire dcache_wen = actual_mem_rw & ~is_mmio;
+
+    wire clint_wen = store_commits && is_mmio;    
     wire [31:0] clint_rdata;
+
     clint_timer CLINT (
         .clk(clk),
         .rst(rst),
@@ -526,13 +559,16 @@ module cpu_pipelined (
         .timer_interrupt(timer_interrupt)
     );
 
+    // Mux the loaded data: Use Timer data if MMIO, otherwise use D-Cache data
+    wire [31:0] final_mem_read_data = is_mmio ? clint_rdata : dcache_read_data;
+
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 
         .mem_stall(global_mem_stall),
         .inst_in(ex_mem_inst),
         .alu_res_in(final_alu_to_wb), 
-        .mem_data_in(dcache_read_data), 
+        .mem_data_in(final_mem_read_data), 
         .pc_in(ex_mem_pc),
         .rd_in(ex_mem_rd),
         .reg_wen_in(ex_mem_reg_wen),
@@ -635,6 +671,10 @@ module id_ex_reg (
             wb_sel_out <= 0; 
             alu_sel_out <= 0;
             inst_out <= 32'h00000013;
+            is_lr_out <= 1'b0;
+            is_sc_out <= 1'b0;
+            is_amo_out <= 1'b0;
+            atomic_op_out <= 5'b0;
         end else if (mem_stall) begin
             // Freeze 
         end else if (flush) begin

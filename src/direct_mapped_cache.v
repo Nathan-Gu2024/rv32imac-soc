@@ -28,7 +28,8 @@ module direct_mapped_cache
     localparam FETCH = 1'b1;
     reg state, next_state;
 
-    assign mem_req_valid = (state == FETCH);
+    wire write_req = cpu_write_req && (mem_write_mask != 4'b0000);
+    assign mem_req_valid = (state == FETCH) || (state == IDLE && write_req);
 
     always @(posedge clk) begin
         if (rst)
@@ -50,19 +51,22 @@ module direct_mapped_cache
         endcase
 
         case (state) 
-            IDLE:
+            IDLE: 
                 begin
                     if (cpu_read_req) begin
                         if (is_hit) begin
                             cpu_ready = 1'b1;
                         end else begin
                             next_state = FETCH;
-                        end 
+                        end
+                    end else if (write_req) begin
+                        // Write-through store. Memory accepts the write through mem_req_valid.
+                        cpu_ready = mem_ready;
                     end else if (cpu_write_req) begin
+                        // Covers zero-mask stores / failed SC.
                         cpu_ready = 1'b1;
-                    end 
-                end 
-            FETCH:
+                    end
+                end            FETCH:
                 begin
                     if (mem_ready) begin
                         next_state = IDLE;
@@ -81,21 +85,21 @@ module direct_mapped_cache
             data_array[index] <= mem_read_data;
             tag_array[index]  <= tag;
             valid_array[index] <= 1'b1;
-        end else if (state == IDLE && cpu_write_req) begin
+        end else if (state == IDLE && write_req && mem_ready) begin
             if (is_hit) begin
                 case (offset[3:2])
                     2'b00: begin
                         if (mem_write_mask[0]) 
                             data_array[index][7:0] <= cpu_write_data[7:0];
                         if (mem_write_mask[1]) 
-                            data_array[index][15:8] <= cpu_write_data[15:8];
+                            data_array[index][15:8]  <= cpu_write_data[15:8];
                         if (mem_write_mask[2]) 
                             data_array[index][23:16] <= cpu_write_data[23:16];
                         if (mem_write_mask[3]) 
                             data_array[index][31:24] <= cpu_write_data[31:24];
                     end
                     2'b01: begin
-                        if (mem_write_mask[0]) 
+                        if (mem_write_mask[0])
                             data_array[index][39:32] <= cpu_write_data[7:0];
                         if (mem_write_mask[1]) 
                             data_array[index][47:40] <= cpu_write_data[15:8];
@@ -116,7 +120,7 @@ module direct_mapped_cache
                     end
                     2'b11: begin
                         if (mem_write_mask[0]) 
-                            data_array[index][103:96] <= cpu_write_data[7:0];
+                            data_array[index][103:96]  <= cpu_write_data[7:0];
                         if (mem_write_mask[1]) 
                             data_array[index][111:104] <= cpu_write_data[15:8];
                         if (mem_write_mask[2]) 
@@ -126,7 +130,7 @@ module direct_mapped_cache
                     end
                 endcase
             end
-        end 
+        end
     end 
 
 endmodule

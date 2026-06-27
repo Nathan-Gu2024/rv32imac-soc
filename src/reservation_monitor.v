@@ -13,8 +13,7 @@ module reservation_monitor (
     reg lock_valid;
 
     // SC succeeds ONLY if the lock is valid AND the target address matches the reservation
-    assign sc_successful = sc_en & lock_valid & (mem_addr == reserved_addr);
-
+    assign sc_successful = lock_valid & (mem_addr == reserved_addr);
     always @(posedge clk) begin
         if (rst) begin
             lock_valid <= 1'b0;
