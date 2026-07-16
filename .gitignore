@@ -26,3 +26,5 @@ sim_build/
 Thumbs.db
 *.swp
 *~
+
+*.png

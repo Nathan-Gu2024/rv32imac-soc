@@ -83,7 +83,7 @@ module direct_mapped_cache
                 valid_array[i] <= 1'b0;
         end else if (state == FETCH && mem_ready) begin
             data_array[index] <= mem_read_data;
-            tag_array[index]  <= tag;
+            tag_array[index] <= tag;
             valid_array[index] <= 1'b1;
         end else if (state == IDLE && write_req && mem_ready) begin
             if (is_hit) begin
@@ -92,7 +92,7 @@ module direct_mapped_cache
                         if (mem_write_mask[0]) 
                             data_array[index][7:0] <= cpu_write_data[7:0];
                         if (mem_write_mask[1]) 
-                            data_array[index][15:8]  <= cpu_write_data[15:8];
+                            data_array[index][15:8] <= cpu_write_data[15:8];
                         if (mem_write_mask[2]) 
                             data_array[index][23:16] <= cpu_write_data[23:16];
                         if (mem_write_mask[3]) 
@@ -120,7 +120,7 @@ module direct_mapped_cache
                     end
                     2'b11: begin
                         if (mem_write_mask[0]) 
-                            data_array[index][103:96]  <= cpu_write_data[7:0];
+                            data_array[index][103:96] <= cpu_write_data[7:0];
                         if (mem_write_mask[1]) 
                             data_array[index][111:104] <= cpu_write_data[15:8];
                         if (mem_write_mask[2]) 

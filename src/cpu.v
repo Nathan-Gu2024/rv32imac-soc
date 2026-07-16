@@ -33,74 +33,174 @@ module cpu_pipelined (
     input wire [127:0] dcache_mem_read_data_block, 
     input wire dcache_mem_ready
 );
-    // IF 
-    wire [31:0] pc, if_inst, inst_expanded;
+    // Control / stalls
+    wire stall;
+    wire global_mem_stall;
 
-    // IF/ID out
-    wire [31:0] if_id_pc, if_id_inst;
+    // IF
+    wire [31:0] pc;
+    wire [31:0] if_inst;
+    wire [31:0] raw_inst;
+    wire [31:0] inst_expanded;
+    wire [31:0] final_inst;
+    wire [31:0] muxed_if_inst;
+    wire [31:0] pc_inc;
+    wire [31:0] actual_jump_target;
+    wire [1:0] opcode_check;
+    wire is_32_bit_opcode;
+    wire unaligned_32_bit_fetch;
     wire is_compressed;
+    wire actual_pc_sel;
+    reg [15:0] fetch_buffer;
+    reg buffer_valid;
+
+    // icache
+    wire cache_ready;
+    wire icache_valid;
+    wire imem_stall;
+
+    // IF/ID
+    wire [31:0] if_id_pc;
+    wire [31:0] if_id_inst;
 
     // ID
-    wire [31:0] rs1_data, rs2_data, imm;
-    wire pc_sel, reg_wen, a_sel, b_sel, mem_rw, is_lr, is_sc, is_amo, csr_wen;
+    wire [31:0] rs1_data;
+    wire [31:0] rs2_data;
+    wire [31:0] imm;
+    wire pc_sel;
+    wire reg_wen;
+    wire a_sel;
+    wire b_sel;
+    wire mem_rw;
+    wire is_lr;
+    wire is_sc;
+    wire is_amo;
     wire [1:0] wb_sel;
     wire [2:0] imm_sel;
     wire [3:0] alu_sel;
     wire [4:0] atomic_op;
 
-    // ID/EX out
-    wire [31:0] id_ex_pc, id_ex_rs1, id_ex_rs2, id_ex_imm, id_ex_inst;
-    wire [4:0] id_ex_rd, id_ex_atomic_op;
-    wire id_ex_reg_wen, id_ex_mem_rw, id_ex_a_sel, id_ex_b_sel, id_ex_is_lr, id_ex_is_sc, id_ex_is_amo; 
+    // ID/EX
+    wire [31:0] id_ex_pc;
+    wire [31:0] id_ex_rs1;
+    wire [31:0] id_ex_rs2;
+    wire [31:0] id_ex_imm;
+    wire [31:0] id_ex_inst;
+    wire [4:0] id_ex_rd;
+    wire [4:0] id_ex_atomic_op;
+    wire id_ex_reg_wen;
+    wire id_ex_mem_rw;
+    wire id_ex_a_sel;
+    wire id_ex_b_sel;
+    wire id_ex_is_lr;
+    wire id_ex_is_sc;
+    wire id_ex_is_amo;
     wire [1:0] id_ex_wb_sel;
     wire [3:0] id_ex_alu_sel;
 
     // EX
-    wire [31:0] alu_a, alu_b, alu_out, fwd_rs1, fwd_rs2, csr_rdata, mtvec_out, mepc_out, trap_cause, trap_pc, trap_target_pc;
-    wire [1:0] fwd_a, fwd_b;
-    wire trap_taken, mret_exec, flush_if, flush_id, flush_ex, pc_trap_override;
+    wire [31:0] alu_a;
+    wire [31:0] alu_b;
+    wire [31:0] alu_out;
+    wire [31:0] fwd_rs1;
+    wire [31:0] fwd_rs2;
+    wire [31:0] ex_mem_forward_data;
+    wire [31:0] csr_rdata;
+    wire [31:0] mtvec_out;
+    wire [31:0] mepc_out;
+    wire [31:0] trap_cause;
+    wire [31:0] trap_pc;
+    wire [31:0] trap_target_pc;
+    wire [31:0] actual_ex_result;
+    wire [6:0] ex_opcode;
+    wire [2:0] ex_funct3;
+    wire [1:0] fwd_a;
+    wire [1:0] fwd_b;
+    wire id_ex_is_branch;
+    wire id_ex_is_beq;
+    wire id_ex_is_bne;
+    wire id_ex_is_blt;
+    wire id_ex_is_bge;
+    wire id_ex_is_bltu;
+    wire id_ex_is_bgeu;
+    wire id_ex_is_jal;
+    wire id_ex_is_jalr;
+    wire id_ex_br_eq;
+    wire id_ex_br_lt;
+    wire ex_is_csrrw;
+    wire ex_csr_wen;
+    wire timer_interrupt;
+    wire gated_interrupt;
+    wire trap_taken;
+    wire mret_exec;
+    wire flush_if;
+    wire flush_id;
+    wire flush_ex;
+    wire pc_trap_override;
+    reg mie;
 
-    // EX/MEM out
-    wire [31:0] ex_mem_alu, ex_mem_rs2, ex_mem_inst, ex_mem_pc;
-    wire [4:0] ex_mem_rd, ex_mem_atomic_op;
-    wire ex_mem_reg_wen, ex_mem_mem_rw, ex_mem_is_lr, ex_mem_is_sc, ex_mem_is_amo;
+    // EX/MEM
+    wire [31:0] ex_mem_alu;
+    wire [31:0] ex_mem_rs2;
+    wire [31:0] ex_mem_inst;
+    wire [31:0] ex_mem_pc;
+    wire [4:0] ex_mem_rd;
+    wire [4:0] ex_mem_atomic_op;
+    wire ex_mem_reg_wen;
+    wire ex_mem_mem_rw;
+    wire ex_mem_is_lr;
+    wire ex_mem_is_sc;
+    wire ex_mem_is_amo;
     wire [1:0] ex_mem_wb_sel;
 
     // MEM
-    wire [31:0] mem_read_data, partial_load_out;
-    wire sc_success_flag;
-    wire [3:0] raw_write_mask;
+    wire [31:0] dcache_read_data;
+    wire [31:0] final_mem_read_data;
+    wire [31:0] partial_load_out;
     wire [31:0] final_alu_to_wb;
-    // wire [31:0] store_data;
-    // wire [3:0] mem_write_mask;
+    wire [31:0] clint_rdata;
+    wire [31:0] dcache_mem_req_addr;
+    wire [3:0] raw_write_mask;
+    wire is_mmio;
+    wire is_load;
+    wire is_store;
+    wire store_commits;
+    wire dcache_valid;
+    wire dcache_ren;
+    wire dcache_wen;
+    wire dcache_ready;
+    wire dmem_stall;
+    wire lr_reservation_set;
+    wire sc_reservation_clear;
+    wire normal_store_reservation_clear;
+    wire sc_success_flag;
+    wire block_sc_store;
+    wire clint_wen;
 
-    // MEM/WB out
-    wire [31:0] mem_wb_alu, mem_wb_memdata, mem_wb_pc, mem_wb_inst;
+    // MEM/WB 
+    wire [31:0] mem_wb_alu;
+    wire [31:0] mem_wb_memdata;
+    wire [31:0] mem_wb_pc;
+    wire [31:0] mem_wb_inst;
     wire [4:0] mem_wb_rd;
     wire mem_wb_reg_wen;
     wire [1:0] mem_wb_wb_sel;
 
-    // WB
+    // WB 
     wire [31:0] wb_data;
-    wire stall;
 
-    wire is_mmio = (ex_mem_alu[31:28] == 4'h4);
-    // Caching / Memory flags
-    // CPU asserts Valid if it is a Load or Store instruction in the MEM stage
-    wire is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen; 
-    wire is_store = ex_mem_mem_rw;
-    wire store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
-    wire dcache_valid = dcache_ren || dcache_wen;
-    wire dcache_ren = is_load & ~is_mmio;
-    wire dcache_wen = store_commits & ~is_mmio;    
-    wire dcache_ready; 
-    wire dmem_stall = dcache_valid && !dcache_ready;
-    wire [31:0] dcache_read_data;
-    wire cache_ready;
-    // wire [31:0] icache_mem_req_addr;
-    // wire [127:0] icache_mem_read_data;
-    // wire icache_mem_ready;
-    // wire icache_mem_req_valid; 
+    // Cache / memory stall control
+    assign icache_valid = 1'b1;
+    assign imem_stall = icache_valid & ~cache_ready;
+    assign is_mmio = (ex_mem_alu[31:28] == 4'h4);
+    assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen;
+    assign is_store = ex_mem_mem_rw;
+    assign store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
+    assign dcache_ren = is_load & ~is_mmio;
+    assign dcache_wen = store_commits & ~is_mmio;
+    assign dcache_valid = dcache_ren || dcache_wen;
+    assign dmem_stall = dcache_valid && !dcache_ready;
+    assign global_mem_stall = dmem_stall | imem_stall;
 
     direct_mapped_cache ICACHE (
         .clk(clk), 
@@ -117,25 +217,7 @@ module cpu_pipelined (
         .cpu_ready(cache_ready), 
         .mem_req_valid(icache_mem_req_valid)
     ); 
-    // Same for the Instruction Memory
-    wire icache_valid = 1'b1; // The CPU is ALWAYS trying to fetch instructions!
-    wire imem_stall = icache_valid & (~cache_ready);
 
-    // Master Pipeline Stall
-    // Freeze the whole CPU if either memory is stalling
-    wire global_mem_stall = dmem_stall | imem_stall;
-
-    wire [127:0] imem_read_data;
-    wire imem_ready;
-    wire [31:0] icache_mem_addr;
-
-    // wire dcache_mem_req_valid;
-    // wire dcache_mem_ready;
-    wire [127:0] dcache_mem_read_data;
-    wire [31:0] dcache_mem_req_addr;
-
-    // wire [127:0] dcache_mem_read_data_block;
-    
     direct_mapped_cache DCACHE (
         .clk(clk),
         .rst(rst),
@@ -153,27 +235,12 @@ module cpu_pipelined (
     );
 
     assign dmem_req_addr = dcache_wen ? ex_mem_alu : dcache_mem_req_addr;    
-    // dmem DMEM (
-    //     .clk(clk),
-    //     .mem_req_valid(dcache_mem_req_valid),
-    //     .mem_address(is_store ? ex_mem_alu : dcache_mem_req_addr),
-    //     .mem_write_data(store_data),    
-    //     .mem_write_mask(mem_write_mask),    
-    //     .mem_read_data(mem_read_data),
-    //     .mem_ready(dcache_mem_ready),
-    //     .mem_read_data_block(dcache_mem_read_data_block)
-    // );
+    
 
-    // IF    
-    // Fetch buffer state
-    reg [15:0] fetch_buffer;
-    reg buffer_valid;
-
-    // Detection
-    wire [1:0] opcode_check = pc[1] ? if_inst[17:16] : if_inst[1:0];
-    wire is_32_bit_opcode = (opcode_check == 2'b11);
-    wire unaligned_32_bit_fetch = (pc[1] == 1'b1) && is_32_bit_opcode && !buffer_valid;
-
+    // IF 
+    assign opcode_check = pc[1] ? if_inst[17:16] : if_inst[1:0];
+    assign is_32_bit_opcode = (opcode_check == 2'b11);
+    assign unaligned_32_bit_fetch = (pc[1] == 1'b1) && is_32_bit_opcode && !buffer_valid;
     always @(posedge clk) begin
         if (rst || pc_sel) begin
             buffer_valid <= 1'b0;
@@ -189,7 +256,8 @@ module cpu_pipelined (
     end
 
     // Instruction assembly
-    wire [31:0] raw_inst = buffer_valid ? {if_inst[15:0], fetch_buffer} : (pc[1] ? {16'b0, if_inst[31:16]} : if_inst);
+    assign raw_inst = buffer_valid ? {if_inst[15:0], fetch_buffer} :
+                      (pc[1] ? {16'b0, if_inst[31:16]} : if_inst);
 
     rvc_expand RVC (
         .inst_c(raw_inst[15:0]), 
@@ -198,12 +266,11 @@ module cpu_pipelined (
     );
 
     // Pipeline routing
-    wire [31:0] final_inst = is_compressed ? inst_expanded : raw_inst;
-    wire [31:0] muxed_if_inst = unaligned_32_bit_fetch ? 32'h00000013 : final_inst;
-    wire [31:0] pc_inc = (unaligned_32_bit_fetch || buffer_valid || is_compressed) ? 32'd2 : 32'd4;
-
-    wire actual_pc_sel = pc_trap_override | pc_sel;
-    wire [31:0] actual_jump_target = pc_trap_override ? trap_target_pc : alu_out;
+    assign final_inst = is_compressed ? inst_expanded : raw_inst;
+    assign muxed_if_inst = unaligned_32_bit_fetch ? 32'h00000013 : final_inst;
+    assign pc_inc = (unaligned_32_bit_fetch || buffer_valid || is_compressed) ? 32'd2 : 32'd4;
+    assign actual_pc_sel = pc_trap_override | pc_sel;
+    assign actual_jump_target = pc_trap_override ? trap_target_pc : alu_out;
     program_counter PC (
         .clk(clk), 
         .rst(rst),
@@ -225,15 +292,6 @@ module cpu_pipelined (
         .pc_out(if_id_pc),
         .inst_out(if_id_inst)
     ); 
-                
-    // imem IMEM (
-    //     .clk(clk), 
-    //     .rst(rst), 
-    //     .mem_req_valid(icache_mem_req_valid), 
-    //     .mem_req_addr(icache_mem_req_addr), 
-    //     .mem_read_data(icache_mem_read_data), 
-    //     .mem_ready(icache_mem_ready)
-    // );
 
     // ID
     control_logic CL (
@@ -307,14 +365,14 @@ module cpu_pipelined (
         .wb_sel_out(id_ex_wb_sel), 
         .alu_sel_out(id_ex_alu_sel)
     );
-        
+
     // EX 
     // Forwarding
-    // SC writes 0/1 to rd, not the address in ex_mem_alu.
-    // JAL/JALR write PC+4, not the jump target in ex_mem_alu.
-    wire [31:0] ex_mem_forward_data = ex_mem_is_sc ? final_alu_to_wb :
-                                    (ex_mem_wb_sel == 2'b10) ? (ex_mem_pc + 32'd4) :
-                                    ex_mem_alu;
+    // SC writes 0/1 to rd
+    // JAL/JALR write PC+4
+    assign ex_mem_forward_data = ex_mem_is_sc ? final_alu_to_wb :
+                                 (ex_mem_wb_sel == 2'b10) ? (ex_mem_pc + 32'd4) :
+                                 ex_mem_alu;
 
     assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_forward_data :
                     (fwd_a == 2'b10) ? wb_data : 
@@ -334,19 +392,18 @@ module cpu_pipelined (
         .alu_res(alu_out)
     );
 
-    wire [6:0] ex_opcode = id_ex_inst[6:0];
-    wire [2:0] ex_funct3 = id_ex_inst[14:12];
+    assign ex_opcode = id_ex_inst[6:0];
+    assign ex_funct3 = id_ex_inst[14:12];
 
-    wire id_ex_is_branch = (ex_opcode == 7'b1100011);
-    wire id_ex_is_beq = id_ex_is_branch && (ex_funct3 == 3'b000);
-    wire id_ex_is_bne = id_ex_is_branch && (ex_funct3 == 3'b001);
-    wire id_ex_is_blt = id_ex_is_branch && (ex_funct3 == 3'b100);
-    wire id_ex_is_bge = id_ex_is_branch && (ex_funct3 == 3'b101);
-    wire id_ex_is_bltu = id_ex_is_branch && (ex_funct3 == 3'b110);
-    wire id_ex_is_bgeu = id_ex_is_branch && (ex_funct3 == 3'b111);
-    wire id_ex_is_jal = (ex_opcode == 7'b1101111);
-    wire id_ex_is_jalr = (ex_opcode == 7'b1100111);
-    wire id_ex_br_eq, id_ex_br_lt;
+    assign id_ex_is_branch = (ex_opcode == 7'b1100011);
+    assign id_ex_is_beq = id_ex_is_branch && (ex_funct3 == 3'b000);
+    assign id_ex_is_bne = id_ex_is_branch && (ex_funct3 == 3'b001);
+    assign id_ex_is_blt = id_ex_is_branch && (ex_funct3 == 3'b100);
+    assign id_ex_is_bge = id_ex_is_branch && (ex_funct3 == 3'b101);
+    assign id_ex_is_bltu = id_ex_is_branch && (ex_funct3 == 3'b110);
+    assign id_ex_is_bgeu = id_ex_is_branch && (ex_funct3 == 3'b111);
+    assign id_ex_is_jal = (ex_opcode == 7'b1101111);
+    assign id_ex_is_jalr = (ex_opcode == 7'b1100111);
 
     branch_comp BC (
         .br_data1(fwd_rs1),
@@ -358,8 +415,8 @@ module cpu_pipelined (
 
     assign pc_sel = (id_ex_br_eq & id_ex_is_beq) |
                 (~id_ex_br_eq & id_ex_is_bne) |
-                (id_ex_br_lt & (id_ex_is_blt|id_ex_is_bltu)) |
-                (~id_ex_br_lt & (id_ex_is_bge|id_ex_is_bgeu)) |
+                (id_ex_br_lt & (id_ex_is_blt | id_ex_is_bltu)) |
+                (~id_ex_br_lt & (id_ex_is_bge | id_ex_is_bgeu)) |
                 id_ex_is_jal | id_ex_is_jalr;
 
     hazard_unit HU (
@@ -378,9 +435,8 @@ module cpu_pipelined (
         .fwd_a(fwd_a), 
         .fwd_b(fwd_b)
     );
-    
-    wire timer_interrupt;
-    reg mie; // Machine Interrupt Enable (MIE)
+
+    // Machine Interrupt Enable (MIE)
     always @(posedge clk) begin
         if (rst) 
             mie <= 1'b1;
@@ -389,8 +445,8 @@ module cpu_pipelined (
         else if (mret_exec) 
             mie <= 1'b1;  // Re-enable when returning to user code
     end
-    
-    wire gated_interrupt = timer_interrupt & mie & ~global_mem_stall & ~stall;
+
+    assign gated_interrupt = timer_interrupt & mie & ~global_mem_stall & ~stall;
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
         .ex_inst(id_ex_inst),
@@ -408,8 +464,8 @@ module cpu_pipelined (
         .trap_target_pc(trap_target_pc)
     );
 
-    wire ex_is_csrrw = (id_ex_inst[6:0] == 7'b1110011) && (id_ex_inst[14:12] == 3'b001);
-    wire ex_csr_wen = ex_is_csrrw && !global_mem_stall && !stall;
+    assign ex_is_csrrw = (id_ex_inst[6:0] == 7'b1110011) && (id_ex_inst[14:12] == 3'b001);
+    assign ex_csr_wen = ex_is_csrrw && !global_mem_stall && !stall;
     csr_file CSR (
         .clk(clk), 
         .rst(rst), 
@@ -425,7 +481,7 @@ module cpu_pipelined (
         .mepc_out(mepc_out)
     ); 
 
-    wire [31:0] actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
+    assign actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
@@ -456,32 +512,6 @@ module cpu_pipelined (
         .wb_sel_out(ex_mem_wb_sel)
     );
 
-    // always @(posedge clk) begin
-    //     if (rst) begin
-    //         leds <= 16'b0;
-    //     end else if (ex_mem_mem_rw) begin
-    //         if (ex_mem_alu == 32'h00002000) begin
-    //             leds <= ex_mem_rs2[15:0];
-    //         end 
-    //     end 
-    // end 
-
-    // always @(posedge clk) begin
-    //     if (rst) begin
-    //         leds <= 3'b0; 
-    //         uart_tx_start <= 1'b0;
-    //     end else begin
-    //         uart_tx_start <= 1'b0; 
-    //         if (ex_mem_mem_rw) begin
-    //             if (ex_mem_alu == 32'h00002000) begin
-    //                 leds <= ex_mem_rs2[2:0]; 
-    //             end else if (ex_mem_alu == 32'h00003000) begin
-    //                 uart_tx_data <= ex_mem_rs2[7:0];
-    //                 uart_tx_start <= 1'b1;
-    //             end 
-    //         end 
-    //     end 
-    // end 
     always @(posedge clk) begin
         if (rst) begin
             leds <= 4'b0;
@@ -512,17 +542,13 @@ module cpu_pipelined (
 
     // LR/SC reservation bookkeeping should follow the MEM-stage operation,
     // not unrelated front-end stalls. LR may complete while the I-cache is
-    // fetching the next line, so set the reservation when the D-cache load is ready.
-    //
+    // fetching the next line, so set the reservation when the D-cache load is ready
     // Keep SC clear gated by global_mem_stall so the combinational SC result
-    // remains stable until the SC instruction can advance to WB.
-    wire lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
-
-    wire sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
-
-    wire normal_store_reservation_clear =
-        is_store && !ex_mem_is_sc &&
-        (is_mmio || (dcache_wen && dcache_ready));
+    // remains stable until the SC instruction can advance to WB
+    assign lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
+    assign sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
+    assign normal_store_reservation_clear = is_store && !ex_mem_is_sc &&
+                                             (is_mmio || (dcache_wen && dcache_ready));
 
     reservation_monitor RM (
         .clk(clk),
@@ -535,20 +561,13 @@ module cpu_pipelined (
         .sc_successful(sc_success_flag)
     );
 
-    wire block_sc_store = ex_mem_is_sc & ~sc_success_flag;
+    assign block_sc_store = ex_mem_is_sc & ~sc_success_flag;
     assign mem_write_mask = block_sc_store ? 4'b0000 : raw_write_mask;
-    assign final_alu_to_wb = ex_mem_is_sc ? 
+    assign final_alu_to_wb = ex_mem_is_sc ?
                              (sc_success_flag ? 32'd0 : 32'd1) :
-                             ex_mem_alu;  
+                             ex_mem_alu;
 
-
-    // wire is_mmio = (ex_mem_alu[31:28] == 4'h4); 
-    wire actual_mem_rw = ex_mem_mem_rw & (~ex_mem_is_sc | sc_success_flag);
-    // wire dcache_wen = actual_mem_rw & ~is_mmio;
-
-    wire clint_wen = store_commits && is_mmio;    
-    wire [31:0] clint_rdata;
-
+    assign clint_wen = store_commits && is_mmio;
     clint_timer CLINT (
         .clk(clk),
         .rst(rst),
@@ -559,9 +578,7 @@ module cpu_pipelined (
         .timer_interrupt(timer_interrupt)
     );
 
-    // Mux the loaded data: Use Timer data if MMIO, otherwise use D-Cache data
-    wire [31:0] final_mem_read_data = is_mmio ? clint_rdata : dcache_read_data;
-
+    assign final_mem_read_data = is_mmio ? clint_rdata : dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 
@@ -596,7 +613,6 @@ module cpu_pipelined (
                     32'b0;
 
 endmodule
-
 
 module program_counter (
     input wire [31:0] mem_address, pc_inc, 
@@ -739,7 +755,7 @@ module ex_mem_reg (
             rd_out <= 0;  
             alu_res_out <= 0;
             rs2_out <= 0;
-             wb_sel_out <= 0;
+            wb_sel_out <= 0;
             inst_out <= 32'h00000013;
             pc_out <= 0;
             is_lr_out <= 1'b0;
@@ -788,7 +804,7 @@ module mem_wb_reg (
             wb_sel_out <= 0;
             inst_out <= 32'h00000013;
         end else if (mem_stall) begin
-            // Freeze 
+        // Freeze 
         end else begin
             alu_res_out <= alu_res_in;
             mem_data_out <= mem_data_in;

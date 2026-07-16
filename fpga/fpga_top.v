@@ -1,67 +1,62 @@
-`include "../src/uart_tx.v"
-
 module fpga_top (
-    input wire clk_hz,
-    input wire [1:0] btn, 
-    output wire [3:0] led,
-    output wire uart_tx_out
+    input wire clk, 
+    input wire rst, 
+    input wire uart_tx_ready, 
+    output wire uart_tx_start, 
+    output wire [7:0] uart_tx_data, 
+    output wire [3:0] leds
 );
-    reg [3:0] clk_div;
-    always @(posedge clk_hz) begin
-        clk_div <= clk_div + 1;
-    end 
 
-    wire slow_clk = clk_div[3];
-    wire cpu_clk;
+    // IMEM
+    wire [31:0] imem_req_addr;
+    wire imem_req_valid;
+    wire [127:0] imem_read_data;
+    wire imem_ready;
 
-    BUFG clk_buffer (
-        .I(slow_clk),
-        .O(cpu_clk)
-    ); 
+    // DMEM
+    wire [31:0] dmem_req_addr;
+    wire [31:0] dmem_write_data;
+    wire [3:0] dmem_write_mask;
+    wire dmem_req_valid;
+    wire [127:0] dmem_read_data_block;
+    wire dmem_ready;
 
-    reg [15:0] tick_counter;
-      
-    always @(posedge cpu_clk) begin
-        if (tick_counter == 16'd62500)
-            tick_counter <= 16'd0;
-        else 
-            tick_counter <= tick_counter + 1;
-    end 
+    cpu_pipelined CPU_CORE (
+        .clk(clk),
+        .rst(rst),
+        .uart_tx_ready(uart_tx_ready),
+        .uart_tx_start(uart_tx_start),
+        .uart_tx_data(uart_tx_data),
+        .leds(leds),
+        .icache_mem_req_addr(imem_req_addr),
+        .icache_mem_req_valid(imem_req_valid),
+        .icache_mem_read_data(imem_read_data),
+        .icache_mem_ready(imem_ready),
+        .dmem_req_addr(dmem_req_addr),
+        .store_data(dmem_write_data),
+        .mem_write_mask(dmem_write_mask),
+        .dcache_mem_req_valid(dmem_req_valid),
+        .dcache_mem_read_data_block(dmem_read_data_block),
+        .dcache_mem_ready(dmem_ready)
+    );
 
-    wire m_tick = (tick_counter == 16'd62500);
+    imem IMEM (
+        .clk(clk),
+        .rst(rst),
+        .mem_req_valid(imem_req_valid),
+        .mem_req_addr(imem_req_addr),
+        .mem_read_data(imem_read_data),
+        .mem_ready(imem_ready)
+    );
 
-    wire [3:0] clean_btn;    
-
-    debouncer db0 (.clk(cpu_clk), .reset(1'b0), .sw(btn[0]), .m_tick(m_tick), .db(clean_btn[0]));
-    debouncer db1 (.clk(cpu_clk), .reset(1'b0), .sw(btn[1]), .m_tick(m_tick), .db(clean_btn[1]));
-    // debouncer db2 (.clk(cpu_clk), .reset(1'b0), .sw(btn[2]), .m_tick(m_tick), .db(clean_btn[2]));
-    // debouncer db3 (.clk(cpu_clk), .reset(1'b0), .sw(btn[3]), .m_tick(m_tick), .db(clean_btn[3]));
-
-    wire clean_rst = clean_btn[0];
-    wire cpu_tx_start;
-    wire [7:0] cpu_tx_data;
-    wire tx_is_ready; 
-
-    cpu_pipelined CPU (
-        .clk(cpu_clk),
-        .rst(clean_rst),
-        .leds(led), 
-        .uart_tx_start(cpu_tx_start),
-        .uart_tx_data(cpu_tx_data), 
-        .uart_tx_ready(tx_is_ready)
-    ); 
-
-    
-    uart_tx #(
-        .CLK_FREQ(50_000_000), 
-        .BAUD_RATE(115200)
-        ) UART (
-        .clk(clk_hz), 
-        .rst(clean_rst), 
-        .tx_start(cpu_tx_start), 
-        .tx_data(cpu_tx_data), 
-        .tx(tx_is_ready), 
-        .tx_ready(uart_tx_out)
+    dmem DMEM (
+        .clk(clk),
+        .mem_req_valid(dmem_req_valid),
+        .mem_address(dmem_req_addr),
+        .mem_write_data(dmem_write_data),
+        .mem_write_mask(dmem_write_mask),
+        .mem_read_data_block(dmem_read_data_block),
+        .mem_ready(dmem_ready)
     );
 
 endmodule
