@@ -1,5 +1,8 @@
-module direct_mapped_cache 
-    (
+ module direct_mapped_cache # (
+    parameter LINE_BYTES = 16;
+    parameter NUM_SETS = 64;
+    parameter NUM_WAYS = 1;
+    ) (
         input wire clk, rst,
         input wire [31:0] cpu_req_addr, cpu_write_data,
         input wire [3:0] mem_write_mask,
@@ -9,17 +12,15 @@ module direct_mapped_cache
         output reg cpu_ready,
         output wire mem_req_valid
     );
+    OFFSET_BITS = $clog2(LINE_BYTES);
+    INDEX_BITS = $clog2(NUM_SETS);
+    TAG_BITS = 32 - OFFSET_BITS - INDEX_BITS;
     wire [3:0] offset = cpu_req_addr[3:0];
-    // wire [5:0] index = cpu_req_addr[9:4];
     wire [1:0] index = cpu_req_addr[5:4];
-    // wire [21:0] tag = cpu_req_addr [31:6];
     wire [25:0] tag = cpu_req_addr [31:6];
 
-    // reg [127:0] data_array [0:63];
     reg [127:0] data_array [0:3];
-    // reg [21:0] tag_array [0:63];
     reg [25:0] tag_array [0:3];
-    // reg [63:0] valid_array;
     reg [3:0] valid_array;
     integer i;
     wire is_hit = valid_array[index] && (tag_array[index] == tag);
