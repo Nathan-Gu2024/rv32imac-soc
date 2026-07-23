@@ -8,12 +8,15 @@
 `include "../src/partial_load.v"
 `include "../src/partial_store.v"
 `include "../src/hazard_unit.v"
-`include "../src/direct_mapped_cache.v"
 `include "../src/rvc_expansion.v"
 `include "../src/reservation_monitor.v"
 `include "../src/csr_file.v"
 `include "../src/trap_controller.v"
 `include "../src/clint_timer.v"
+`include "../src/dcache.v"
+`include "../src/icache.v"
+// `include "../src/cache_core.v"
+`include "../src/tcm.v"
 
 module cpu_pipelined ( 
     input wire clk, rst, uart_tx_ready, 
@@ -28,9 +31,13 @@ module cpu_pipelined (
     
     output wire [31:0] dmem_req_addr, 
     output wire [31:0] store_data, 
-    output wire [3:0] mem_write_mask, 
-    output wire dcache_mem_req_valid, 
-    input wire [127:0] dcache_mem_read_data_block, 
+    output wire [3:0] mem_write_mask,
+
+    // D-cache lower-memory line interface (fake line memory now, AXI adapter later)
+    output wire dcache_mem_req_valid,
+    output wire dcache_mem_req_write,
+    output wire [127:0] dcache_mem_wline,
+    input wire [127:0] dcache_mem_read_data_block,
     input wire dcache_mem_ready
 );
     // Control / stalls
@@ -162,6 +169,9 @@ module cpu_pipelined (
     wire [31:0] dcache_mem_req_addr;
     wire [3:0] raw_write_mask;
     wire is_mmio;
+    wire is_led;
+    wire is_uart;
+    wire is_clint;
     wire is_load;
     wire is_store;
     wire store_commits;
@@ -190,51 +200,161 @@ module cpu_pipelined (
     wire [31:0] wb_data;
 
     // Cache / memory stall control
+    localparam [31:0] LED_ADDR = 32'h0000_2000;
+    localparam [31:0] UART_ADDR = 32'h0000_3000;
+    localparam [31:0] CLINT_BASE = 32'h0200_0000;
+    localparam [31:0] CLINT_MASK = 32'hFFFF_0000;
+    localparam [31:0] TCM_BASE = 32'h4000_0000;
+    localparam [31:0] TCM_BYTE = 32'h0001_0000;
+
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;
-    assign is_mmio = (ex_mem_alu[31:28] == 4'h4);
+
+    // Keep MMIO exact. Do not decode all 0x4xxxxxxx as MMIO because that
+    // collides with the TCM region at 0x4000_0000.
+    assign is_led   = (ex_mem_alu == LED_ADDR);
+    assign is_uart  = (ex_mem_alu == UART_ADDR);
+    assign is_clint = ((ex_mem_alu & CLINT_MASK) == CLINT_BASE);
+    assign is_mmio  = is_led | is_uart | is_clint;
+
     assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen;
     assign is_store = ex_mem_mem_rw;
     assign store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
+
+    // TCM is intentionally not MMIO here. TCM accesses go into dcache.v,
+    // which bypasses the cache and forwards them to tcm.v.
     assign dcache_ren = is_load & ~is_mmio;
     assign dcache_wen = store_commits & ~is_mmio;
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
     assign global_mem_stall = dmem_stall | imem_stall;
 
-    direct_mapped_cache ICACHE (
+    // TCM
+    wire tcm_i_req, tcm_i_ready;
+    wire [31:0] tcm_i_addr, tcm_i_rdata;
+    
+    wire tcm_d_req, tcm_d_we, tcm_d_ready;
+    wire [31:0] tcm_d_addr, tcm_d_wdata, tcm_d_rdata;
+    wire [3:0] tcm_d_wmask;
+
+    tcm #(
+        .ADDR_WIDTH(32),
+        .TCM_BASE(TCM_BASE),
+        .TCM_BYTES(TCM_BYTES)
+    ) TCM (
         .clk(clk), 
         .rst(rst), 
-        .cpu_req_addr(pc),
-        .cpu_write_data(32'b0), 
-        .cpu_read_req(1'b1),        
-        .cpu_write_req(1'b0), 
-        .mem_write_mask(4'b0000),
-        .mem_ready(icache_mem_ready), 
-        .mem_read_data(icache_mem_read_data), 
-        .cpu_read_data(if_inst), 
-        .mem_req_addr(icache_mem_req_addr), 
-        .cpu_ready(cache_ready), 
-        .mem_req_valid(icache_mem_req_valid)
+
+        .i_req(tcm_i_req), 
+        .i_addr(tcm_i_addr), 
+        .i_rdata(tcm_i_rdata), 
+        .i_ready(tcm_i_ready), 
+
+        .d_req(tcm_d_req), 
+        .d_we(tcm_d_we), 
+        .d_addr(tcm_d_addr), 
+        .d_wdata(tcm_d_wdata), 
+        .d_wmask(tcm_d_wmask), 
+        .d_rdata(tcm_d_rdata), 
+        .d_ready(tcm_d_ready)
     ); 
 
-    direct_mapped_cache DCACHE (
-        .clk(clk),
+    icache #(
+        .ADDR_WIDTH(32), 
+        .LINE_BYTES(16), 
+        .NUM_SETS(64), 
+        .NUM_WAYS(2), 
+        .TCM_BASE(TCM_BASE), 
+        .TCM_BYTES(TCM_BYTES)
+    ) ICACHE (
+        .clk(clk), 
         .rst(rst),
-        .cpu_req_addr(ex_mem_alu),  
-        .cpu_write_data(store_data), 
-        .mem_write_mask(mem_write_mask),
-        .cpu_read_req(dcache_ren),      
-        .cpu_write_req(dcache_wen),    
-        .mem_ready(dcache_mem_ready),
-        .mem_read_data(dcache_mem_read_data_block),        
-        .cpu_read_data(dcache_read_data),
-        .mem_req_addr(dcache_mem_req_addr),
-        .cpu_ready(dcache_ready),         
-        .mem_req_valid(dcache_mem_req_valid)
-    );
+        
+        .cpu_req_valid(icache_valid), 
+        .cpu_req_addr(pc), 
+        .cpu_rdata(if_inst), 
+        .cpu_ready(cache_ready), 
 
-    assign dmem_req_addr = dcache_wen ? ex_mem_alu : dcache_mem_req_addr;    
+        .tcm_req_valid(tcm_i_req), 
+        .tcm_req_addr(tcm_i_addr), 
+        .tcm_rdata(tcm_i_rdata), 
+        .tcm_ready(tcm_i_ready),
+
+        .mem_req_valid(icache_mem_req_valid), 
+        .mem_req_addr(icache_mem_req_addr), 
+        .mem_rline(icache_mem_read_data), 
+        .mem_ready(icache_mem_ready)
+    ); 
+
+    dcache #(
+        .ADDR_WIDTH(32), 
+        .LINE_BYTES(16), 
+        .NUM_SETS(64), 
+        .NUM_WAYS(2), 
+        .TCM_BASE(TCM_BASE), 
+        .TCM_BYTES(TCM_BYTES)
+    ) DCACHE (
+        .clk(clk), 
+        .rst(rst),
+
+        .cpu_req_valid(dcache_valid), 
+        .cpu_req_write(dcache_wen), 
+        .cpu_req_addr(ex_mem_alu), 
+        .cpu_wdata(store_data), 
+        .cpu_wmask(mem_write_mask),
+        .cpu_rdata(dcache_read_data), 
+        .cpu_ready(dcache_ready), 
+
+        .tcm_req_valid(tcm_d_req),
+        .tcm_req_write(tcm_d_we), 
+        .tcm_req_addr(tcm_d_addr), 
+        .tcm_wdata(tcm_d_wdata), 
+        .tcm_wmask(tcm_d_wmask),
+        .tcm_rdata(tcm_d_rdata), 
+        .tcm_ready(tcm_d_ready), 
+
+        .mem_req_valid(dcache_mem_req_valid), 
+        .mem_req_write(dcache_mem_req_write), 
+        .mem_req_addr(dcache_mem_req_addr), 
+        .mem_wline(dcache_mem_wline), 
+        .mem_rline(dcache_mem_read_data_block), 
+        .mem_ready(dcache_mem_ready)
+    ); 
+
+
+    // direct_mapped_cache ICACHE (
+    //     .clk(clk), 
+    //     .rst(rst), 
+    //     .cpu_req_addr(pc),
+    //     .cpu_write_data(32'b0), 
+    //     .cpu_read_req(1'b1),        
+    //     .cpu_write_req(1'b0), 
+    //     .mem_write_mask(4'b0000),
+    //     .mem_ready(icache_mem_ready), 
+    //     .mem_read_data(icache_mem_read_data), 
+    //     .cpu_read_data(if_inst), 
+    //     .mem_req_addr(icache_mem_req_addr), 
+    //     .cpu_ready(cache_ready), 
+    //     .mem_req_valid(icache_mem_req_valid)
+    // ); 
+
+    // direct_mapped_cache DCACHE (
+    //     .clk(clk),
+    //     .rst(rst),
+    //     .cpu_req_addr(ex_mem_alu),  
+    //     .cpu_write_data(store_data), 
+    //     .mem_write_mask(mem_write_mask),
+    //     .cpu_read_req(dcache_ren),      
+    //     .cpu_write_req(dcache_wen),    
+    //     .mem_ready(dcache_mem_ready),
+    //     .mem_read_data(dcache_mem_read_data_block),        
+    //     .cpu_read_data(dcache_read_data),
+    //     .mem_req_addr(dcache_mem_req_addr),
+    //     .cpu_ready(dcache_ready),         
+    //     .mem_req_valid(dcache_mem_req_valid)
+    // );
+
+    // assign dmem_req_addr = dcache_mem_req_addr;
     
 
     // IF 
@@ -519,14 +639,16 @@ module cpu_pipelined (
             uart_tx_data <= 8'b0;
         end else begin
             uart_tx_start <= 1'b0;
-            if (ex_mem_mem_rw) begin
-                if (ex_mem_alu == 32'h00002000) begin
+
+            // Gate MMIO side effects so stores do not repeat while the pipeline is frozen.
+            if (!global_mem_stall && store_commits) begin
+                if (is_led) begin
                     leds <= ex_mem_rs2[3:0];
-                end else if (ex_mem_alu == 32'h00003000) begin
+                end else if (is_uart && uart_tx_ready) begin
                     uart_tx_data <= ex_mem_rs2[7:0];
                     uart_tx_start <= 1'b1;
-                end 
-            end 
+                end
+            end
         end 
     end
 
@@ -567,7 +689,7 @@ module cpu_pipelined (
                              (sc_success_flag ? 32'd0 : 32'd1) :
                              ex_mem_alu;
 
-    assign clint_wen = store_commits && is_mmio;
+    assign clint_wen = store_commits && is_clint && !global_mem_stall;
     clint_timer CLINT (
         .clk(clk),
         .rst(rst),
@@ -578,7 +700,10 @@ module cpu_pipelined (
         .timer_interrupt(timer_interrupt)
     );
 
-    assign final_mem_read_data = is_mmio ? clint_rdata : dcache_read_data;
+    assign final_mem_read_data = is_clint ? clint_rdata :
+                                 is_led ? {28'b0, leds} :
+                                 is_uart ? 32'b0 :
+                                            dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
         .rst(rst), 

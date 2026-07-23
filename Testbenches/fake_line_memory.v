@@ -39,10 +39,10 @@ module fake_line_memory #(
         begin
             aligned = {addr[ADDR_WIDTH - 1 : 4], 4'b0000}; 
             // Little endian
-            default_line {
-                aligned + 32'd12, 
-                aligned + 32'd8, 
-                aligned + 32'4, 
+            default_line = {
+                aligned + 32'd12,
+                aligned + 32'd8,
+                aligned + 32'd4,
                 aligned
             };
         end 
@@ -58,6 +58,17 @@ module fake_line_memory #(
         end
     end 
 
+    // Combinationally drive the requested read line
+    always @(*) begin
+        if (valid[line_index(saved_addr)]) begin
+            // Return previously written data if valid
+            mem_rline = mem[line_index(saved_addr)];
+        end else begin
+            // Return the dynamically generated testbench data
+            mem_rline = default_line(saved_addr);
+        end
+    end
+    
     always @(posedge clk) begin
         if (rst) begin
             busy <= 1'b0; 
@@ -75,7 +86,7 @@ module fake_line_memory #(
                     countdown <= countdown - 1;
                 end else begin
                     if (saved_write) begin
-                        mem[line_index(saved_addr)] <= saved_Wline; 
+                        mem[line_index(saved_addr)] <= saved_wline; 
                         valid[line_index(saved_addr)] <= 1'b1;
                         write_count <= write_count + 1;
                         last_write_addr <= saved_addr; 
@@ -87,8 +98,8 @@ module fake_line_memory #(
                 end 
             end else if (mem_req_valid) begin
                 busy <= 1'b1;
-                saved_Write <= mem_req_write;
-                saved_addr <= {mem_req_addr[ADDR_WIDTH - 1 : 0 : 4], 4'b0000}; 
+                saved_write <= mem_req_write;
+                saved_addr <= {mem_req_addr[ADDR_WIDTH - 1 : 4], 4'b0000}; 
                 saved_wline <= mem_wline; 
                 countdown <= LATENCY;
             end

@@ -21,7 +21,7 @@ module cache_core #(
 
     // lower mem line req
     output reg mem_req_valid, mem_req_write,
-    output reg [ADDR_WIDTH - 1: 0] mem_req_addr, 
+    output reg [ADDR_WIDTH - 1 : 0] mem_req_addr, 
     output reg [LINE_BYTES * 8 - 1 : 0] mem_wline
 ); 
 
@@ -49,14 +49,15 @@ module cache_core #(
     reg dirty_array [0 : NUM_WAYS - 1][0 : NUM_SETS -1];
     reg lru_array[0 : NUM_SETS - 1]; 
 
-    wire hit_way0 = valid_array[0][req_index] && (tag_array[0][req_index] == tag); 
-    wire hit_way1 = valid_array[1][req_index] && (tag_array[1][req_index] == tag);
+    wire hit_way0 = valid_array[0][req_index] && (tag_array[0][req_index] == req_tag); 
+    wire hit_way1 = valid_array[1][req_index] && (tag_array[1][req_index] == req_tag);
+
     wire is_hit = hit_way0 || hit_way1;
     wire [LINE_BITS - 1 : 0] hit_line = hit_way0 ? data_array[0][req_index] : 
                                         hit_way1 ? data_array[1][req_index] : 
                                                     {LINE_BITS{1'b0}}; 
     wire victim_way = !valid_array[0][req_index] ? 1'b0 : 
-                      !valid_array[1][req_index] ? 1'b0 : 
+                      !valid_array[1][req_index] ? 1'b1 : 
                                 lru_array[req_index];
     wire victim_valid = valid_array[victim_way][req_index];
     wire vicitm_dirty = dirty_array[victim_way][req_index];
@@ -66,7 +67,7 @@ module cache_core #(
     reg [1:0] state, next_state; 
     reg saved_write, saved_victim_way, saved_victim_dirty;
     reg [ADDR_WIDTH - 1 : 0] saved_addr;
-    reg [INDEX_BITS - 1 : 0] saved_index,;
+    reg [INDEX_BITS - 1 : 0] saved_index;
     reg [TAG_BITS - 1 : 0] saved_tag, saved_victim_tag;
     reg [LINE_BITS - 1 : 0] saved_wline, saved_victim_line, saved_resp_line;
     reg [LINE_BYTES - 1 : 0] saved_wmask; 
@@ -82,7 +83,7 @@ module cache_core #(
             merge_line = old_line; 
             for (j = 0; j < LINE_BYTES; j = j + 1) begin
                 if (byte_mask[j]) begin
-                    merge_line[j * 8 + : 8] = new_line[j * 8 + : 8];
+                    merge_line[j*8+:8] = new_line[j*8+:8];
                 end 
             end 
         end 
@@ -120,7 +121,7 @@ module cache_core #(
                     mem_req_valid = 1'b1; 
                     mem_req_write = 1'b1;
                     mem_req_addr = {saved_victim_tag, saved_index, {OFFSET_BITS{1'b0}}};
-                    mem_wline = saved_victim_tag;
+                    mem_wline = saved_victim_line;
                     if (mem_ready) begin
                         next_state = REFILL_REQ; 
                     end 
@@ -130,6 +131,7 @@ module cache_core #(
                     mem_req_valid = 1'b1; 
                     mem_req_write = 1'b0;
                     mem_req_addr = {saved_tag, saved_index, {OFFSET_BITS{1'b0}}};
+                    // mem_req_addr = {saved_tag, saved_index, {4{1'b0}}};
                     if (mem_ready) begin
                         next_state = RESPOND;
                     end 
@@ -152,7 +154,7 @@ module cache_core #(
             saved_index <= {INDEX_BITS{1'b0}};
             saved_tag <= {TAG_BITS{1'b0}}; 
             saved_wline <= {LINE_BITS{1'b0}}; 
-            saved_wmask <= {LINE_BITS{1'b0}}; 
+            saved_wmask <= {LINE_BYTES{1'b0}}; 
             saved_victim_way <= 1'b0;
             saved_victim_dirty <= 1'b0; 
             saved_victim_tag <= {TAG_BITS{1'b0}}; 
@@ -173,13 +175,13 @@ module cache_core #(
                     begin
                         if (req_valid) begin
                             if (is_hit) begin
-                                lru_array[index] <= hit_way0 ? 1'b1 : 1'b0;
+                                lru_array[req_index] <= hit_way0 ? 1'b1 : 1'b0;
                                 if (req_write) begin
                                    if (hit_way0) begin
-                                        data_array[0][req_index] <= merge_line(data_array[0][req_index]. req_wline, req_wmask);
+                                        data_array[0][req_index] <= merge_line(data_array[0][req_index], req_wline, req_wmask);
                                         dirty_array[0][req_index] <= 1'b1;
                                     end else begin
-                                        data_array[1][req_index] <= merge_line(data_array[1][req_index]. req_wline, req_wmask);
+                                        data_array[1][req_index] <= merge_line(data_array[1][req_index], req_wline, req_wmask);
                                         dirty_array[1][req_index] <= 1'b1;
                                     end 
                                 end 
@@ -208,7 +210,6 @@ module cache_core #(
                             lru_array[saved_index] <= (saved_victim_way == 1'b0) ? 1'b1 : 1'b0;
                         end 
                     end 
-                default: 
             endcase
         end 
     end 
