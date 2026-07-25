@@ -77,6 +77,8 @@ module fpga_top #(
     wire [127:0] mem_rline;
     wire         mem_ready;
 
+    wire [3:0] cpu_leds;
+    
     cpu_pipelined CPU_CORE (
         .clk(clk),
         .rst(rst),
@@ -84,7 +86,7 @@ module fpga_top #(
         .uart_tx_ready(uart_tx_ready),
         .uart_tx_start(uart_tx_start),
         .uart_tx_data(uart_tx_data),
-        .leds(leds),
+        .leds(cpu_leds),
 
         // I-cache lower-memory line interface
         .icache_mem_req_addr(icache_req_addr),
@@ -172,5 +174,15 @@ module fpga_top #(
         .m_axi_bvalid(m_axi_bvalid),
         .m_axi_bready(m_axi_bready)
     );
-
+    reg [26:0] heartbeat; 
+    always @(posedge clk, negedge rst_n) begin
+        if (!rst_n) 
+            heartbeat <= 27'd0;
+        else
+            heartbeat <= heartbeat + 1'b1;
+    end 
+    
+    assign leds[3] = heartbeat[25];
+    assign leds[2:0] = cpu_leds[2:0];
+//    assign leds = 4'b1111;
 endmodule

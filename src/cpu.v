@@ -1,5 +1,3 @@
-`include "../fpga/imem.v"
-`include "../fpga/dmem.v"
 `include "../src/regfile.v"
 `include "../src/alu.v"
 `include "../src/branch_comp.v"
@@ -205,7 +203,7 @@ module cpu_pipelined (
     localparam [31:0] CLINT_BASE = 32'h0200_0000;
     localparam [31:0] CLINT_MASK = 32'hFFFF_0000;
     localparam [31:0] TCM_BASE = 32'h4000_0000;
-    localparam [31:0] TCM_BYTE = 32'h0001_0000;
+    localparam [31:0] TCM_BYTES = 32'h0001_0000;
 
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;

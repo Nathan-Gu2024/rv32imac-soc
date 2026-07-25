@@ -1,4 +1,4 @@
-`timescale 1ns/1ps
+ `timescale 1ns/1ps
 
 module tcm #( 
     parameter ADDR_WIDTH = 32, 
@@ -23,13 +23,22 @@ module tcm #(
     localparam TCM_WORDS = TCM_BYTES / 4;
     localparam INDEX_BITS = $clog2(TCM_WORDS);
 
-    reg [31:0] mem [0 : TCM_WORDS - 1];
+    // reg [31:0] mem [0 : TCM_WORDS - 1];
+    (* ram_style = "block" *) reg [31:0] mem [0 : TCM_WORDS - 1];
 
     wire [ADDR_WIDTH - 1 : 0] i_offset_bytes = i_addr - TCM_BASE; 
     wire [ADDR_WIDTH - 1 : 0] d_offset_bytes = d_addr - TCM_BASE; 
 
-    wire [$clog2(TCM_WORDS) - 1 : 0] i_index = i_offset_bytes[INDEX_BITS + 1 : 2];
-    wire [$clog2(TCM_WORDS) - 1 : 0] d_index = d_offset_bytes[INDEX_BITS + 1 : 2];
+    // wire [$clog2(TCM_WORDS) - 1 : 0] i_index = i_offset_bytes[INDEX_BITS + 1 : 2];
+    // wire [$clog2(TCM_WORDS) - 1 : 0] d_index = d_offset_bytes[INDEX_BITS + 1 : 2];
+    
+    (* ram_style = "block" *) reg [31:0] mem [0 : TCM_WORDS - 1];
+
+    wire [ADDR_WIDTH-1:0] i_offset = i_addr - TCM_BASE;
+    wire [ADDR_WIDTH-1:0] d_offset = d_addr - TCM_BASE;
+
+    wire [INDEX_BITS-1:0] i_index = i_offset[INDEX_BITS+1:2];
+    wire [INDEX_BITS-1:0] d_index = d_offset[INDEX_BITS+1:2];
 
     wire i_in_range = (i_addr >= TCM_BASE) && (i_addr < (TCM_BASE + TCM_BYTES));
     wire d_in_range = (d_addr >= TCM_BASE) && (d_addr < (TCM_BASE + TCM_BYTES));
@@ -77,11 +86,13 @@ module tcm #(
     end 
 
     // sim
+    `ifndef SYNTHESIS
     integer i;
     initial begin
         for (i = 0; i < TCM_WORDS; i = i + 1) begin
-            mem[i] = 32'h00000000;
-        end 
+            mem[i] = 32'h0000_0000;
+        end
     end
-
+    `endif
+    
 endmodule

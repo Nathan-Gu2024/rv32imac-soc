@@ -32,6 +32,7 @@ module control_logic (
         .imm_sel(imm_sel),
         .alu_sel(alu_sel)
     );
+    
     assign out_is_lr  = is_lr;
     assign out_is_sc  = is_sc;
     assign out_is_amo = is_amo;
