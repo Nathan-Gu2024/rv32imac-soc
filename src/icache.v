@@ -15,7 +15,8 @@ module icache #(
     input wire cpu_req_valid,
     input wire [ADDR_WIDTH-1:0] cpu_req_addr,
     output reg [31:0] cpu_rdata,
-    output reg cpu_ready,
+//    output reg cpu_ready,
+    output wire cpu_ready,
 
     // TCM instruction port
     output wire tcm_req_valid,
@@ -24,7 +25,7 @@ module icache #(
     input wire tcm_ready,
 
     // Lower-memory/cache-line read interface
-    output wire  mem_req_valid,
+    output wire mem_req_valid,
     output wire [ADDR_WIDTH-1:0] mem_req_addr,
     input wire [LINE_BYTES*8-1:0] mem_rline,
     input wire mem_ready
@@ -36,12 +37,13 @@ module icache #(
 
     localparam [ADDR_WIDTH-1:0] TCM_LIMIT = TCM_BASE + TCM_BYTES;
 
-    localparam S_IDLE = 2'd0;
-    localparam S_START_TCM = 2'd1;
-    localparam S_WAIT_TCM = 2'd2;
-    localparam S_WAIT_CACHE = 2'd3;
+    localparam [2:0] S_IDLE = 3'd0;
+    localparam [2:0] S_START_TCM = 3'd1;
+    localparam [2:0] S_WAIT_TCM = 3'd2;
+    localparam [2:0] S_WAIT_CACHE = 3'd3;
+    localparam [2:0] S_DONE = 3'd4;
 
-    reg [1:0] state;
+    reg [2:0] state;
     reg [ADDR_WIDTH-1:0] saved_addr;
     reg [WORD_SEL_BITS-1:0] saved_word_offset;
 
@@ -56,7 +58,7 @@ module icache #(
     wire cache_req_valid = (state == S_WAIT_CACHE);
 
     assign tcm_req_valid = (state == S_WAIT_TCM);
-    assign tcm_req_addr  = saved_addr;
+    assign tcm_req_addr = saved_addr;
 
     reg core_req_valid, core_req_sent;
 
@@ -87,7 +89,8 @@ module icache #(
         .mem_req_addr(mem_req_addr),
         .mem_wline(unused_mem_wline)
     );
-
+    assign cpu_ready = (state == S_DONE) && (cpu_req_addr == saved_addr);
+    
     always @(posedge clk) begin
         if (rst) begin
             state <= S_IDLE;
@@ -96,9 +99,9 @@ module icache #(
             core_req_valid <= 1'b0;
             core_req_sent <= 1'b0;
             cpu_rdata <= 32'h0;
-            cpu_ready <= 1'b0;
+//            cpu_ready <= 1'b0;
         end else begin
-            cpu_ready <= 1'b0;
+//            cpu_ready <= 1'b0;
 
             case (state)
                 S_IDLE: begin
@@ -115,12 +118,10 @@ module icache #(
 
                 S_WAIT_CACHE: begin
                     if (!core_req_sent) begin
-                        // core_req_valid <= 1'b1;
-                        core_req_sent  <= 1'b1;
+                        core_req_sent <= 1'b1;
                     end
 
                     if (cache_ready) begin
-                        // Directly multiplex the hardware wire, bypassing function scope bugs
                         case (saved_word_offset)
                             2'd0: cpu_rdata <= cache_rline[31:0];
                             2'd1: cpu_rdata <= cache_rline[63:32];
@@ -128,24 +129,45 @@ module icache #(
                             2'd3: cpu_rdata <= cache_rline[127:96];
                             default: cpu_rdata <= 32'h0;
                         endcase
-                        cpu_ready <= 1'b1;
+//                        cpu_ready <= 1'b1;
                         core_req_sent <= 1'b0;
-                        state <= S_IDLE;
+                        state <= S_DONE; // Transition to holding state
                     end
                 end                
                 
                 S_START_TCM: begin
-                    // Give synchronous TCM one clean request cycle.
                     state <= S_WAIT_TCM;
                 end
 
                 S_WAIT_TCM: begin
                     if (tcm_ready) begin
                         cpu_rdata <= tcm_rdata;
-                        cpu_ready <= 1'b1;
-                        state <= S_IDLE;
+//                        cpu_ready <= 1'b1;
+                        state <= S_DONE; // Transition to holding state
                     end
                 end
+                
+                S_DONE: begin
+                    if (cpu_req_valid && (cpu_req_addr == saved_addr)) begin
+                        // Hold ready high until the pipeline advances and the PC changes
+//                        cpu_ready <= 1'b1; 
+                    end else begin
+//                        cpu_ready <= 1'b0;
+                        // Immediately fetch the new instruction to avoid a 1-cycle penalty
+                        if (cpu_req_valid) begin
+                            saved_addr <= cpu_req_addr;
+                            saved_word_offset <= cpu_req_addr[OFFSET_BITS-1:2];
+                            if ((cpu_req_addr >= TCM_BASE) && (cpu_req_addr < TCM_LIMIT)) begin
+                                state <= S_WAIT_TCM;
+                            end else begin
+                                state <= S_WAIT_CACHE;
+                            end
+                        end else begin
+                            state <= S_IDLE;
+                        end
+                    end
+                end
+
                 default: begin
                     core_req_sent <= 1'b0;
                     state <= S_IDLE;

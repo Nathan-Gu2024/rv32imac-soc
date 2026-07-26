@@ -13,7 +13,7 @@
 `include "../src/clint_timer.v"
 `include "../src/dcache.v"
 `include "../src/icache.v"
-// `include "../src/cache_core.v"
+`include "../src/cache_core.v"
 `include "../src/tcm.v"
 
 module cpu_pipelined ( 
@@ -36,7 +36,16 @@ module cpu_pipelined (
     output wire dcache_mem_req_write,
     output wire [127:0] dcache_mem_wline,
     input wire [127:0] dcache_mem_read_data_block,
-    input wire dcache_mem_ready
+    input wire dcache_mem_ready,
+    
+    // debug
+    output wire [31:0] debug_pc, 
+    output wire [31:0] debug_instr, 
+    output wire debug_dcache_valid,
+    output wire debug_dcache_ready,
+    output wire debug_tcm_d_req,
+    output wire debug_tcm_d_ready,
+    output wire debug_global_mem_stall
 );
     // Control / stalls
     wire stall;
@@ -226,7 +235,7 @@ module cpu_pipelined (
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
     assign global_mem_stall = dmem_stall | imem_stall;
-
+        
     // TCM
     wire tcm_i_req, tcm_i_ready;
     wire [31:0] tcm_i_addr, tcm_i_rdata;
@@ -238,7 +247,8 @@ module cpu_pipelined (
     tcm #(
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
-        .TCM_BYTES(TCM_BYTES)
+        .TCM_BYTES(TCM_BYTES), 
+        .INIT_FILE("tcm_init.mem")
     ) TCM (
         .clk(clk), 
         .rst(rst), 
@@ -318,8 +328,14 @@ module cpu_pipelined (
         .mem_rline(dcache_mem_read_data_block), 
         .mem_ready(dcache_mem_ready)
     ); 
-
-
+    //debug 
+    assign debug_dcache_valid     = dcache_valid;
+    assign debug_dcache_ready     = dcache_ready;
+    assign debug_tcm_d_req        = tcm_d_req;
+    assign debug_tcm_d_ready      = tcm_d_ready;
+    assign debug_global_mem_stall = global_mem_stall;    
+    
+    
     // direct_mapped_cache ICACHE (
     //     .clk(clk), 
     //     .rst(rst), 
@@ -410,6 +426,8 @@ module cpu_pipelined (
         .pc_out(if_id_pc),
         .inst_out(if_id_inst)
     ); 
+    
+    assign debug_instr = if_id_inst;
 
     // ID
     control_logic CL (
@@ -745,9 +763,13 @@ module program_counter (
     wire [31:0] next_pc = pc_sel ? mem_address : pc + pc_inc;
 
     always @(posedge clk) begin
+//        if (rst) 
+//            pc <= 32'b0;
+//        else if (!stall) 
+//            pc <= next_pc;
         if (rst) 
-            pc <= 32'b0;
-        else if (!stall) 
+            pc <= 32'h4000_0000;
+        else if (!stall)
             pc <= next_pc;
     end
 
