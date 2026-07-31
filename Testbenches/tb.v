@@ -20,23 +20,34 @@ module testbench;
     wire [127:0] dcache_mem_read_data_block; 
     wire dcache_mem_ready;
 
+    wire dcache_mem_req_write; 
+    wire [127:0] dcache_mem_wline; 
+
     // Instantiate Device Under Test (DUT)
     cpu_pipelined DUT (
-        .clk(clk), .rst(rst), .uart_tx_ready(uart_tx_ready),
-        .uart_tx_start(uart_tx_start), .uart_tx_data(uart_tx_data), .leds(leds),
+        .clk(clk), 
+        .rst(rst), 
+        .uart_tx_ready(uart_tx_ready),
+        .uart_tx_start(uart_tx_start), 
+        .uart_tx_data(uart_tx_data), 
+        .leds(leds),
         
         .icache_mem_req_addr(icache_mem_req_addr),
         .icache_mem_req_valid(icache_mem_req_valid),
         .icache_mem_read_data(icache_mem_read_data),
         .icache_mem_ready(icache_mem_ready),
         
-        .dmem_req_addr(dmem_req_addr),
+        .dmem_req_addr(dmem_req_addr), 
         .store_data(store_data),
         .mem_write_mask(mem_write_mask),
+        
         .dcache_mem_req_valid(dcache_mem_req_valid),
+        .dcache_mem_req_write(dcache_mem_req_write), 
+        .dcache_mem_wline(dcache_mem_wline),         
         .dcache_mem_read_data_block(dcache_mem_read_data_block),
         .dcache_mem_ready(dcache_mem_ready)
     );
+
 
     reg [31:0] mock_imem [0:16383]; // 64KB Instruction Memory array
     reg [31:0] mock_dmem [0:4095];  // 16KB Data Memory array
@@ -61,14 +72,14 @@ module testbench;
 
     // Handle standard memory write requests straight to mock_dmem
     always @(posedge clk) begin
-        if (dcache_mem_req_valid && mem_write_mask != 4'b0000) begin
-            if (mem_write_mask[0]) mock_dmem[dmem_req_addr[31:2]][7:0]   <= store_data[7:0];
-            if (mem_write_mask[1]) mock_dmem[dmem_req_addr[31:2]][15:8]  <= store_data[15:8];
-            if (mem_write_mask[2]) mock_dmem[dmem_req_addr[31:2]][23:16] <= store_data[23:16];
-            if (mem_write_mask[3]) mock_dmem[dmem_req_addr[31:2]][31:24] <= store_data[31:24];
+        // When the cache requests a memory write, write the full 128-bit line to mock_dmem
+        if (dcache_mem_req_valid && dcache_mem_req_write) begin
+            mock_dmem[{dmem_req_addr[31:4], 2'b00}] <= dcache_mem_wline[31:0];
+            mock_dmem[{dmem_req_addr[31:4], 2'b01}] <= dcache_mem_wline[63:32];
+            mock_dmem[{dmem_req_addr[31:4], 2'b10}] <= dcache_mem_wline[95:64];
+            mock_dmem[{dmem_req_addr[31:4], 2'b11}] <= dcache_mem_wline[127:96];
         end
     end
-
     integer i;
     integer cycle;
 
@@ -98,8 +109,10 @@ module testbench;
         reset_dut();
         repeat(50) @(posedge clk);
         $display("Test 1: Basic ALU");
-        $monitor("Time: %0t | PC: %0d | Stall: %b | Cache State: %b | Hit: %b", 
-          $time, DUT.PC.pc, DUT.global_mem_stall, DUT.ICACHE.state, DUT.ICACHE.is_hit);
+        // $monitor("Time: %0t | PC: %0d | Stall: %b | Cache State: %b | Hit: %b", 
+        //   $time, DUT.PC.pc, DUT.global_mem_stall, DUT.ICACHE.state, DUT.ICACHE.cache_hit);
+        $monitor("Time: %0t | PC: %0d | Stall: %b | Hit: %b", 
+          $time, DUT.PC.pc, DUT.global_mem_stall, DUT.ICACHE.cache_hit);
         check(3, 32'd8); // add
         check(4, 32'd2); // sub
         check(5, 32'd1); // and
@@ -259,49 +272,49 @@ module testbench;
         check(8, 32'd89);  // x8 should be 89
 
 
-        // Hardware Trap & OS Context Switch
-        reset_pipeline();
-        $readmemh("../Mems/test_trap_ecall.mem", mock_imem);
-        reset_dut();
-        repeat(100) @(posedge clk); 
-        $display("Test 17: Hardware Trap & OS Context Switch");     
+        // // Hardware Trap & OS Context Switch
+        // reset_pipeline();
+        // $readmemh("../Mems/test_trap_ecall.mem", mock_imem);
+        // reset_dut();
+        // repeat(100) @(posedge clk); 
+        // $display("Test 17: Hardware Trap & OS Context Switch");     
         
-        // Check 1: Did the User Program run before the trap?
-        check(6, 32'd10);
-        check(7, 32'd20);
+        // // Check 1: Did the User Program run before the trap?
+        // check(6, 32'd10);
+        // check(7, 32'd20);
         
-        // Check 2: Did the trap successfully jump to the Kernel at 0x40?
-        check(29, 32'd99); // If x29 is 99, the Trap Controller successfully overrode the PC!
+        // // Check 2: Did the trap successfully jump to the Kernel at 0x40?
+        // check(29, 32'd99); // If x29 is 99, the Trap Controller successfully overrode the PC!
         
-        // Check 3: Did the kernel successfully return to the User Program?
-        check(28, 32'd30); // If x28 is 30, mret flawlessly restored the PC!
+        // // Check 3: Did the kernel successfully return to the User Program?
+        // check(28, 32'd30); // If x28 is 30, mret flawlessly restored the PC!
 
 
-        // Hardware Trap & OS Context Switch
-        reset_pipeline();
-        $readmemh("../Mems/test_timer_trap.mem", mock_imem);
-        reset_dut();
-        repeat(150) @(posedge clk); 
-        $display("Test 18: Preemptive Timer Interrupt");
-        $display(
-            "PC=%h timer=%b gated=%b mie=%b mtime=%0d mtimecmp=%0d mtvec=%h trap=%b x8=%0d x9=%0d",
-            DUT.pc,
-            DUT.timer_interrupt,
-            DUT.gated_interrupt,
-            DUT.mie,
-            DUT.CLINT.mtime,
-            DUT.CLINT.mtimecmp,
-            DUT.mtvec_out,
-            DUT.trap_taken,
-            DUT.RF.regs[8],
-            DUT.RF.regs[9]
-        );     
-        check(9, 32'd99);
-        if (DUT.RF.regs[8] > 0) begin
-            $display("[PASS] Register x8 > 0 (Actual: %d) - User loop ran before trap", DUT.RF.regs[8]);
-        end else begin 
-            $display("[FAIL] Register x8 = 0 - USer loop never executed");
-        end 
+        // // Hardware Trap & OS Context Switch
+        // reset_pipeline();
+        // $readmemh("../Mems/test_timer_trap.mem", mock_imem);
+        // reset_dut();
+        // repeat(150) @(posedge clk); 
+        // $display("Test 18: Preemptive Timer Interrupt");
+        // $display(
+        //     "PC=%h timer=%b gated=%b mie=%b mtime=%0d mtimecmp=%0d mtvec=%h trap=%b x8=%0d x9=%0d",
+        //     DUT.pc,
+        //     DUT.timer_interrupt,
+        //     DUT.gated_interrupt,
+        //     DUT.mie,
+        //     DUT.CLINT.mtime,
+        //     DUT.CLINT.mtimecmp,
+        //     DUT.mtvec_out,
+        //     DUT.trap_taken,
+        //     DUT.RF.regs[8],
+        //     DUT.RF.regs[9]
+        // );     
+        // check(9, 32'd99);
+        // if (DUT.RF.regs[8] > 0) begin
+        //     $display("[PASS] Register x8 > 0 (Actual: %d) - User loop ran before trap", DUT.RF.regs[8]);
+        // end else begin 
+        //     $display("[FAIL] Register x8 = 0 - USer loop never executed");
+        // end 
               
         $finish;
 

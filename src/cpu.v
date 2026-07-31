@@ -15,7 +15,7 @@
 `include "../src/clint_timer.v"
 `include "../src/dcache.v"
 `include "../src/icache.v"
-// `include "../src/cache_core.v"
+`include "../src/cache_core.v"
 `include "../src/tcm.v"
 
 module cpu_pipelined ( 
@@ -205,7 +205,7 @@ module cpu_pipelined (
     localparam [31:0] CLINT_BASE = 32'h0200_0000;
     localparam [31:0] CLINT_MASK = 32'hFFFF_0000;
     localparam [31:0] TCM_BASE = 32'h4000_0000;
-    localparam [31:0] TCM_BYTE = 32'h0001_0000;
+    localparam [31:0] TCM_BYTES = 32'h0001_0000;
 
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;
@@ -447,6 +447,7 @@ module cpu_pipelined (
         .imm(imm)
     );
 
+
     id_ex_reg ID_EX (
         .clk(clk), 
         .rst(rst),
@@ -539,7 +540,9 @@ module cpu_pipelined (
                 (~id_ex_br_lt & (id_ex_is_bge | id_ex_is_bgeu)) |
                 id_ex_is_jal | id_ex_is_jalr;
 
+    wire id_ex_mem_read = (id_ex_wb_sel == 2'b00) && id_ex_reg_wen;
     hazard_unit HU (
+        .id_ex_mem_read(id_ex_mem_read),
         .id_ex_rd(id_ex_rd), 
         .id_ex_wb_sel(id_ex_wb_sel),
         .if_id_rs1(if_id_inst[19:15]), 
