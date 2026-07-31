@@ -1,29 +1,8 @@
-# Clock Signal
-set_property PACKAGE_PIN E7 [get_ports clk_hz]
-set_property IOSTANDARD LVCMOS33 [get_ports clk_hz]
+## Hamgeek Zynq-7020 minimal CPU constraints for block design top
 
-# FIXED: Added name 'sys_clk_pin' and corrected waveform math
-create_clock -add -name sys_clk_pin -period 10.000 -waveform {0 5.000} [get_ports clk_hz]
-
-# Buttons (Inputs) - ONLY PL BUTTONS
-set_property PACKAGE_PIN K2  [get_ports {btn[0]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {btn[0]}]
-
-set_property PACKAGE_PIN K3 [get_ports {btn[1]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {btn[1]}]
-
-# LEDs (Outputs) - ONLY PL LEDS
-set_property PACKAGE_PIN D2 [get_ports {led[0]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {led[0]}]
-
-set_property PACKAGE_PIN D3 [get_ports {led[1]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {led[1]}]
-
-set_property PACKAGE_PIN D4 [get_ports {led[2]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {led[2]}]
-
-set_property PACKAGE_PIN D5 [get_ports {led[2]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {led[2]}]
-
-set_property PACKAGE_PIN D4 [get_ports {led[3]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {led[3]}]
+## LEDs only - adjust name if get_ports shows leds_0 instead of leds
+set_property PACKAGE_PIN W13 [get_ports {leds[0]}]
+set_property PACKAGE_PIN V12 [get_ports {leds[1]}]
+set_property PACKAGE_PIN U12 [get_ports {leds[2]}]
+set_property PACKAGE_PIN T12 [get_ports {leds[3]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {leds[*]}]
