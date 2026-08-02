@@ -131,11 +131,10 @@ module cache_core #(
                     mem_req_valid = 1'b1; 
                     mem_req_write = 1'b0;
                     mem_req_addr = {saved_tag, saved_index, {OFFSET_BITS{1'b0}}};
-                    // mem_req_addr = {saved_tag, saved_index, {4{1'b0}}};
                     if (mem_ready) begin
                         next_state = RESPOND;
-                    end 
                 end 
+            end
             RESPOND: 
                 begin
                     resp_ready = 1'b1;

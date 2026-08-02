@@ -216,7 +216,19 @@ module fpga_top #(
         end
     end
     
+    reg [31:0] counter;
+
+    always @(posedge clk) begin
+        if (rst)
+            counter <= 0;
+        else
+            counter <= counter + 1;
+    end
+
+//    assign leds = counter[27:24];
+    
     assign leds[3] = heartbeat[25];
+
 //    assign leds[2] = seen_dcache_valid;
 //    assign leds[1] = seen_tcm_d_req;
 //    assign leds[0] = seen_tcm_d_ready;

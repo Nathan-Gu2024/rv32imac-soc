@@ -240,9 +240,23 @@ module dcache #(
 
     wire cpu_addr_is_tcm = (cpu_req_addr >= TCM_BASE) &&
                            (cpu_req_addr < (TCM_BASE + TCM_BYTES));
+                           
+    // Filter for Memory-Mapped IO (Addresses starting with 0x0000_2xxx)
+    wire cpu_addr_is_mmio = (cpu_req_addr[31:12] == 20'h00002);
 
-    // 1. Instantly route TCM requests
-    assign tcm_req_valid = cpu_req_valid && cpu_addr_is_tcm;
+    // 1. Route TCM requests with a 1-cycle pulse mask to prevent ghost writes/reads
+    reg tcm_req_pending;
+    always @(posedge clk) begin
+        if (rst) begin
+            tcm_req_pending <= 1'b0;
+        end else if (tcm_req_valid) begin
+            tcm_req_pending <= 1'b1;
+        end else if (tcm_ready) begin
+            tcm_req_pending <= 1'b0;
+        end
+    end
+
+    assign tcm_req_valid = cpu_req_valid && cpu_addr_is_tcm && !tcm_req_pending;
     assign tcm_req_write = cpu_req_write;
     assign tcm_req_addr  = cpu_req_addr;
     assign tcm_wdata     = cpu_wdata;
@@ -266,8 +280,8 @@ module dcache #(
         endcase
     end
 
-    // 3. Instantiate Cache Core combinationally
-    wire core_req_valid = cpu_req_valid && !cpu_addr_is_tcm;
+    // 3. Instantiate Cache Core combinationally with MMIO explicit blocking
+    wire core_req_valid = cpu_req_valid && !cpu_addr_is_tcm && !cpu_addr_is_mmio;
     wire [LINE_BITS-1:0] cache_rline;
     wire cache_ready, cache_hit;
 
@@ -309,6 +323,8 @@ module dcache #(
 
     // 5. Instantly return data and ready signal to CPU based on address target
     assign cpu_rdata = cpu_addr_is_tcm ? tcm_rdata : cache_rword;
-    assign cpu_ready = cpu_addr_is_tcm ? tcm_ready : cache_ready;
+    
+    // If addressing MMIO, acknowledge instantly so the pipeline can move on.
+    assign cpu_ready = cpu_addr_is_tcm ? tcm_ready : (cpu_addr_is_mmio ? 1'b1 : cache_ready);
 
 endmodule

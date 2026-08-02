@@ -33,12 +33,12 @@ module tcm #(
     // wire [$clog2(TCM_WORDS) - 1 : 0] i_index = i_offset_bytes[INDEX_BITS + 1 : 2];
     // wire [$clog2(TCM_WORDS) - 1 : 0] d_index = d_offset_bytes[INDEX_BITS + 1 : 2];
     
-    initial begin
-        if (INIT_FILE != "") begin
-            $display("Loading TCM file %s", INIT_FILE);
-            $readmemh(INIT_FILE, mem);
-        end
-    end
+//    initial begin
+//        if (INIT_FILE != "") begin
+//            $display("Loading TCM file %s", INIT_FILE);
+//            $readmemh(INIT_FILE, mem);
+//        end
+//    end
     
     
     initial begin
@@ -158,36 +158,85 @@ module tcm #(
 
     // Sync 1 cycle TCM; if inst and data ports touch same word 
     // -> return newly merged word for write-first
+//    always @(posedge clk) begin
+//        if (rst) begin
+//            i_rdata <= 32'b0;
+//            d_rdata <= 32'b0;
+//            i_ready <= 1'b0;
+//            d_ready <= 1'b0;
+//        end else begin
+//            i_ready <= 1'b0;
+//            d_ready <= 1'b0;
+
+//            if (d_req && d_in_range && d_we) begin 
+//                mem[d_index] <= d_merged_word;
+//            end 
+
+//            if (i_req && i_in_range) begin
+//                if (d_req && d_in_range && d_we && (i_index == d_index)) begin
+//                    i_rdata <= d_merged_word; 
+//                end else begin
+//                    i_rdata <= mem[i_index]; 
+//                end 
+//                i_ready <= 1'b1;
+//            end 
+
+//            if (d_req && d_in_range) begin
+//                d_rdata <= d_we ? d_merged_word : mem[d_index];
+//                d_ready <= 1'b1;
+//            end 
+//        end 
+//    end 
+    
+    
+    
+    // Port B (Data) Write masking and Synchronous Read/Write
     always @(posedge clk) begin
         if (rst) begin
-            i_rdata <= 32'b0;
             d_rdata <= 32'b0;
-            i_ready <= 1'b0;
             d_ready <= 1'b0;
         end else begin
-            i_ready <= 1'b0;
             d_ready <= 1'b0;
 
-            if (d_req && d_in_range && d_we) begin 
-                mem[d_index] <= d_merged_word;
-            end 
-
-            if (i_req && i_in_range) begin
-                if (d_req && d_in_range && d_we && (i_index == d_index)) begin
-                    i_rdata <= d_merged_word; 
-                end else begin
-                    i_rdata <= mem[i_index]; 
-                end 
-                i_ready <= 1'b1;
-            end 
-
             if (d_req && d_in_range) begin
-                d_rdata <= d_we ? d_merged_word : mem[d_index];
+                if (d_we) begin
+                    // BRAM inferred byte-enable writes
+                    if (d_wmask[0]) mem[d_index][7:0]   <= d_wdata[7:0];
+                    if (d_wmask[1]) mem[d_index][15:8]  <= d_wdata[15:8];
+                    if (d_wmask[2]) mem[d_index][23:16] <= d_wdata[23:16];
+                    if (d_wmask[3]) mem[d_index][31:24] <= d_wdata[31:24];
+                end
+                
+                // Synchronous read (will map to BRAM read port)
+                d_rdata <= mem[d_index];
                 d_ready <= 1'b1;
             end 
         end 
     end 
 
+    // Port A (Instruction) Synchronous Read
+    always @(posedge clk) begin
+        if (rst) begin
+            i_rdata <= 32'b0;
+            i_ready <= 1'b0;
+        end else begin
+            i_ready <= 1'b0;
+            
+            if (i_req && i_in_range) begin
+                // Synchronous read (will map to second BRAM read port)
+                i_rdata <= mem[i_index]; 
+                i_ready <= 1'b1;
+            end 
+        end 
+    end
+
+    always @(posedge clk) begin
+        if (d_req)
+            $display("TCM %s addr=%h data=%h",
+                     d_we ? "WRITE" : "READ",
+                     d_addr,
+                     d_we ? d_wdata : d_rdata);
+    end
     // sim
 //    `ifndef SYNTHESIS
 //    integer i;

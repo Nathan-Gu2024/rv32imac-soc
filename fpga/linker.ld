@@ -9,11 +9,11 @@ ENTRY(_start)
 
 SECTIONS
 {
-    .text : { 
-        *(.text_init) 
+.text : { 
+        *(.text.init) 
         *(.text .text.*)
-    } > TCM 
-
+    } > TCM
+    
     .rodata : {
         *(.rodata .rodata.*)
     } > TCM

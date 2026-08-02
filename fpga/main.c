@@ -1,6 +1,6 @@
 #include <stdint.h> 
 
-#define LED_ADDR 0x20000000 
+#define LED_ADDR 0x00002000
 #define LED_REG  *((volatile uint32_t*)LED_ADDR)
 
 int main () {

@@ -182,7 +182,7 @@ module icache #(
     input wire tcm_ready,
 
     // Lower-memory/cache-line read interface
-    output wire mem_req_valid,
+    output wire  mem_req_valid,
     output wire [ADDR_WIDTH-1:0] mem_req_addr,
     input wire [LINE_BYTES*8-1:0] mem_rline,
     input wire mem_ready
@@ -191,29 +191,13 @@ module icache #(
     localparam OFFSET_BITS = $clog2(LINE_BYTES);
     localparam [ADDR_WIDTH-1:0] TCM_LIMIT = TCM_BASE + TCM_BYTES;
 
-    localparam S_IDLE = 2'd0;
-    localparam S_START_TCM = 2'd1;
-    localparam S_WAIT_TCM = 2'd2;
-    localparam S_WAIT_CACHE = 2'd3;
+    // 1. Instantly determine where the request should go
+    wire req_is_tcm = (cpu_req_addr >= TCM_BASE) && (cpu_req_addr < TCM_LIMIT);
 
-    reg [1:0] state;
-    reg [ADDR_WIDTH-1:0] saved_addr;
-    reg [WORD_SEL_BITS-1:0] saved_word_offset;
-
-    wire req_is_tcm_addr = (cpu_req_addr >= TCM_BASE) && (cpu_req_addr < TCM_LIMIT);
-
+    // 2. Route Cache signals directly
+    wire cache_req_valid = cpu_req_valid && !req_is_tcm;
     wire cache_ready, cache_hit;
     wire [LINE_BITS-1:0] cache_rline;
-
-    wire unused_mem_req_write;
-    wire [LINE_BITS-1:0] unused_mem_wline;
-
-    wire cache_req_valid = (state == S_WAIT_CACHE);
-
-    assign tcm_req_valid = (state == S_WAIT_TCM);
-    assign tcm_req_addr  = saved_addr;
-
-    reg core_req_valid, core_req_sent;
 
     cache_core #(
         .ADDR_WIDTH(ADDR_WIDTH),
@@ -240,77 +224,42 @@ module icache #(
         .mem_req_valid(mem_req_valid),
         .mem_req_write(), // Unused for I-Cache
         .mem_req_addr(mem_req_addr),
-        .mem_wline(unused_mem_wline)
+        .mem_wline()      // Unused for I-Cache
     );
 
+    // 3. Instantly multiplex the specific 32-bit word out of the 128-bit cache line
+    wire [1:0] word_offset = cpu_req_addr[OFFSET_BITS-1:2];
+    reg [31:0] cache_word;
+    always @(*) begin
+        case (word_offset)
+            2'd0: cache_word = cache_rline[31:0];
+            2'd1: cache_word = cache_rline[63:32];
+            2'd2: cache_word = cache_rline[95:64];
+            2'd3: cache_word = cache_rline[127:96];
+            default: cache_word = 32'h0;
+        endcase
+    end
+
+    // 4. Route TCM signals with a 1-cycle pulse mask to prevent echoes
+    reg tcm_req_pending;
     always @(posedge clk) begin
         if (rst) begin
-            state <= S_IDLE;
-            saved_addr <= {ADDR_WIDTH{1'b0}};
-            saved_word_offset <= {WORD_SEL_BITS{1'b0}};
-            core_req_valid <= 1'b0;
-            core_req_sent <= 1'b0;
-            cpu_rdata <= 32'h0;
-            cpu_ready <= 1'b0;
-        end else begin
-            cpu_ready <= 1'b0;
-
-            case (state)
-                S_IDLE: begin
-                    if (cpu_req_valid) begin
-                        saved_addr <= cpu_req_addr;
-                        saved_word_offset <= cpu_req_addr[OFFSET_BITS-1:2];
-                        if (req_is_tcm_addr) begin
-                            state <= S_WAIT_TCM;
-                        end else begin
-                            state <= S_WAIT_CACHE;
-                        end
-                    end
-                end
-
-                S_WAIT_CACHE: begin
-                    if (!core_req_sent) begin
-                        // core_req_valid <= 1'b1;
-                        core_req_sent  <= 1'b1;
-                    end
-
-                    if (cache_ready) begin
-                        // Directly multiplex the hardware wire, bypassing function scope bugs
-                        case (saved_word_offset)
-                            2'd0: cpu_rdata <= cache_rline[31:0];
-                            2'd1: cpu_rdata <= cache_rline[63:32];
-                            2'd2: cpu_rdata <= cache_rline[95:64];
-                            2'd3: cpu_rdata <= cache_rline[127:96];
-                            default: cpu_rdata <= 32'h0;
-                        endcase
-                        cpu_ready <= 1'b1;
-                        core_req_sent <= 1'b0;
-                        state <= S_IDLE;
-                    end
-                end                
-                
-                S_START_TCM: begin
-                    // Give synchronous TCM one clean request cycle.
-                    state <= S_WAIT_TCM;
-                end
-
-                S_WAIT_TCM: begin
-                    if (tcm_ready) begin
-                        cpu_rdata <= tcm_rdata;
-                        cpu_ready <= 1'b1;
-                        state <= S_IDLE;
-                    end
-                end
-                default: begin
-                    core_req_sent <= 1'b0;
-                    state <= S_IDLE;
-                end
-            endcase
+            tcm_req_pending <= 1'b0;
+        end else if (tcm_req_valid) begin
+            // We just sent a request to the TCM. Flag it so we drop 'valid' next cycle.
+            tcm_req_pending <= 1'b1;
+        end else if (tcm_ready) begin
+            // The TCM finished responding. Clear the flag for the next instruction.
+            tcm_req_pending <= 1'b0;
         end
     end
 
-    // 5. Instantly return data and ready signal to CPU based on address target
+    // Only assert valid on the VERY FIRST cycle of the request
+    assign tcm_req_valid = cpu_req_valid && req_is_tcm && !tcm_req_pending;
+    assign tcm_req_addr  = cpu_req_addr;
+    
+    // 5. Return data and ready signal
     assign cpu_rdata = req_is_tcm ? tcm_rdata : cache_word;
     assign cpu_ready = req_is_tcm ? tcm_ready : cache_ready;
-
+    
 endmodule

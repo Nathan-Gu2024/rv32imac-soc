@@ -151,7 +151,7 @@ module cpu_pipelined (
     wire flush_id;
     wire flush_ex;
     wire pc_trap_override;
-    reg mie;
+    wire mstatus_mie;
 
     // EX/MEM
     wire [31:0] ex_mem_alu;
@@ -248,7 +248,7 @@ module cpu_pipelined (
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES), 
-        .INIT_FILE("tcm_init.mem")
+        .INIT_FILE("main.mem")
     ) TCM (
         .clk(clk), 
         .rst(rst), 
@@ -335,42 +335,6 @@ module cpu_pipelined (
     assign debug_tcm_d_ready      = tcm_d_ready;
     assign debug_global_mem_stall = global_mem_stall;    
     
-    
-    // direct_mapped_cache ICACHE (
-    //     .clk(clk), 
-    //     .rst(rst), 
-    //     .cpu_req_addr(pc),
-    //     .cpu_write_data(32'b0), 
-    //     .cpu_read_req(1'b1),        
-    //     .cpu_write_req(1'b0), 
-    //     .mem_write_mask(4'b0000),
-    //     .mem_ready(icache_mem_ready), 
-    //     .mem_read_data(icache_mem_read_data), 
-    //     .cpu_read_data(if_inst), 
-    //     .mem_req_addr(icache_mem_req_addr), 
-    //     .cpu_ready(cache_ready), 
-    //     .mem_req_valid(icache_mem_req_valid)
-    // ); 
-
-    // direct_mapped_cache DCACHE (
-    //     .clk(clk),
-    //     .rst(rst),
-    //     .cpu_req_addr(ex_mem_alu),  
-    //     .cpu_write_data(store_data), 
-    //     .mem_write_mask(mem_write_mask),
-    //     .cpu_read_req(dcache_ren),      
-    //     .cpu_write_req(dcache_wen),    
-    //     .mem_ready(dcache_mem_ready),
-    //     .mem_read_data(dcache_mem_read_data_block),        
-    //     .cpu_read_data(dcache_read_data),
-    //     .mem_req_addr(dcache_mem_req_addr),
-    //     .cpu_ready(dcache_ready),         
-    //     .mem_req_valid(dcache_mem_req_valid)
-    // );
-
-    // assign dmem_req_addr = dcache_mem_req_addr;
-    
-
     // IF 
     assign opcode_check = pc[1] ? if_inst[17:16] : if_inst[1:0];
     assign is_32_bit_opcode = (opcode_check == 2'b11);
@@ -557,6 +521,7 @@ module cpu_pipelined (
                 id_ex_is_jal | id_ex_is_jalr;
 
     wire id_ex_mem_read = (id_ex_wb_sel == 2'b00) && id_ex_reg_wen;
+    
     hazard_unit HU (
         .id_ex_mem_read(id_ex_mem_read),
         .id_ex_rd(id_ex_rd), 
@@ -575,17 +540,9 @@ module cpu_pipelined (
         .fwd_b(fwd_b)
     );
 
-    // Machine Interrupt Enable (MIE)
-    always @(posedge clk) begin
-        if (rst) 
-            mie <= 1'b1;
-        else if (trap_taken) 
-            mie <= 1'b0; // Disable interrupts inside the OS kernel
-        else if (mret_exec) 
-            mie <= 1'b1;  // Re-enable when returning to user code
-    end
-
-    assign gated_interrupt = timer_interrupt & mie & ~global_mem_stall & ~stall;
+    // Machine Interrupt Enable comes straight from mstatus.MIE (csr_file),
+    // which correctly resets to 0 and tracks trap/mret/software CSR writes.
+    assign gated_interrupt = timer_interrupt & mstatus_mie & ~global_mem_stall & ~stall;
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
         .ex_inst(id_ex_inst),
@@ -617,8 +574,9 @@ module cpu_pipelined (
         .trap_cause(trap_cause),
         .mret_exec(mret_exec),
         .mtvec_out(mtvec_out),
-        .mepc_out(mepc_out)
-    ); 
+        .mepc_out(mepc_out),
+        .mstatus_mie(mstatus_mie)
+    );
 
     assign actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
     ex_mem_reg EX_MEM (

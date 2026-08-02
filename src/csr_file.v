@@ -14,7 +14,8 @@ module csr_file (
     input wire mret_exec, // High when the 'mret' instruction executes
     // Outputs to the cpu pc mux
     output wire [31:0] mtvec_out, // where to jump on a trap
-    output wire [31:0] mepc_out // where to jump on an 'mret'
+    output wire [31:0] mepc_out, // where to jump on an 'mret'
+    output wire mstatus_mie // live MIE bit, for gating hardware interrupts
 );
 
     // OS Registers
@@ -26,6 +27,7 @@ module csr_file (
     // Route critical registers continuously to the hardware trap controller
     assign mtvec_out = mtvec;
     assign mepc_out = mepc;
+    assign mstatus_mie = mstatus[3];
 
     // Read Logic (Combinational)
     always @(*) begin
