@@ -1,5 +1,6 @@
 `include "../src/regfile.v"
 `include "../src/alu.v"
+`include "../src/div_unit.v"
 `include "../src/branch_comp.v"
 `include "../src/control_logic.v"
 `include "../src/immgen.v"
@@ -91,7 +92,7 @@ module cpu_pipelined (
     wire is_amo;
     wire [1:0] wb_sel;
     wire [2:0] imm_sel;
-    wire [3:0] alu_sel;
+    wire [4:0] alu_sel;
     wire [4:0] atomic_op;
 
     // ID/EX
@@ -110,7 +111,7 @@ module cpu_pipelined (
     wire id_ex_is_sc;
     wire id_ex_is_amo;
     wire [1:0] id_ex_wb_sel;
-    wire [3:0] id_ex_alu_sel;
+    wire [4:0] id_ex_alu_sel;
 
     // EX
     wire [31:0] alu_a;
@@ -219,10 +220,10 @@ module cpu_pipelined (
 
     // Keep MMIO exact. Do not decode all 0x4xxxxxxx as MMIO because that
     // collides with the TCM region at 0x4000_0000.
-    assign is_led   = (ex_mem_alu == LED_ADDR);
-    assign is_uart  = (ex_mem_alu == UART_ADDR);
+    assign is_led = (ex_mem_alu == LED_ADDR);
+    assign is_uart = (ex_mem_alu == UART_ADDR);
     assign is_clint = ((ex_mem_alu & CLINT_MASK) == CLINT_BASE);
-    assign is_mmio  = is_led | is_uart | is_clint;
+    assign is_mmio = is_led | is_uart | is_clint;
 
     assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen;
     assign is_store = ex_mem_mem_rw;
@@ -234,7 +235,7 @@ module cpu_pipelined (
     assign dcache_wen = store_commits & ~is_mmio;
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
-    assign global_mem_stall = dmem_stall | imem_stall;
+    assign global_mem_stall = dmem_stall | imem_stall | div_stall;
         
     // TCM
     wire tcm_i_req, tcm_i_ready;
@@ -248,7 +249,7 @@ module cpu_pipelined (
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES), 
-        .INIT_FILE("main.mem")
+        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/main.mem")
     ) TCM (
         .clk(clk), 
         .rst(rst), 
@@ -329,10 +330,10 @@ module cpu_pipelined (
         .mem_ready(dcache_mem_ready)
     ); 
     //debug 
-    assign debug_dcache_valid     = dcache_valid;
-    assign debug_dcache_ready     = dcache_ready;
-    assign debug_tcm_d_req        = tcm_d_req;
-    assign debug_tcm_d_ready      = tcm_d_ready;
+    assign debug_dcache_valid = dcache_valid;
+    assign debug_dcache_ready = dcache_ready;
+    assign debug_tcm_d_req = tcm_d_req;
+    assign debug_tcm_d_ready = tcm_d_ready;
     assign debug_global_mem_stall = global_mem_stall;    
     
     // IF 
@@ -487,11 +488,49 @@ module cpu_pipelined (
     assign alu_b = id_ex_b_sel ? id_ex_imm : fwd_rs2;
 
     alu ALU (
-        .a(alu_a), 
+        .a(alu_a),
         .b(alu_b),
         .alu_sel(id_ex_alu_sel),
         .alu_res(alu_out)
     );
+
+    // div/rem/divu/remu: alu_sel values 16-19 (bit4 set) are the only ones
+    // with that bit set, so it alone flags all four ops. bit0 selects
+    // signed(div/rem)=0 vs unsigned(divu/remu)=1; bit1 selects
+    // quotient(div/divu)=0 vs remainder(rem/remu)=1. A plain combinational
+    // divide does not meet timing (see div_unit.v), so this runs as a
+    // ~33-cycle multi-cycle op that stalls the whole pipeline via
+    // global_mem_stall, the same way a cache miss already does.
+    wire is_div_op = id_ex_alu_sel[4];
+    wire div_is_signed = ~id_ex_alu_sel[0];
+    wire div_want_rem = id_ex_alu_sel[1];
+    wire div_busy, div_done;
+    wire [31:0] div_quotient, div_remainder;
+    reg div_result_ready;
+
+    wire div_start = is_div_op && !div_busy && !div_done && !div_result_ready;
+    wire div_stall = is_div_op && !div_result_ready;
+
+    always @(posedge clk) begin
+        if (rst) div_result_ready <= 1'b0;
+        else if (div_done) div_result_ready <= 1'b1;
+        else if (!is_div_op) div_result_ready <= 1'b0;
+    end
+
+    div_unit DIV (
+        .clk(clk),
+        .rst(rst),
+        .start(div_start),
+        .a(alu_a),
+        .b(alu_b),
+        .is_signed(div_is_signed),
+        .busy(div_busy),
+        .done(div_done),
+        .quotient(div_quotient),
+        .remainder(div_remainder)
+    );
+
+    wire [31:0] ex_result = is_div_op ? (div_want_rem ? div_remainder : div_quotient) : alu_out;
 
     assign ex_opcode = id_ex_inst[6:0];
     assign ex_funct3 = id_ex_inst[14:12];
@@ -578,7 +617,7 @@ module cpu_pipelined (
         .mstatus_mie(mstatus_mie)
     );
 
-    assign actual_ex_result = ex_is_csrrw ? csr_rdata : alu_out;
+    assign actual_ex_result = ex_is_csrrw ? csr_rdata : ex_result;
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
@@ -764,8 +803,8 @@ module id_ex_reg (
     input wire [31:0] pc_in, rs1_in, rs2_in, imm_in, 
     input wire [4:0] rd_in, 
     input wire reg_wen_in, mem_rw_in, a_sel_in, b_sel_in, 
-    input wire [1:0] wb_sel_in, 
-    input wire [3:0] alu_sel_in,
+    input wire [1:0] wb_sel_in,
+    input wire [4:0] alu_sel_in,
     input wire [31:0] inst_in,
     input wire is_lr_in, is_sc_in, is_amo_in, 
     input wire [4:0] atomic_op_in,
@@ -774,8 +813,8 @@ module id_ex_reg (
     output reg [31:0] pc_out, rs1_out, rs2_out, imm_out,
     output reg [4:0] rd_out,
     output reg reg_wen_out, mem_rw_out, a_sel_out, b_sel_out, 
-    output reg [1:0] wb_sel_out, 
-    output reg [3:0] alu_sel_out, 
+    output reg [1:0] wb_sel_out,
+    output reg [4:0] alu_sel_out,
     output reg [31:0] inst_out
 ); 
 
