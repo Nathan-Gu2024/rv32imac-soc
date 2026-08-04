@@ -32,33 +32,33 @@
 //     return 0;
 // }
 
-void delay(uint32_t count) {
-    for (volatile uint32_t i = 0; i < count; i++); 
-}
+// void delay(uint32_t count) {
+//     for (volatile uint32_t i = 0; i < count; i++); 
+// }
 
-int main () {
-    uint32_t a = 0;
-    uint32_t b = 1;
-    uint32_t next;
+// int main () {
+//     uint32_t a = 0;
+//     uint32_t b = 1;
+//     uint32_t next;
     
-    while (1) {
-        LED_REG = a; 
+//     while (1) {
+//         LED_REG = a; 
         
-        next = a + b; // Heavy dependency here!
-        a = b;
-        b = next;
+//         next = a + b; // Heavy dependency here!
+//         a = b;
+//         b = next;
         
-        delay(2000000);
+//         delay(2000000);
         
-        // Reset so we don't overflow the LEDs visually
-        // Assuming you have 4-8 LEDs (max value ~15 to 255)
-        if (a > 128) { 
-            a = 0;
-            b = 1;
-        }
-    }
-    return 0;
-}
+//         // Reset so we don't overflow the LEDs visually
+//         // Assuming you have 4-8 LEDs (max value ~15 to 255)
+//         if (a > 128) { 
+//             a = 0;
+//             b = 1;
+//         }
+//     }
+//     return 0;
+// }
 
 // void delay(uint32_t count) {
 //     for (volatile uint32_t i = 0; i < count; i++); 
@@ -187,81 +187,81 @@ int main () {
 //     return 0;
 // }
 
-// void delay(uint32_t count) {
-//     for (volatile uint32_t i = 0; i < count; i++); 
-// }
+void delay(uint32_t count) {
+    for (volatile uint32_t i = 0; i < count; i++); 
+}
 
-// int main () {
-//     // =========================================================
-//     // STAGE 1: Test Load Byte Unsigned (lbu) vs Signed (lb)
-//     // =========================================================
-//     volatile int8_t  s_byte = (int8_t)0x80;   // Holds 0x80 (-128)
-//     volatile uint8_t u_byte = (uint8_t)0x80;  // Holds 0x80 (+128)
+int main () {
+    // =========================================================
+    // STAGE 1: Test Load Byte Unsigned (lbu) vs Signed (lb)
+    // =========================================================
+    volatile int8_t  s_byte = (int8_t)0x80;   // Holds 0x80 (-128)
+    volatile uint8_t u_byte = (uint8_t)0x80;  // Holds 0x80 (+128)
 
-//     volatile int32_t  lb_res  = s_byte;   // Triggers 'lb'  -> 0xFFFFFF80 (-128)
-//     volatile uint32_t lbu_res = u_byte;  // Triggers 'lbu' -> 0x00000080 (+128)
+    volatile int32_t  lb_res  = s_byte;   // Triggers 'lb'  -> 0xFFFFFF80 (-128)
+    volatile uint32_t lbu_res = u_byte;  // Triggers 'lbu' -> 0x00000080 (+128)
 
-//     if (lb_res != -128 || lbu_res != 128) {
-//         LED_REG = 0b1001; // FAIL Stage 1 (LED 9)
-//         while(1);
-//     }
-//     LED_REG = 1; // PASS Stage 1 (LED 1)
-//     delay(2000000);
+    if (lb_res != -128 || lbu_res != 128) {
+        LED_REG = 0b1001; // FAIL Stage 1 (LED 9)
+        while(1);
+    }
+    LED_REG = 1; // PASS Stage 1 (LED 1)
+    delay(2000000);
 
-//     // =========================================================
-//     // STAGE 2: Test Load Halfword Signed (lh) vs Unsigned (lhu)
-//     // =========================================================
-//     volatile int16_t  s_half = (int16_t)0x8000;   // Holds 0x8000 (-32768)
-//     volatile uint16_t u_half = (uint16_t)0x8000;  // Holds 0x8000 (+32768)
+    // =========================================================
+    // STAGE 2: Test Load Halfword Signed (lh) vs Unsigned (lhu)
+    // =========================================================
+    volatile int16_t  s_half = (int16_t)0x8000;   // Holds 0x8000 (-32768)
+    volatile uint16_t u_half = (uint16_t)0x8000;  // Holds 0x8000 (+32768)
 
-//     volatile int32_t  lh_res  = s_half;   // Triggers 'lh'  -> 0xFFFF8000 (-32768)
-//     volatile uint32_t lhu_res = u_half;  // Triggers 'lhu' -> 0x00008000 (+32768)
+    volatile int32_t  lh_res  = s_half;   // Triggers 'lh'  -> 0xFFFF8000 (-32768)
+    volatile uint32_t lhu_res = u_half;  // Triggers 'lhu' -> 0x00008000 (+32768)
 
-//     if (lh_res != -32768 || lhu_res != 32768) {
-//         LED_REG = 0b1010; // FAIL Stage 2 (LED 10)
-//         while(1);
-//     }
-//     LED_REG = 2; // PASS Stage 2 (LED 2)
-//     delay(2000000);
+    if (lh_res != -32768 || lhu_res != 32768) {
+        LED_REG = 0b1010; // FAIL Stage 2 (LED 10)
+        while(1);
+    }
+    LED_REG = 2; // PASS Stage 2 (LED 2)
+    delay(2000000);
 
-//     // =========================================================
-//     // STAGE 3: Test RV32M - Multiplication (mul)
-//     // =========================================================
-//     volatile int32_t a_mul = -15;
-//     volatile int32_t b_mul = 20;
-//     volatile int32_t mul_res = a_mul * b_mul; // Triggers 'mul' -> -300
+    // =========================================================
+    // STAGE 3: Test RV32M - Multiplication (mul)
+    // =========================================================
+    volatile int32_t a_mul = -15;
+    volatile int32_t b_mul = 20;
+    volatile int32_t mul_res = a_mul * b_mul; // Triggers 'mul' -> -300
 
-//     if (mul_res != -300) {
-//         LED_REG = 0b1011; // FAIL Stage 3 (LED 11)
-//         while(1);
-//     }
-//     LED_REG = 3; // PASS Stage 3 (LED 3)
-//     delay(2000000);
+    if (mul_res != -300) {
+        LED_REG = 0b1011; // FAIL Stage 3 (LED 11)
+        while(1);
+    }
+    LED_REG = 3; // PASS Stage 3 (LED 3)
+    delay(2000000);
 
-//     // =========================================================
-//     // STAGE 4: Test RV32M - Division & Remainder (div, rem, divu, remu)
-//     // =========================================================
-//     volatile int32_t s_num = -100;
-//     volatile int32_t s_den = 7;
-//     volatile int32_t div_res = s_num / s_den; // Triggers 'div' -> -14
-//     volatile int32_t rem_res = s_num % s_den; // Triggers 'rem' -> -2
+    // =========================================================
+    // STAGE 4: Test RV32M - Division & Remainder (div, rem, divu, remu)
+    // =========================================================
+    volatile int32_t s_num = -100;
+    volatile int32_t s_den = 7;
+    volatile int32_t div_res = s_num / s_den; // Triggers 'div' -> -14
+    volatile int32_t rem_res = s_num % s_den; // Triggers 'rem' -> -2
 
-//     volatile uint32_t u_num = 100;
-//     volatile uint32_t u_den = 7;
-//     volatile uint32_t divu_res = u_num / u_den; // Triggers 'divu' -> 14
-//     volatile uint32_t remu_res = u_num % u_den; // Triggers 'remu' -> 2
+    volatile uint32_t u_num = 100;
+    volatile uint32_t u_den = 7;
+    volatile uint32_t divu_res = u_num / u_den; // Triggers 'divu' -> 14
+    volatile uint32_t remu_res = u_num % u_den; // Triggers 'remu' -> 2
 
-//     if (div_res != -14 || rem_res != -2 || divu_res != 14 || remu_res != 2) {
-//         LED_REG = 0b1100; // FAIL Stage 4 (LED 12)
-//         while(1);
-//     }
+    if (div_res != -14 || rem_res != -2 || divu_res != 14 || remu_res != 2) {
+        LED_REG = 0b1100; // FAIL Stage 4 (LED 12)
+        while(1);
+    }
 
-//     // =========================================================
-//     // ALL TESTS PASSED! Show 15 (0b1111) on LEDs
-//     // =========================================================
-//     while(1) {
-//         LED_REG = 15; 
-//     }
+    // =========================================================
+    // ALL TESTS PASSED! Show 15 (0b1111) on LEDs
+    // =========================================================
+    while(1) {
+        LED_REG = 15; 
+    }
 
-//     return 0;
-// }
+    return 0;
+}

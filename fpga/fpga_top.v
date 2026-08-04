@@ -6,12 +6,9 @@ module fpga_top #(
     input wire clk,
     input wire rst,          
 
-    // CPU UART byte-stream interface.
-    // If you want a real serial TX pin, instantiate your uart_tx module above this
-    // and connect uart_tx_start/uart_tx_data/uart_tx_ready to it.
-    input wire uart_tx_ready,
-    output wire uart_tx_start,
-    output wire [7:0] uart_tx_data,
+    // Physical UART TX pin - driven directly by cpu_pipelined's internal
+    // uart_mmio peripheral (MMIO at 0x4000_1000; see uart_mmio.v).
+    output wire uart_tx,
 
     output wire [3:0] leds,
 
@@ -99,9 +96,7 @@ module fpga_top #(
         .clk(clk),
         .rst(rst),
 
-        .uart_tx_ready(uart_tx_ready),
-        .uart_tx_start(uart_tx_start),
-        .uart_tx_data(uart_tx_data),
+        .uart_tx(uart_tx),
         .leds(cpu_leds),
 
         // I-cache lower-memory line interface
@@ -227,13 +222,13 @@ module fpga_top #(
 
 //    assign leds = counter[27:24];
     
-    assign leds[3] = heartbeat[25];
+//    assign leds[3] = heartbeat[25];
 
 //    assign leds[2] = seen_dcache_valid;
 //    assign leds[1] = seen_tcm_d_req;
 //    assign leds[0] = seen_tcm_d_ready;
     
-     assign leds[2:0] = cpu_leds[2:0];
+     assign leds[3:0] = cpu_leds[3:0];
 //    assign leds[2:0] = debug_instr[2:0];
 
 //    assign leds[2] = debug_pc[4];

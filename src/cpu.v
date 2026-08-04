@@ -16,11 +16,12 @@
 `include "../src/icache.v"
 `include "../src/cache_core.v"
 `include "../src/tcm.v"
+`include "../src/uart_tx.v"
+`include "../src/uart_mmio.v"
 
-module cpu_pipelined ( 
-    input wire clk, rst, uart_tx_ready, 
-    output reg uart_tx_start, 
-    output reg [7:0] uart_tx_data, 
+module cpu_pipelined (
+    input wire clk, rst,
+    output wire uart_tx,
     output reg [3:0] leds,
 
     output wire [31:0] icache_mem_req_addr, 
@@ -32,7 +33,7 @@ module cpu_pipelined (
     output wire [31:0] store_data, 
     output wire [3:0] mem_write_mask,
 
-    // D-cache lower-memory line interface (fake line memory now, AXI adapter later)
+    // D-cache lower-memory line interface
     output wire dcache_mem_req_valid,
     output wire dcache_mem_req_write,
     output wire [127:0] dcache_mem_wline,
@@ -61,13 +62,8 @@ module cpu_pipelined (
     wire [31:0] muxed_if_inst;
     wire [31:0] pc_inc;
     wire [31:0] actual_jump_target;
-    wire [1:0] opcode_check;
-    wire is_32_bit_opcode;
-    wire unaligned_32_bit_fetch;
     wire is_compressed;
     wire actual_pc_sel;
-    reg [15:0] fetch_buffer;
-    reg buffer_valid;
 
     // icache
     wire cache_ready;
@@ -77,6 +73,7 @@ module cpu_pipelined (
     // IF/ID
     wire [31:0] if_id_pc;
     wire [31:0] if_id_inst;
+    wire if_id_compressed;
 
     // ID
     wire [31:0] rs1_data;
@@ -96,6 +93,7 @@ module cpu_pipelined (
     wire [4:0] atomic_op;
 
     // ID/EX
+    wire id_ex_compressed;
     wire [31:0] id_ex_pc;
     wire [31:0] id_ex_rs1;
     wire [31:0] id_ex_rs2;
@@ -155,6 +153,7 @@ module cpu_pipelined (
     wire mstatus_mie;
 
     // EX/MEM
+    wire ex_mem_compressed;
     wire [31:0] ex_mem_alu;
     wire [31:0] ex_mem_rs2;
     wire [31:0] ex_mem_inst;
@@ -180,6 +179,8 @@ module cpu_pipelined (
     wire is_led;
     wire is_uart;
     wire is_clint;
+    wire uart_ready;
+    wire [31:0] uart_rdata;
     wire is_load;
     wire is_store;
     wire store_commits;
@@ -195,7 +196,8 @@ module cpu_pipelined (
     wire block_sc_store;
     wire clint_wen;
 
-    // MEM/WB 
+    // MEM/WB
+    wire mem_wb_compressed;
     wire [31:0] mem_wb_alu;
     wire [31:0] mem_wb_memdata;
     wire [31:0] mem_wb_pc;
@@ -209,7 +211,8 @@ module cpu_pipelined (
 
     // Cache / memory stall control
     localparam [31:0] LED_ADDR = 32'h0000_2000;
-    localparam [31:0] UART_ADDR = 32'h0000_3000;
+    localparam [31:0] UART_MMIO_BASE = 32'h4000_1000;
+    localparam [31:0] UART_MMIO_MASK = 32'hFFFF_F000;
     localparam [31:0] CLINT_BASE = 32'h0200_0000;
     localparam [31:0] CLINT_MASK = 32'hFFFF_0000;
     localparam [31:0] TCM_BASE = 32'h4000_0000;
@@ -218,25 +221,36 @@ module cpu_pipelined (
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;
 
-    // Keep MMIO exact. Do not decode all 0x4xxxxxxx as MMIO because that
-    // collides with the TCM region at 0x4000_0000.
+    // Don't decode all 0x4xxxxxxx as MMIO because that
+    // collides with the TCM region at 0x4000_0000
+    // led/clint ack instantly, needs its own req/ready handshake
     assign is_led = (ex_mem_alu == LED_ADDR);
-    assign is_uart = (ex_mem_alu == UART_ADDR);
+    assign is_uart = ((ex_mem_alu & UART_MMIO_MASK) == UART_MMIO_BASE);
     assign is_clint = ((ex_mem_alu & CLINT_MASK) == CLINT_BASE);
-    assign is_mmio = is_led | is_uart | is_clint;
+    assign is_mmio = is_led | is_clint;
 
     assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen;
     assign is_store = ex_mem_mem_rw;
     assign store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
 
-    // TCM is intentionally not MMIO here. TCM accesses go into dcache.v,
-    // which bypasses the cache and forwards them to tcm.v.
-    assign dcache_ren = is_load & ~is_mmio;
-    assign dcache_wen = store_commits & ~is_mmio;
+    // TCM accesses go into dcache.v which bypass the cache and forward to tcm.v
+    assign dcache_ren = is_load & ~is_mmio & ~is_uart;
+    assign dcache_wen = store_commits & ~is_mmio & ~is_uart;
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
-    assign global_mem_stall = dmem_stall | imem_stall | div_stall;
-        
+
+    wire uart_valid = is_uart & (is_load | store_commits);
+    wire uart_req = uart_valid & ~uart_pending;
+    reg uart_pending;
+    always @(posedge clk) begin
+        if (rst) uart_pending <= 1'b0;
+        else if (uart_req) uart_pending <= 1'b1;
+        else if (uart_ready) uart_pending <= 1'b0;
+    end
+
+    wire uart_stall = uart_valid && !uart_ready;
+    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall;
+
     // TCM
     wire tcm_i_req, tcm_i_ready;
     wire [31:0] tcm_i_addr, tcm_i_rdata;
@@ -248,8 +262,8 @@ module cpu_pipelined (
     tcm #(
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
-        .TCM_BYTES(TCM_BYTES), 
-        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/main.mem")
+        .TCM_BYTES(TCM_BYTES),
+        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/main_cv7.mem")
     ) TCM (
         .clk(clk), 
         .rst(rst), 
@@ -329,45 +343,27 @@ module cpu_pipelined (
         .mem_rline(dcache_mem_read_data_block), 
         .mem_ready(dcache_mem_ready)
     ); 
+
     //debug 
-    assign debug_dcache_valid = dcache_valid;
-    assign debug_dcache_ready = dcache_ready;
-    assign debug_tcm_d_req = tcm_d_req;
-    assign debug_tcm_d_ready = tcm_d_ready;
+    assign debug_dcache_valid     = dcache_valid;
+    assign debug_dcache_ready     = dcache_ready;
+    assign debug_tcm_d_req        = tcm_d_req;
+    assign debug_tcm_d_ready      = tcm_d_ready;
     assign debug_global_mem_stall = global_mem_stall;    
     
-    // IF 
-    assign opcode_check = pc[1] ? if_inst[17:16] : if_inst[1:0];
-    assign is_32_bit_opcode = (opcode_check == 2'b11);
-    assign unaligned_32_bit_fetch = (pc[1] == 1'b1) && is_32_bit_opcode && !buffer_valid;
-    always @(posedge clk) begin
-        if (rst || pc_sel) begin
-            buffer_valid <= 1'b0;
-            fetch_buffer <= 16'b0;
-        end else if (!global_mem_stall && !stall) begin
-            if (unaligned_32_bit_fetch) begin
-                fetch_buffer <= if_inst[31:16];
-                buffer_valid <= 1'b1;
-            end else begin
-                buffer_valid <= 1'b0;
-            end 
-        end 
-    end
-
-    // Instruction assembly
-    assign raw_inst = buffer_valid ? {if_inst[15:0], fetch_buffer} :
-                      (pc[1] ? {16'b0, if_inst[31:16]} : if_inst);
+    // IF
+    assign raw_inst = if_inst;
 
     rvc_expand RVC (
-        .inst_c(raw_inst[15:0]), 
-        .inst_expanded(inst_expanded), 
+        .inst_c(raw_inst[15:0]),
+        .inst_expanded(inst_expanded),
         .is_compressed(is_compressed)
     );
 
     // Pipeline routing
     assign final_inst = is_compressed ? inst_expanded : raw_inst;
-    assign muxed_if_inst = unaligned_32_bit_fetch ? 32'h00000013 : final_inst;
-    assign pc_inc = (unaligned_32_bit_fetch || buffer_valid || is_compressed) ? 32'd2 : 32'd4;
+    assign muxed_if_inst = final_inst;
+    assign pc_inc = is_compressed ? 32'd2 : 32'd4;
     assign actual_pc_sel = pc_trap_override | pc_sel;
     assign actual_jump_target = pc_trap_override ? trap_target_pc : alu_out;
     program_counter PC (
@@ -381,16 +377,18 @@ module cpu_pipelined (
     );
 
     if_id_reg IF_ID (
-        .clk(clk), 
-        .rst(rst), 
-        .stall(stall), 
+        .clk(clk),
+        .rst(rst),
+        .stall(stall),
         .mem_stall(global_mem_stall),
-        .flush(pc_sel | flush_if), 
-        .pc_in(pc), 
-        .inst_in(muxed_if_inst), 
+        .flush(pc_sel | flush_if),
+        .pc_in(pc),
+        .inst_in(muxed_if_inst),
+        .compressed_in(is_compressed),
         .pc_out(if_id_pc),
-        .inst_out(if_id_inst)
-    ); 
+        .inst_out(if_id_inst),
+        .compressed_out(if_id_compressed)
+    );
     
     assign debug_instr = if_id_inst;
 
@@ -430,16 +428,17 @@ module cpu_pipelined (
 
 
     id_ex_reg ID_EX (
-        .clk(clk), 
+        .clk(clk),
         .rst(rst),
-        .flush(pc_sel || stall || flush_id), 
+        .flush(pc_sel || stall || flush_id),
         .mem_stall(global_mem_stall),
-        .pc_in(if_id_pc), 
-        .rs1_in(rs1_data), 
+        .pc_in(if_id_pc),
+        .rs1_in(rs1_data),
         .rs2_in(rs2_data),
-        .imm_in(imm), 
+        .imm_in(imm),
         .rd_in(if_id_inst[11:7]),
         .inst_in(if_id_inst),
+        .compressed_in(if_id_compressed),
         .reg_wen_in(reg_wen), 
         .mem_rw_in(mem_rw),
         .a_sel_in(a_sel), 
@@ -462,18 +461,21 @@ module cpu_pipelined (
         .inst_out(id_ex_inst), 
         .reg_wen_out(id_ex_reg_wen), 
         .mem_rw_out(id_ex_mem_rw),
-        .a_sel_out(id_ex_a_sel), 
-        .b_sel_out(id_ex_b_sel), 
-        .wb_sel_out(id_ex_wb_sel), 
-        .alu_sel_out(id_ex_alu_sel)
+        .a_sel_out(id_ex_a_sel),
+        .b_sel_out(id_ex_b_sel),
+        .wb_sel_out(id_ex_wb_sel),
+        .alu_sel_out(id_ex_alu_sel),
+        .compressed_out(id_ex_compressed)
     );
 
     // EX 
     // Forwarding
     // SC writes 0/1 to rd
-    // JAL/JALR write PC+4
+    // JAL/JALR write PC+4, or PC+2 if the original instruction was compressed,
+    // the link address must point at the next
+    // real instruction, only 2 bytes after a compressed one
     assign ex_mem_forward_data = ex_mem_is_sc ? final_alu_to_wb :
-                                 (ex_mem_wb_sel == 2'b10) ? (ex_mem_pc + 32'd4) :
+                                 (ex_mem_wb_sel == 2'b10) ? (ex_mem_pc + (ex_mem_compressed ? 32'd2 : 32'd4)) :
                                  ex_mem_alu;
 
     assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_forward_data :
@@ -494,16 +496,11 @@ module cpu_pipelined (
         .alu_res(alu_out)
     );
 
-    // div/rem/divu/remu: alu_sel values 16-19 (bit4 set) are the only ones
-    // with that bit set, so it alone flags all four ops. bit0 selects
-    // signed(div/rem)=0 vs unsigned(divu/remu)=1; bit1 selects
-    // quotient(div/divu)=0 vs remainder(rem/remu)=1. A plain combinational
-    // divide does not meet timing (see div_unit.v), so this runs as a
-    // ~33-cycle multi-cycle op that stalls the whole pipeline via
-    // global_mem_stall, the same way a cache miss already does.
+    // Comb divide fails timing so this runs as a
+    // ~33-cycle multi-cycle op that stalls the whole pipeline via global_mem_stall
     wire is_div_op = id_ex_alu_sel[4];
     wire div_is_signed = ~id_ex_alu_sel[0];
-    wire div_want_rem = id_ex_alu_sel[1];
+    wire div_want_rem  = id_ex_alu_sel[1];
     wire div_busy, div_done;
     wire [31:0] div_quotient, div_remainder;
     reg div_result_ready;
@@ -580,7 +577,7 @@ module cpu_pipelined (
     );
 
     // Machine Interrupt Enable comes straight from mstatus.MIE (csr_file),
-    // which correctly resets to 0 and tracks trap/mret/software CSR writes.
+    // which correctly resets to 0 and tracks trap/mret/software CSR writes
     assign gated_interrupt = timer_interrupt & mstatus_mie & ~global_mem_stall & ~stall;
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
@@ -624,9 +621,10 @@ module cpu_pipelined (
         .mem_stall(global_mem_stall),
         .alu_res_in(actual_ex_result), 
         .rs2_in(fwd_rs2), 
-        .inst_in(flush_ex ? 32'h00000013 : id_ex_inst), 
+        .inst_in(flush_ex ? 32'h00000013 : id_ex_inst),
         .pc_in(id_ex_pc),
-        .rd_in(id_ex_rd), 
+        .compressed_in(id_ex_compressed),
+        .rd_in(id_ex_rd),
         .reg_wen_in(id_ex_reg_wen),
         .mem_rw_in(id_ex_mem_rw), 
         .wb_sel_in(id_ex_wb_sel),
@@ -639,34 +637,44 @@ module cpu_pipelined (
         .is_amo_out(ex_mem_is_amo), 
         .atomic_op_out(ex_mem_atomic_op), 
         .alu_res_out(ex_mem_alu),
-        .rs2_out(ex_mem_rs2), 
+        .rs2_out(ex_mem_rs2),
         .inst_out(ex_mem_inst),
         .pc_out(ex_mem_pc),
-        .rd_out(ex_mem_rd), 
-        .reg_wen_out(ex_mem_reg_wen), 
-        .mem_rw_out(ex_mem_mem_rw), 
+        .compressed_out(ex_mem_compressed),
+        .rd_out(ex_mem_rd),
+        .reg_wen_out(ex_mem_reg_wen),
+        .mem_rw_out(ex_mem_mem_rw),
         .wb_sel_out(ex_mem_wb_sel)
     );
 
     always @(posedge clk) begin
         if (rst) begin
             leds <= 4'b0;
-            uart_tx_start <= 1'b0;
-            uart_tx_data <= 8'b0;
         end else begin
-            uart_tx_start <= 1'b0;
-
-            // Gate MMIO side effects so stores do not repeat while the pipeline is frozen.
+            // Gate MMIO side effects so stores do not repeat while the pipeline is frozen
             if (!global_mem_stall && store_commits) begin
                 if (is_led) begin
                     leds <= ex_mem_rs2[3:0];
-                end else if (is_uart && uart_tx_ready) begin
-                    uart_tx_data <= ex_mem_rs2[7:0];
-                    uart_tx_start <= 1'b1;
                 end
             end
-        end 
+        end
     end
+
+    // uart_mmio owns its own uart_tx instance and drives the physical tx
+    // pin directly; its d_req is the pending-gated pulse computed above so
+    // a stalled multi-cycle transaction doesn't re-trigger the write or
+    // re-latch the status read every cycle
+    uart_mmio UART (
+        .clk(clk),
+        .rst(rst),
+        .d_req(uart_req),
+        .d_we(store_commits),
+        .d_addr(ex_mem_alu),
+        .d_wdata(ex_mem_rs2),
+        .d_rdata(uart_rdata),
+        .d_ready(uart_ready),
+        .tx(uart_tx)
+    );
 
     // MEM
     partial_store PS (
@@ -686,7 +694,7 @@ module cpu_pipelined (
     assign lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
     assign sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
     assign normal_store_reservation_clear = is_store && !ex_mem_is_sc &&
-                                             (is_mmio || (dcache_wen && dcache_ready));
+                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready));
 
     reservation_monitor RM (
         .clk(clk),
@@ -718,7 +726,7 @@ module cpu_pipelined (
 
     assign final_mem_read_data = is_clint ? clint_rdata :
                                  is_led ? {28'b0, leds} :
-                                 is_uart ? 32'b0 :
+                                 is_uart ? uart_rdata :
                                             dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
@@ -726,31 +734,36 @@ module cpu_pipelined (
         .mem_stall(global_mem_stall),
         .inst_in(ex_mem_inst),
         .alu_res_in(final_alu_to_wb), 
-        .mem_data_in(final_mem_read_data), 
+        .mem_data_in(final_mem_read_data),
         .pc_in(ex_mem_pc),
+        .compressed_in(ex_mem_compressed),
         .rd_in(ex_mem_rd),
         .reg_wen_in(ex_mem_reg_wen),
-        .wb_sel_in(ex_mem_wb_sel), 
+        .wb_sel_in(ex_mem_wb_sel),
         .inst_out(mem_wb_inst),
-        .alu_res_out(mem_wb_alu), 
+        .alu_res_out(mem_wb_alu),
         .mem_data_out(mem_wb_memdata),
         .pc_out(mem_wb_pc),
-        .rd_out(mem_wb_rd), 
-        .reg_wen_out(mem_wb_reg_wen), 
+        .compressed_out(mem_wb_compressed),
+        .rd_out(mem_wb_rd),
+        .reg_wen_out(mem_wb_reg_wen),
         .wb_sel_out(mem_wb_wb_sel)
-    ); 
+    );
 
     // WB
     partial_load PL (
-        .inst(mem_wb_inst), 
-        .mem_address(mem_wb_alu), 
+        .inst(mem_wb_inst),
+        .mem_address(mem_wb_alu),
         .data_from_mem(mem_wb_memdata),
         .data_to_reg(partial_load_out)
     );
 
+    // JAL/JALR link value: PC+4 normally, but PC+2 if the original
+    // instruction was compressed (c.jal/c.jalr) - a compressed call is only
+    // 2 bytes, so the return address must point 2 bytes past it, not 4.
     assign wb_data = (mem_wb_wb_sel == 2'b01) ? mem_wb_alu : // ALU
                     (mem_wb_wb_sel == 2'b00) ? partial_load_out : // MEM
-                    (mem_wb_wb_sel == 2'b10) ? (mem_wb_pc + 32'd4) : // PC + 4
+                    (mem_wb_wb_sel == 2'b10) ? (mem_wb_pc + (mem_wb_compressed ? 32'd2 : 32'd4)) : // PC + 4/2
                     32'b0;
 
 endmodule
@@ -777,102 +790,112 @@ endmodule
 
 
 module if_id_reg (
-    input wire clk, rst, stall, flush, mem_stall, 
+    input wire clk, rst, stall, flush, mem_stall,
     input wire [31:0] pc_in, inst_in,
-    output reg [31:0] pc_out, inst_out
+    input wire compressed_in,
+    output reg [31:0] pc_out, inst_out,
+    output reg compressed_out
 );
     always @(posedge clk) begin
         if (rst) begin
             pc_out <= 32'b0;
             inst_out <= 32'h00000013;
+            compressed_out <= 1'b0;
         end else if (mem_stall) begin
             // Freeze
         end else if (flush) begin
             pc_out <= 32'b0;
             inst_out <= 32'h00000013;
+            compressed_out <= 1'b0;
         end else if (!stall) begin
             pc_out <= pc_in;
             inst_out <= inst_in;
-        end 
-    end    
+            compressed_out <= compressed_in;
+        end
+    end
 endmodule
 
 
 module id_ex_reg (
     input wire clk, rst, flush, mem_stall,
-    input wire [31:0] pc_in, rs1_in, rs2_in, imm_in, 
-    input wire [4:0] rd_in, 
-    input wire reg_wen_in, mem_rw_in, a_sel_in, b_sel_in, 
+    input wire [31:0] pc_in, rs1_in, rs2_in, imm_in,
+    input wire [4:0] rd_in,
+    input wire reg_wen_in, mem_rw_in, a_sel_in, b_sel_in,
     input wire [1:0] wb_sel_in,
     input wire [4:0] alu_sel_in,
     input wire [31:0] inst_in,
-    input wire is_lr_in, is_sc_in, is_amo_in, 
+    input wire compressed_in,
+    input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
-    output reg is_lr_out, is_sc_out, is_amo_out, 
+    output reg is_lr_out, is_sc_out, is_amo_out,
     output reg [4:0] atomic_op_out,
     output reg [31:0] pc_out, rs1_out, rs2_out, imm_out,
     output reg [4:0] rd_out,
-    output reg reg_wen_out, mem_rw_out, a_sel_out, b_sel_out, 
+    output reg reg_wen_out, mem_rw_out, a_sel_out, b_sel_out,
     output reg [1:0] wb_sel_out,
     output reg [4:0] alu_sel_out,
-    output reg [31:0] inst_out
-); 
+    output reg [31:0] inst_out,
+    output reg compressed_out
+);
 
     always @(posedge clk) begin
         if (rst) begin
             mem_rw_out <= 0;
-            rd_out <= 5'b0; 
-            pc_out <= 0; 
-            rs1_out <= 0; 
+            rd_out <= 5'b0;
+            pc_out <= 0;
+            rs1_out <= 0;
             rs2_out <= 0;
-            imm_out <= 0; 
-            reg_wen_out <= 0; 
+            imm_out <= 0;
+            reg_wen_out <= 0;
             a_sel_out <= 0;
-            b_sel_out <= 0; 
-            wb_sel_out <= 0; 
+            b_sel_out <= 0;
+            wb_sel_out <= 0;
             alu_sel_out <= 0;
             inst_out <= 32'h00000013;
+            compressed_out <= 1'b0;
             is_lr_out <= 1'b0;
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
             atomic_op_out <= 5'b0;
         end else if (mem_stall) begin
-            // Freeze 
+            // Freeze
         end else if (flush) begin
             mem_rw_out <= 0;
-            rd_out <= 5'b0; 
-            pc_out <= 0; 
-            rs1_out <= 0; 
+            rd_out <= 5'b0;
+            pc_out <= 0;
+            rs1_out <= 0;
             rs2_out <= 0;
-            imm_out <= 0; 
-            reg_wen_out <= 0; 
+            imm_out <= 0;
+            reg_wen_out <= 0;
             a_sel_out <= 0;
-            b_sel_out <= 0; 
-            wb_sel_out <= 0; 
+            b_sel_out <= 0;
+            wb_sel_out <= 0;
             alu_sel_out <= 0;
             inst_out <= 32'h00000013;
+            compressed_out <= 1'b0;
             is_lr_out <= 1'b0;
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
             atomic_op_out <= 5'b0;
         end else begin
             mem_rw_out <= mem_rw_in;
-            rd_out <= rd_in; 
-            pc_out <= pc_in; 
-            rs1_out <= rs1_in; 
+            rd_out <= rd_in;
+            pc_out <= pc_in;
+            rs1_out <= rs1_in;
             rs2_out <= rs2_in;
-            imm_out <= imm_in; 
-            reg_wen_out <= reg_wen_in; 
+            imm_out <= imm_in;
+            reg_wen_out <= reg_wen_in;
             a_sel_out <= a_sel_in;
             b_sel_out <= b_sel_in;
-            wb_sel_out <= wb_sel_in; 
+            wb_sel_out <= wb_sel_in;
             alu_sel_out <= alu_sel_in;
             inst_out <= inst_in;
+            compressed_out <= compressed_in;
             is_lr_out <= is_lr_in;
             is_sc_out <= is_sc_in;
             is_amo_out <= is_amo_in;
             atomic_op_out <= atomic_op_in;
-        end 
+        end
     end
 
 endmodule
@@ -881,32 +904,35 @@ endmodule
 module ex_mem_reg (
     input wire clk, rst, mem_stall,
     input wire [31:0] alu_res_in, rs2_in, inst_in, pc_in,
+    input wire compressed_in,
     input wire [4:0] rd_in,
     input wire reg_wen_in, mem_rw_in,
     input wire [1:0] wb_sel_in,
-    input wire is_lr_in, is_sc_in, is_amo_in, 
+    input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
     output reg is_lr_out, is_sc_out, is_amo_out,
     output reg [4:0] atomic_op_out,
-    output reg [31:0] alu_res_out, rs2_out, inst_out, pc_out, 
+    output reg [31:0] alu_res_out, rs2_out, inst_out, pc_out,
+    output reg compressed_out,
     output reg [4:0] rd_out,
     output reg reg_wen_out, mem_rw_out,
     output reg [1:0] wb_sel_out
 );
     always @(posedge clk) begin
         if (rst) begin
-            reg_wen_out <= 0;  
+            reg_wen_out <= 0;
             mem_rw_out <= 0;
-            rd_out <= 0;  
+            rd_out <= 0;
             alu_res_out <= 0;
             rs2_out <= 0;
             wb_sel_out <= 0;
             inst_out <= 32'h00000013;
             pc_out <= 0;
+            compressed_out <= 1'b0;
             is_lr_out <= 1'b0;
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
-            atomic_op_out <= 5'b0;    
+            atomic_op_out <= 5'b0;
         end else if (mem_stall) begin
             // Freeze
         end else begin
@@ -917,7 +943,8 @@ module ex_mem_reg (
             reg_wen_out <= reg_wen_in;
             mem_rw_out <= mem_rw_in;
             wb_sel_out <= wb_sel_in;
-            pc_out <= pc_in;   
+            pc_out <= pc_in;
+            compressed_out <= compressed_in;
             is_lr_out <= is_lr_in;
             is_sc_out <= is_sc_in;
             is_amo_out <= is_amo_in;
@@ -931,29 +958,33 @@ endmodule
 module mem_wb_reg (
     input wire clk, rst, mem_stall,
     input wire [31:0] alu_res_in, mem_data_in, pc_in, inst_in,
+    input wire compressed_in,
     input wire [4:0] rd_in,
     input wire reg_wen_in,
     input wire [1:0] wb_sel_in,
     output reg [31:0] alu_res_out, mem_data_out, pc_out, inst_out,
+    output reg compressed_out,
     output reg [4:0] rd_out,
     output reg reg_wen_out,
     output reg [1:0] wb_sel_out
 );
     always @(posedge clk) begin
         if (rst) begin
-            reg_wen_out <= 0;  
+            reg_wen_out <= 0;
             rd_out <= 0;
-            alu_res_out <= 0;  
+            alu_res_out <= 0;
             mem_data_out <= 0;
-            pc_out <= 0;  
+            pc_out <= 0;
+            compressed_out <= 1'b0;
             wb_sel_out <= 0;
             inst_out <= 32'h00000013;
         end else if (mem_stall) begin
-        // Freeze 
+        // Freeze
         end else begin
             alu_res_out <= alu_res_in;
             mem_data_out <= mem_data_in;
-            pc_out <= pc_in;           
+            pc_out <= pc_in;
+            compressed_out <= compressed_in;
             rd_out <= rd_in;
             reg_wen_out <= reg_wen_in;
             wb_sel_out <= wb_sel_in;
