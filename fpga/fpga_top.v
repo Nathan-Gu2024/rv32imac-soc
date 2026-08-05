@@ -6,9 +6,10 @@ module fpga_top #(
     input wire clk,
     input wire rst,          
 
-    // Physical UART TX pin - driven directly by cpu_pipelined's internal
+    // Physical UART pins - driven/read directly by cpu_pipelined's internal
     // uart_mmio peripheral (MMIO at 0x4000_1000; see uart_mmio.v).
     output wire uart_tx,
+    input wire uart_rx,
 
     output wire [3:0] leds,
 
@@ -97,6 +98,7 @@ module fpga_top #(
         .rst(rst),
 
         .uart_tx(uart_tx),
+        .uart_rx(uart_rx),
         .leds(cpu_leds),
 
         // I-cache lower-memory line interface

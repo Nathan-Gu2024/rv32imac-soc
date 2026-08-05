@@ -17,11 +17,14 @@
 `include "../src/cache_core.v"
 `include "../src/tcm.v"
 `include "../src/uart_tx.v"
+`include "../src/uart_rx.v"
 `include "../src/uart_mmio.v"
+`include "../src/intc.v"
 
 module cpu_pipelined (
     input wire clk, rst,
     output wire uart_tx,
+    input wire uart_rx,
     output reg [3:0] leds,
 
     output wire [31:0] icache_mem_req_addr, 
@@ -74,6 +77,7 @@ module cpu_pipelined (
     wire [31:0] if_id_pc;
     wire [31:0] if_id_inst;
     wire if_id_compressed;
+    wire if_id_valid;
 
     // ID
     wire [31:0] rs1_data;
@@ -91,9 +95,14 @@ module cpu_pipelined (
     wire [2:0] imm_sel;
     wire [4:0] alu_sel;
     wire [4:0] atomic_op;
+    wire csr_wen; 
+    wire [1:0] csr_op; 
+    wire csr_use_imm; 
+    wire [4:0] csr_uimm; 
 
     // ID/EX
     wire id_ex_compressed;
+    wire id_ex_valid;
     wire [31:0] id_ex_pc;
     wire [31:0] id_ex_rs1;
     wire [31:0] id_ex_rs2;
@@ -110,7 +119,11 @@ module cpu_pipelined (
     wire id_ex_is_amo;
     wire [1:0] id_ex_wb_sel;
     wire [4:0] id_ex_alu_sel;
-
+    wire id_ex_csr_wen; 
+    wire [1:0] id_ex_csr_op; 
+    wire id_ex_csr_use_imm; 
+    wire [4:0] id_ex_csr_uimm;
+ 
     // EX
     wire [31:0] alu_a;
     wire [31:0] alu_b;
@@ -179,8 +192,16 @@ module cpu_pipelined (
     wire is_led;
     wire is_uart;
     wire is_clint;
+    wire is_intc;
     wire uart_ready;
     wire [31:0] uart_rdata;
+    wire uart_tx_irq;
+    wire uart_rx_irq;
+    wire intc_ready;
+    wire [31:0] intc_rdata;
+    wire intc_irq_out;
+    wire mie_mtie, mie_meie;
+    wire timer_fires, external_fires;
     wire is_load;
     wire is_store;
     wire store_commits;
@@ -211,6 +232,8 @@ module cpu_pipelined (
 
     // Cache / memory stall control
     localparam [31:0] LED_ADDR = 32'h0000_2000;
+    localparam [31:0] INTC_MMIO_BASE = 32'h0000_4000;
+    localparam [31:0] INTC_MMIO_MASK = 32'hFFFF_F000;
     localparam [31:0] UART_MMIO_BASE = 32'h4000_1000;
     localparam [31:0] UART_MMIO_MASK = 32'hFFFF_F000;
     localparam [31:0] CLINT_BASE = 32'h0200_0000;
@@ -227,6 +250,7 @@ module cpu_pipelined (
     assign is_led = (ex_mem_alu == LED_ADDR);
     assign is_uart = ((ex_mem_alu & UART_MMIO_MASK) == UART_MMIO_BASE);
     assign is_clint = ((ex_mem_alu & CLINT_MASK) == CLINT_BASE);
+    assign is_intc = ((ex_mem_alu & INTC_MMIO_MASK) == INTC_MMIO_BASE);
     assign is_mmio = is_led | is_clint;
 
     assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen;
@@ -234,8 +258,8 @@ module cpu_pipelined (
     assign store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
 
     // TCM accesses go into dcache.v which bypass the cache and forward to tcm.v
-    assign dcache_ren = is_load & ~is_mmio & ~is_uart;
-    assign dcache_wen = store_commits & ~is_mmio & ~is_uart;
+    assign dcache_ren = is_load & ~is_mmio & ~is_uart & ~is_intc;
+    assign dcache_wen = store_commits & ~is_mmio & ~is_uart & ~is_intc;
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
 
@@ -247,9 +271,21 @@ module cpu_pipelined (
         else if (uart_req) uart_pending <= 1'b1;
         else if (uart_ready) uart_pending <= 1'b0;
     end
-
     wire uart_stall = uart_valid && !uart_ready;
-    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall;
+
+    // intc: same two-tier req/pending pattern as uart_mmio above - it also
+    // has real registered latency, not an instant ack like led/clint.
+    wire intc_valid = is_intc & (is_load | store_commits);
+    wire intc_req = intc_valid & ~intc_pending;
+    reg intc_pending;
+    always @(posedge clk) begin
+        if (rst) intc_pending <= 1'b0;
+        else if (intc_req) intc_pending <= 1'b1;
+        else if (intc_ready) intc_pending <= 1'b0;
+    end
+    wire intc_stall = intc_valid && !intc_ready;
+
+    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall;
 
     // TCM
     wire tcm_i_req, tcm_i_ready;
@@ -345,10 +381,10 @@ module cpu_pipelined (
     ); 
 
     //debug 
-    assign debug_dcache_valid     = dcache_valid;
-    assign debug_dcache_ready     = dcache_ready;
-    assign debug_tcm_d_req        = tcm_d_req;
-    assign debug_tcm_d_ready      = tcm_d_ready;
+    assign debug_dcache_valid = dcache_valid;
+    assign debug_dcache_ready = dcache_ready;
+    assign debug_tcm_d_req = tcm_d_req;
+    assign debug_tcm_d_ready = tcm_d_ready;
     assign debug_global_mem_stall = global_mem_stall;    
     
     // IF
@@ -387,7 +423,8 @@ module cpu_pipelined (
         .compressed_in(is_compressed),
         .pc_out(if_id_pc),
         .inst_out(if_id_inst),
-        .compressed_out(if_id_compressed)
+        .compressed_out(if_id_compressed),
+        .valid_out(if_id_valid)
     );
     
     assign debug_instr = if_id_inst;
@@ -406,7 +443,10 @@ module cpu_pipelined (
         .out_is_sc(is_sc),
         .out_is_amo(is_amo),
         .out_atomic_op(atomic_op),
-        .csr_wen(csr_wen)
+        .csr_wen(csr_wen),
+        .csr_op(csr_op), 
+        .csr_use_imm(csr_use_imm),
+        .csr_uimm(csr_uimm)
     );
 
     regfile RF (
@@ -449,10 +489,19 @@ module cpu_pipelined (
         .is_sc_in(is_sc), 
         .is_amo_in(is_amo), 
         .atomic_op_in(atomic_op), 
-        .is_lr_out(id_ex_is_lr), 
+        .csr_wen_in(csr_wen),
+        .csr_op_in(csr_op),
+        .csr_use_imm_in(csr_use_imm),
+        .csr_uimm_in(csr_uimm),
+        .valid_in(if_id_valid),
+        .is_lr_out(id_ex_is_lr),
         .is_sc_out(id_ex_is_sc), 
         .is_amo_out(id_ex_is_amo), 
         .atomic_op_out(id_ex_atomic_op), 
+        .csr_wen_out(id_ex_csr_wen),
+        .csr_op_out(id_ex_csr_op),
+        .csr_use_imm_out(id_ex_csr_use_imm),
+        .csr_uimm_out(id_ex_csr_uimm),
         .pc_out(id_ex_pc), 
         .rs1_out(id_ex_rs1), 
         .rs2_out(id_ex_rs2), 
@@ -465,7 +514,8 @@ module cpu_pipelined (
         .b_sel_out(id_ex_b_sel),
         .wb_sel_out(id_ex_wb_sel),
         .alu_sel_out(id_ex_alu_sel),
-        .compressed_out(id_ex_compressed)
+        .compressed_out(id_ex_compressed),
+        .valid_out(id_ex_valid)
     );
 
     // EX 
@@ -500,7 +550,7 @@ module cpu_pipelined (
     // ~33-cycle multi-cycle op that stalls the whole pipeline via global_mem_stall
     wire is_div_op = id_ex_alu_sel[4];
     wire div_is_signed = ~id_ex_alu_sel[0];
-    wire div_want_rem  = id_ex_alu_sel[1];
+    wire div_want_rem = id_ex_alu_sel[1];
     wire div_busy, div_done;
     wire [31:0] div_quotient, div_remainder;
     reg div_result_ready;
@@ -577,12 +627,27 @@ module cpu_pipelined (
     );
 
     // Machine Interrupt Enable comes straight from mstatus.MIE (csr_file),
-    // which correctly resets to 0 and tracks trap/mret/software CSR writes
-    assign gated_interrupt = timer_interrupt & mstatus_mie & ~global_mem_stall & ~stall;
+    // which correctly resets to 0 and tracks trap/mret/software CSR writes.
+    // Each class also needs its own mie bit (mie_mtie/mie_meie) and live
+    // mip truth (timer_interrupt/intc_irq_out) before it's allowed to fire -
+    // gated_interrupt is kept only as a combined debug/status signal.
+    //
+    // id_ex_valid additionally gates both: EX can be holding a
+    // flush-inserted bubble (pc=0, inst=NOP) rather than a real instruction
+    // - e.g. every taken branch/jump produces one for a cycle, including a
+    // tight self-loop's own redirect. Taking an interrupt on such a cycle
+    // would capture trap_pc=0 as the resume address instead of a real one,
+    // so mret would later jump to address 0 and hang. Deferring by a cycle
+    // until EX is valid again is safe since the interrupt condition stays
+    // latched (pending in intc / mtime>=mtimecmp) rather than pulsing.
+    assign timer_fires = mstatus_mie & mie_mtie & timer_interrupt & id_ex_valid & ~global_mem_stall & ~stall;
+    assign external_fires = mstatus_mie & mie_meie & intc_irq_out & id_ex_valid & ~global_mem_stall & ~stall;
+    assign gated_interrupt = timer_fires | external_fires;
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
         .ex_inst(id_ex_inst),
-        .external_interrupt(gated_interrupt),
+        .timer_irq(timer_fires),
+        .external_irq(external_fires),
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out),
         .trap_taken(trap_taken),
@@ -596,25 +661,31 @@ module cpu_pipelined (
         .trap_target_pc(trap_target_pc)
     );
 
-    assign ex_is_csrrw = (id_ex_inst[6:0] == 7'b1110011) && (id_ex_inst[14:12] == 3'b001);
-    assign ex_csr_wen = ex_is_csrrw && !global_mem_stall && !stall;
+    assign ex_csr_wen = id_ex_csr_wen && !global_mem_stall && !stall;
     csr_file CSR (
-        .clk(clk), 
-        .rst(rst), 
-        .csr_addr(id_ex_inst[31:20]), 
+        .clk(clk),
+        .rst(rst),
+        .csr_addr(id_ex_inst[31:20]),
         .csr_wdata(fwd_rs1),
-        .csr_wen(ex_csr_wen), 
+        .csr_wen(ex_csr_wen),
+        .csr_op(id_ex_csr_op),
+        .csr_use_imm(id_ex_csr_use_imm),
+        .csr_uimm(id_ex_csr_uimm),
         .csr_rdata(csr_rdata),
         .trap_taken(trap_taken),
         .trap_pc(trap_pc),
         .trap_cause(trap_cause),
         .mret_exec(mret_exec),
+        .timer_pending(timer_interrupt),
+        .external_pending(intc_irq_out),
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out),
-        .mstatus_mie(mstatus_mie)
+        .mstatus_mie(mstatus_mie),
+        .mie_mtie(mie_mtie),
+        .mie_meie(mie_meie)
     );
 
-    assign actual_ex_result = ex_is_csrrw ? csr_rdata : ex_result;
+    assign actual_ex_result = id_ex_csr_wen ? csr_rdata : ex_result;
     ex_mem_reg EX_MEM (
         .clk(clk), 
         .rst(rst), 
@@ -673,7 +744,27 @@ module cpu_pipelined (
         .d_wdata(ex_mem_rs2),
         .d_rdata(uart_rdata),
         .d_ready(uart_ready),
-        .tx(uart_tx)
+        .tx(uart_tx),
+        .rx(uart_rx),
+        .tx_irq(uart_tx_irq), 
+        .rx_irq(uart_rx_irq)
+    );
+
+    // intc: source 0 is UART TX-complete; sources 1-7 are reserved for
+    // future peripherals (tie 0 until wired up).
+    intc #(
+        .NUM_SOURCES(8)
+    ) INTC (
+        .clk(clk),
+        .rst(rst),
+        .d_req(intc_req),
+        .d_we(store_commits),
+        .d_addr(ex_mem_alu),
+        .d_wdata(ex_mem_rs2),
+        .d_rdata(intc_rdata),
+        .d_ready(intc_ready),
+        .irq_in({6'b0, uart_rx_irq, uart_tx_irq}),
+        .irq_out(intc_irq_out)
     );
 
     // MEM
@@ -694,7 +785,7 @@ module cpu_pipelined (
     assign lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
     assign sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
     assign normal_store_reservation_clear = is_store && !ex_mem_is_sc &&
-                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready));
+                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready) || (is_intc && intc_ready));
 
     reservation_monitor RM (
         .clk(clk),
@@ -727,6 +818,7 @@ module cpu_pipelined (
     assign final_mem_read_data = is_clint ? clint_rdata :
                                  is_led ? {28'b0, leds} :
                                  is_uart ? uart_rdata :
+                                 is_intc ? intc_rdata :
                                             dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
@@ -794,23 +886,31 @@ module if_id_reg (
     input wire [31:0] pc_in, inst_in,
     input wire compressed_in,
     output reg [31:0] pc_out, inst_out,
-    output reg compressed_out
+    output reg compressed_out,
+    // 0 whenever this slot holds a flush-inserted bubble rather than a
+    // genuinely fetched instruction (indistinguishable from a real NOP by
+    // inst_out/pc_out alone - both read as 0x13/0 either way). Needed so
+    // downstream logic (interrupt-taking) can tell the difference.
+    output reg valid_out
 );
     always @(posedge clk) begin
         if (rst) begin
             pc_out <= 32'b0;
             inst_out <= 32'h00000013;
             compressed_out <= 1'b0;
+            valid_out <= 1'b0;
         end else if (mem_stall) begin
             // Freeze
         end else if (flush) begin
             pc_out <= 32'b0;
             inst_out <= 32'h00000013;
             compressed_out <= 1'b0;
+            valid_out <= 1'b0;
         end else if (!stall) begin
             pc_out <= pc_in;
             inst_out <= inst_in;
             compressed_out <= compressed_in;
+            valid_out <= 1'b1;
         end
     end
 endmodule
@@ -827,6 +927,11 @@ module id_ex_reg (
     input wire compressed_in,
     input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
+    input wire csr_wen_in,
+    input wire [1:0] csr_op_in,
+    input wire csr_use_imm_in,
+    input wire [4:0] csr_uimm_in,
+    input wire valid_in,
     output reg is_lr_out, is_sc_out, is_amo_out,
     output reg [4:0] atomic_op_out,
     output reg [31:0] pc_out, rs1_out, rs2_out, imm_out,
@@ -835,7 +940,15 @@ module id_ex_reg (
     output reg [1:0] wb_sel_out,
     output reg [4:0] alu_sel_out,
     output reg [31:0] inst_out,
-    output reg compressed_out
+    output reg compressed_out,
+    output reg csr_wen_out,
+    output reg [1:0] csr_op_out,
+    output reg csr_use_imm_out,
+    output reg [4:0] csr_uimm_out,
+    // See if_id_reg's valid_out for what this means; propagated forward
+    // (not unconditionally set) so a bubble already flushed upstream stays
+    // marked invalid all the way through EX.
+    output reg valid_out
 );
 
     always @(posedge clk) begin
@@ -857,6 +970,11 @@ module id_ex_reg (
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
             atomic_op_out <= 5'b0;
+            csr_wen_out <= 1'b0;
+            csr_op_out <= 2'b0;
+            csr_use_imm_out <= 1'b0;
+            csr_uimm_out <= 5'b0;
+            valid_out <= 1'b0;
         end else if (mem_stall) begin
             // Freeze
         end else if (flush) begin
@@ -877,6 +995,11 @@ module id_ex_reg (
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
             atomic_op_out <= 5'b0;
+            csr_wen_out <= 1'b0;
+            csr_op_out <= 2'b0;
+            csr_use_imm_out <= 1'b0;
+            csr_uimm_out <= 5'b0;
+            valid_out <= 1'b0;
         end else begin
             mem_rw_out <= mem_rw_in;
             rd_out <= rd_in;
@@ -885,6 +1008,7 @@ module id_ex_reg (
             rs2_out <= rs2_in;
             imm_out <= imm_in;
             reg_wen_out <= reg_wen_in;
+            valid_out <= valid_in;
             a_sel_out <= a_sel_in;
             b_sel_out <= b_sel_in;
             wb_sel_out <= wb_sel_in;
@@ -895,6 +1019,10 @@ module id_ex_reg (
             is_sc_out <= is_sc_in;
             is_amo_out <= is_amo_in;
             atomic_op_out <= atomic_op_in;
+            csr_wen_out <= csr_wen_in;
+            csr_op_out <= csr_op_in;
+            csr_use_imm_out <= csr_use_imm_in;
+            csr_uimm_out <= csr_uimm_in;
         end
     end
 

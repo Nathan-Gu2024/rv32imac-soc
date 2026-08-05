@@ -6,7 +6,12 @@ module control_logic (
     output wire [4:0] alu_sel,
     output wire out_is_lr, out_is_sc, out_is_amo,
     output wire [4:0] out_atomic_op,
-    output wire csr_wen
+    output wire csr_wen, 
+
+    output wire [1:0] csr_op, 
+    output wire csr_use_imm, 
+    output wire [4:0] csr_uimm
+    
 );
 
     wire [5:0] rom_address;
@@ -15,6 +20,7 @@ module control_logic (
     wire is_lr = is_atomic_inst && (atomic_funct5 == 5'b00010);
     wire is_sc = is_atomic_inst && (atomic_funct5 == 5'b00011);
     wire is_amo = is_atomic_inst && !is_lr && !is_sc;
+    
     wire is_system_inst = (inst[6:0] == 7'b1110011);
 
     rom_decoder decoder (
@@ -37,8 +43,15 @@ module control_logic (
     assign out_is_sc = is_sc;
     assign out_is_amo = is_amo;
     assign out_atomic_op = atomic_funct5;
-    assign csr_wen = is_system_inst && (inst[14:12] == 3'b001);
-
+    wire [2:0] csr_funct3 = inst[14:12];
+    // funct3 000/100 are non-CSR system instructions (ecall/ebreak/mret/etc)
+    assign csr_wen = is_system_inst && (csr_funct3 != 3'b000) && (csr_funct3 != 3'b100);
+    // funct3[1:0] perfectly matches our operations: 01 = RW, 10 = RS, 11 = RC
+    assign csr_op = csr_funct3[1:0];
+    // If funct3 bit 2 is high (101, 110, 111), it's an immediate variant
+    assign csr_use_imm = is_system_inst && csr_funct3[2];
+    assign csr_uimm = inst[19:15]; // The 5-bit unsigned immediate field
+    
 endmodule
 
 module rom (

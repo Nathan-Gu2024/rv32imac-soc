@@ -32,15 +32,11 @@ module tcm #(
     localparam TCM_WORDS = TCM_BYTES / 4;
     localparam INDEX_BITS = $clog2(TCM_WORDS);
 
-    // ==========================================
     // 1. Banked Memory Arrays (Block RAM)
-    // ==========================================
     (* ram_style = "block" *) reg [15:0] mem_even [0 : TCM_WORDS - 1];
-    (* ram_style = "block" *) reg [15:0] mem_odd  [0 : TCM_WORDS - 1];
+    (* ram_style = "block" *) reg [15:0] mem_odd [0 : TCM_WORDS - 1];
 
-    // ==========================================
     // 2. Initialization (NOPs + Readmemh)
-    // ==========================================
     reg [31:0] temp_mem [0 : TCM_WORDS - 1];
     integer i;
 
@@ -59,13 +55,11 @@ module tcm #(
         // Split the 32-bit temporary array into the 16-bit physical banks
         for (i = 0; i < TCM_WORDS; i = i + 1) begin
             mem_even[i] = temp_mem[i][15:0];
-            mem_odd[i]  = temp_mem[i][31:16];
+            mem_odd[i] = temp_mem[i][31:16];
         end
     end
 
-    // ==========================================
     // 3. Address Decoding & Alignment Logic
-    // ==========================================
     wire [ADDR_WIDTH-1:0] i_offset = i_addr - TCM_BASE;
     wire [ADDR_WIDTH-1:0] d_offset = d_addr - TCM_BASE;
 
@@ -78,7 +72,7 @@ module tcm #(
     // Instruction alignment calculations
     wire is_unaligned = i_offset[1];
     wire [INDEX_BITS-1:0] even_idx = is_unaligned ? (i_index + 1) : i_index;
-    wire [INDEX_BITS-1:0] odd_idx  = i_index;
+    wire [INDEX_BITS-1:0] odd_idx = i_index;
 
     // Registers to hold BRAM outputs (1 cycle delay)
     reg [15:0] i_rdata_even, i_rdata_odd;
@@ -86,20 +80,18 @@ module tcm #(
 
     reg [15:0] d_rdata_even, d_rdata_odd;
 
-    // ==========================================
-    // 4. Port A: Instruction Fetch (Synchronous)
-    // ==========================================
+    // Port A: Instruction Fetch (Synchronous)
     always @(posedge clk) begin
         if (rst) begin
             i_rdata_even <= 16'b0;
-            i_rdata_odd  <= 16'b0;
+            i_rdata_odd <= 16'b0;
             i_is_unaligned_reg <= 1'b0;
             i_ready <= 1'b0;
         end else begin
             i_ready <= 1'b0;
             if (i_req && i_in_range) begin
                 i_rdata_even <= mem_even[even_idx];
-                i_rdata_odd  <= mem_odd[odd_idx];
+                i_rdata_odd <= mem_odd[odd_idx];
 
                 // Track if this specific fetch was unaligned so we can stitch correctly
                 i_is_unaligned_reg <= is_unaligned;
@@ -116,27 +108,25 @@ module tcm #(
             i_rdata = {i_rdata_odd, i_rdata_even};
     end
 
-    // ==========================================
-    // 5. Port B: Data Memory (Synchronous)
-    // ==========================================
+    // Port B: Data Memory (Synchronous)
     always @(posedge clk) begin
         if (rst) begin
             d_rdata_even <= 16'b0;
-            d_rdata_odd  <= 16'b0;
+            d_rdata_odd <= 16'b0;
             d_ready <= 1'b0;
         end else begin
             d_ready <= 1'b0;
             if (d_req && d_in_range) begin
                 if (d_we) begin
                     // BRAM inferred byte-enable writes mapped to the split banks
-                    if (d_wmask[0]) mem_even[d_index][7:0]   <= d_wdata[7:0];
-                    if (d_wmask[1]) mem_even[d_index][15:8]  <= d_wdata[15:8];
-                    if (d_wmask[2]) mem_odd[d_index][7:0]    <= d_wdata[23:16];
-                    if (d_wmask[3]) mem_odd[d_index][15:8]   <= d_wdata[31:24];
+                    if (d_wmask[0]) mem_even[d_index][7:0] <= d_wdata[7:0];
+                    if (d_wmask[1]) mem_even[d_index][15:8]<= d_wdata[15:8];
+                    if (d_wmask[2]) mem_odd[d_index][7:0] <= d_wdata[23:16];
+                    if (d_wmask[3]) mem_odd[d_index][15:8] <= d_wdata[31:24];
                 end
 
                 d_rdata_even <= mem_even[d_index];
-                d_rdata_odd  <= mem_odd[d_index];
+                d_rdata_odd <= mem_odd[d_index];
                 d_ready <= 1'b1;
             end
         end
