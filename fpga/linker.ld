@@ -1,4 +1,3 @@
-/* linker.ld */ 
 MEMORY
 {
     /* TCM Base: 0x4000_0000, Size: 65536 bytes (64KB) */ 

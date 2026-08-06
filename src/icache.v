@@ -191,11 +191,21 @@ module icache #(
     localparam OFFSET_BITS = $clog2(LINE_BYTES);
     localparam [ADDR_WIDTH-1:0] TCM_LIMIT = TCM_BASE + TCM_BYTES;
 
-    // 1. Instantly determine where the request should go
+    // determine where the request should go
     wire req_is_tcm = (cpu_req_addr >= TCM_BASE) && (cpu_req_addr < TCM_LIMIT);
 
-    // 2. Route Cache signals directly
-    wire cache_req_valid = cpu_req_valid && !req_is_tcm;
+    // Cache-backed (DDR/AXI) path, cache_core hands back one whole
+    // 128-bit line per access, stitches the potentially misaligned compressed instructions
+    reg line2_active;
+    reg [ADDR_WIDTH-1:0] saved_addr;
+    reg [15:0] saved_last_half;
+
+    wire [2:0] half_idx = cpu_req_addr[OFFSET_BITS-1:1];
+    wire needs_line2 = (half_idx == 3'd7);
+
+    wire cache_req_valid = line2_active ? 1'b1 : (cpu_req_valid && !req_is_tcm);
+    wire [ADDR_WIDTH-1:0] cache_req_addr = line2_active ? (saved_addr + LINE_BYTES) : cpu_req_addr;
+
     wire cache_ready, cache_hit;
     wire [LINE_BITS-1:0] cache_rline;
 
@@ -210,7 +220,7 @@ module icache #(
 
         .req_valid(cache_req_valid),
         .req_write(1'b0),
-        .req_addr(cpu_req_addr),
+        .req_addr(cache_req_addr),
         .req_wline({LINE_BITS{1'b0}}),
         .req_wmask({LINE_BYTES{1'b0}}),
 
@@ -227,39 +237,64 @@ module icache #(
         .mem_wline()      // Unused for I-Cache
     );
 
-    // 3. Instantly multiplex the specific 32-bit word out of the 128-bit cache line
-    wire [1:0] word_offset = cpu_req_addr[OFFSET_BITS-1:2];
-    reg [31:0] cache_word;
+    // 3. Instantly multiplex the 32-bit window starting at half_idx out of
+    //    the 128-bit line. half_idx==7's high half is only valid once
+    //    line2 arrives (see cache_result_data_comb below).
+    reg [31:0] line1_window;
     always @(*) begin
-        case (word_offset)
-            2'd0: cache_word = cache_rline[31:0];
-            2'd1: cache_word = cache_rline[63:32];
-            2'd2: cache_word = cache_rline[95:64];
-            2'd3: cache_word = cache_rline[127:96];
-            default: cache_word = 32'h0;
+        case (half_idx)
+            3'd0: line1_window = cache_rline[31:0];
+            3'd1: line1_window = cache_rline[47:16];
+            3'd2: line1_window = cache_rline[63:32];
+            3'd3: line1_window = cache_rline[79:48];
+            3'd4: line1_window = cache_rline[95:64];
+            3'd5: line1_window = cache_rline[111:80];
+            3'd6: line1_window = cache_rline[127:96];
+            default: line1_window = {16'b0, cache_rline[127:112]};
         endcase
     end
 
-    // 4. Route TCM signals with a 1-cycle pulse mask to prevent echoes
+    // Combinational result: passes straight through at cache_core's own
+    // hit/miss timing for the common (non-straddling) case, same as
+    // before. Only the straddling case needs the extra line2_active state.
+    wire [31:0] cache_result_data_comb = line2_active ? {cache_rline[15:0], saved_last_half} : line1_window;
+    wire cache_result_ready_comb = line2_active ? cache_ready : (cache_ready && !needs_line2);
+
+    always @(posedge clk) begin
+        if (rst) begin
+            line2_active <= 1'b0;
+            saved_addr <= {ADDR_WIDTH{1'b0}};
+            saved_last_half <= 16'b0;
+        end else if (!line2_active) begin
+            if (cache_req_valid && cache_ready && needs_line2) begin
+                saved_addr <= cpu_req_addr;
+                saved_last_half <= cache_rline[127:112];
+                line2_active <= 1'b1;
+            end
+        end else begin
+            if (cache_ready) begin
+                line2_active <= 1'b0;
+            end
+        end
+    end
+
+    // req-ack handshake
     reg tcm_req_pending;
     always @(posedge clk) begin
         if (rst) begin
             tcm_req_pending <= 1'b0;
         end else if (tcm_req_valid) begin
-            // We just sent a request to the TCM. Flag it so we drop 'valid' next cycle.
             tcm_req_pending <= 1'b1;
         end else if (tcm_ready) begin
-            // The TCM finished responding. Clear the flag for the next instruction.
             tcm_req_pending <= 1'b0;
         end
     end
 
-    // Only assert valid on the VERY FIRST cycle of the request
+    //  assert valid on the first cycle of the request
     assign tcm_req_valid = cpu_req_valid && req_is_tcm && !tcm_req_pending;
     assign tcm_req_addr  = cpu_req_addr;
     
-    // 5. Return data and ready signal
-    assign cpu_rdata = req_is_tcm ? tcm_rdata : cache_word;
-    assign cpu_ready = req_is_tcm ? tcm_ready : cache_ready;
+    assign cpu_rdata = req_is_tcm ? tcm_rdata : cache_result_data_comb;
+    assign cpu_ready = req_is_tcm ? tcm_ready : cache_result_ready_comb;
     
 endmodule
