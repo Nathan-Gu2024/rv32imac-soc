@@ -1,0 +1,5 @@
+# rv32_5stage out-of-tree Zephyr module Kconfig entry point.
+# SPDX-License-Identifier: Apache-2.0
+
+rsource "drivers/serial/Kconfig"
+rsource "drivers/interrupt_controller/Kconfig"

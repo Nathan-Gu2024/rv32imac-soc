@@ -1,0 +1,19 @@
+# Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+# UART driver (src/uart_mmio.v).
+# SPDX-License-Identifier: Apache-2.0
+
+config UART_RV32_5STAGE
+	bool "RV32 5-stage custom UART driver"
+	default y
+	depends on DT_HAS_RV32_5STAGE_UART_ENABLED
+	select SERIAL_HAS_DRIVER
+	select SERIAL_SUPPORT_INTERRUPT
+	help
+	  Driver for the custom uart_mmio.v peripheral: 4 word-aligned
+	  registers (TX_DATA/TX_STATUS/RX_DATA/RX_STATUS) at fixed offsets,
+	  no runtime baud-rate configuration (fixed in hardware at synthesis
+	  time via uart_tx.v/uart_rx.v parameters). Polling mode always
+	  works; select CONFIG_UART_INTERRUPT_DRIVEN separately to also
+	  build the interrupt-driven path, which needs
+	  rv32_5stage,intc (drivers/interrupt_controller) as its
+	  interrupt-parent.

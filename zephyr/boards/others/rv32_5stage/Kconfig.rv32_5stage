@@ -1,0 +1,5 @@
+# Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_RV32_5STAGE
+	select SOC_RV32_5STAGE

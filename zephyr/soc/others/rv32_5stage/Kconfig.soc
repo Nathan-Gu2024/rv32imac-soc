@@ -1,0 +1,14 @@
+# Custom RV32IMC 5-stage pipelined RISC-V SoC (FPGA soft-core)
+# SPDX-License-Identifier: Apache-2.0
+
+config SOC_RV32_5STAGE
+	bool
+	help
+	  Custom RV32IMC 5-stage pipelined RISC-V CPU, implemented as an FPGA
+	  soft-core (Zynq-7020 PL fabric). Standard RISC-V privileged trap
+	  model (mstatus/mie/mip/mtvec/mepc/mcause), a CLINT-compatible
+	  mtime/mtimecmp timer, and a minimal single-line external-interrupt
+	  aggregator (not a PLIC) feeding mip.MEIP.
+
+config SOC
+	default "rv32_5stage" if SOC_RV32_5STAGE

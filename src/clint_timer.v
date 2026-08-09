@@ -32,12 +32,7 @@ module clint_timer (
                 case (addr[3:0])
                     4'h0: mtime[31:0] <= wdata;
                     4'h4: mtime[63:32] <= wdata;
-                    4'h8: 
-                        begin
-                            mtimecmp[31:0]  <= wdata;
-                            mtimecmp[63:32] <= 32'b0;
-                        end
-
+                    4'h8: mtimecmp[31:0] <= wdata;
                     4'hC: mtimecmp[63:32] <= wdata;
                 endcase
             end

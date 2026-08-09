@@ -231,13 +231,22 @@ module cpu_pipelined (
     wire [31:0] wb_data;
 
     // Cache / memory stall control
+    // INTC/UART/CLINT masks below match each peripheral's REAL register
+    // window (intc.v: ENABLE+PENDING, 8 bytes; uart_mmio.v: 4 word regs,
+    // 16 bytes; clint_timer.v: addr[3:0], 16 bytes) - NOT a whole 4KB/64KB
+    // page. They used to be page-wide, which silently misrouted any real
+    // DDR-resident program data/stack that happened to land in that page
+    // through the peripheral's own register logic instead of memory
+    // (writes got acknowledged but went nowhere real; reads came back as
+    // whatever the peripheral defaults its d_rdata/rdata to, usually 0) -
+    // exactly the same class of bug as dcache.v's old page-wide MMIO
     localparam [31:0] LED_ADDR = 32'h0000_2000;
     localparam [31:0] INTC_MMIO_BASE = 32'h0000_4000;
-    localparam [31:0] INTC_MMIO_MASK = 32'hFFFF_F000;
+    localparam [31:0] INTC_MMIO_MASK = 32'hFFFF_FFF8;
     localparam [31:0] UART_MMIO_BASE = 32'h4000_1000;
-    localparam [31:0] UART_MMIO_MASK = 32'hFFFF_F000;
+    localparam [31:0] UART_MMIO_MASK = 32'hFFFF_FFF0;
     localparam [31:0] CLINT_BASE = 32'h0200_0000;
-    localparam [31:0] CLINT_MASK = 32'hFFFF_0000;
+    localparam [31:0] CLINT_MASK = 32'hFFFF_FFF0;
     localparam [31:0] TCM_BASE = 32'h4000_0000;
     localparam [31:0] TCM_BYTES = 32'h0001_0000;
 
@@ -263,27 +272,78 @@ module cpu_pipelined (
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
 
-    wire uart_valid = is_uart & (is_load | store_commits);
-    wire uart_req = uart_valid & ~uart_pending;
-    reg uart_pending;
-    always @(posedge clk) begin
-        if (rst) uart_pending <= 1'b0;
-        else if (uart_req) uart_pending <= 1'b1;
-        else if (uart_ready) uart_pending <= 1'b0;
-    end
-    wire uart_stall = uart_valid && !uart_ready;
+    // uart_ready/intc_ready below are one-shot registered pulses (the
+    // peripheral's own d_ready, high for exactly one cycle after d_req),
+    // unlike dcache_ready which is combinational/level-sensitive and
+    // simply stays high as long as the same address keeps hitting. That
+    // difference used to cause a livelock: uart_pending/intc_pending
+    // would clear the instant the one-shot ready pulse fired, and since
+    // uart_valid/intc_valid (derived from the still-frozen ex_mem stage)
+    // stays asserted for as long as the pipeline is stalled for ANY
+    // other reason too (e.g. a concurrent multi-cycle icache miss), a
+    // fresh req/ready cycle would immediately re-fire - so uart_stall/
+    // intc_stall kept re-asserting on whichever cycle happened to be out
+    // of phase with the other stall source, and global_mem_stall (an OR
+    // of all sources) never saw every source clear on the same cycle.
+    // uart_done/intc_done latch "this exact access has already been
+    // acknowledged" across that re-arming, and only release once the
+    // pipeline genuinely retires (global_mem_stall actually drops),
+    // matching how dcache_ready naturally persists.
+    // uart_rdata/intc_rdata (the peripheral's own d_rdata) are ALSO only
+    // valid for that same one cycle uart_ready/intc_ready pulses - but
+    // uart_done/intc_done deliberately keep the pipeline stalled for one
+    // MORE cycle after that (see above), so by the time the pipeline
+    // actually commits, the live uart_rdata/intc_rdata wire has already
+    // fallen back to the peripheral's default (0) for a load. Latch the
+    // data at the exact same moment as the done flag so it survives to
+    // the delayed commit - final_mem_read_data below reads THESE, not the
+    // live uart_rdata/intc_rdata wires, for is_uart/is_intc loads.
+    reg [31:0] uart_rdata_latched;
+    reg [31:0] intc_rdata_latched;
 
-    // intc: same two-tier req/pending pattern as uart_mmio above - it also
-    // has real registered latency, not an instant ack like led/clint.
-    wire intc_valid = is_intc & (is_load | store_commits);
-    wire intc_req = intc_valid & ~intc_pending;
-    reg intc_pending;
+    wire uart_valid = is_uart & (is_load | store_commits);
+    wire uart_req = uart_valid & ~uart_pending & ~uart_done;
+    reg uart_pending;
+    reg uart_done;
     always @(posedge clk) begin
-        if (rst) intc_pending <= 1'b0;
-        else if (intc_req) intc_pending <= 1'b1;
-        else if (intc_ready) intc_pending <= 1'b0;
+        if (rst) begin
+            uart_pending <= 1'b0;
+            uart_done <= 1'b0;
+            uart_rdata_latched <= 32'b0;
+        end else begin
+            if (uart_req) uart_pending <= 1'b1;
+            else if (uart_ready) uart_pending <= 1'b0;
+
+            if (uart_ready) begin
+                uart_done <= 1'b1;
+                uart_rdata_latched <= uart_rdata;
+            end else if (!global_mem_stall) uart_done <= 1'b0;
+        end
     end
-    wire intc_stall = intc_valid && !intc_ready;
+    wire uart_stall = uart_valid && !uart_done;
+
+    // intc: same two-tier req/pending pattern as uart_mmio above
+    // has real registered latency, not instant ack like led/clint.
+    wire intc_valid = is_intc & (is_load | store_commits);
+    wire intc_req = intc_valid & ~intc_pending & ~intc_done;
+    reg intc_pending;
+    reg intc_done;
+    always @(posedge clk) begin
+        if (rst) begin
+            intc_pending <= 1'b0;
+            intc_done <= 1'b0;
+            intc_rdata_latched <= 32'b0;
+        end else begin
+            if (intc_req) intc_pending <= 1'b1;
+            else if (intc_ready) intc_pending <= 1'b0;
+
+            if (intc_ready) begin
+                intc_done <= 1'b1;
+                intc_rdata_latched <= intc_rdata;
+            end else if (!global_mem_stall) intc_done <= 1'b0;
+        end
+    end
+    wire intc_stall = intc_valid && !intc_done;
 
     assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall;
 
@@ -299,7 +359,7 @@ module cpu_pipelined (
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES),
-        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/main_cv7.mem")
+        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr.mem")
     ) TCM (
         .clk(clk), 
         .rst(rst), 
@@ -378,9 +438,11 @@ module cpu_pipelined (
         .mem_wline(dcache_mem_wline), 
         .mem_rline(dcache_mem_read_data_block), 
         .mem_ready(dcache_mem_ready)
-    ); 
+    );
 
-    //debug 
+    assign dmem_req_addr = dcache_mem_req_addr;
+
+    //debug
     assign debug_dcache_valid = dcache_valid;
     assign debug_dcache_ready = dcache_ready;
     assign debug_tcm_d_req = tcm_d_req;
@@ -817,8 +879,8 @@ module cpu_pipelined (
 
     assign final_mem_read_data = is_clint ? clint_rdata :
                                  is_led ? {28'b0, leds} :
-                                 is_uart ? uart_rdata :
-                                 is_intc ? intc_rdata :
+                                 is_uart ? uart_rdata_latched :
+                                 is_intc ? intc_rdata_latched :
                                             dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
@@ -1121,3 +1183,4 @@ module mem_wb_reg (
     end
 
 endmodule
+ 

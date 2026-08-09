@@ -1,0 +1,18 @@
+description: |
+  Custom UART (src/uart_mmio.v). 4 word-aligned registers in a single
+  0x10-byte block, offsets fixed in hardware (not independently
+  relocatable, so no reg-names): TX_DATA=0x0, TX_STATUS=0x4, RX_DATA=0x8,
+  RX_STATUS=0xC. TX_STATUS bit 0 = tx_ready, RX_STATUS bit 0 = rx_has_data.
+  Two interrupt sources on the parent rv32_5stage,intc: TX-complete
+  (edge-detected tx_ready 0->1) and RX-data-available (rx_valid pulse).
+
+compatible: "rv32_5stage,uart"
+
+include: [uart-controller.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true

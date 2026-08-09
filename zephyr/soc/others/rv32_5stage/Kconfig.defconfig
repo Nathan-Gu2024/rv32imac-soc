@@ -1,0 +1,45 @@
+# Custom RV32IMC 5-stage pipelined RISC-V SoC (FPGA soft-core)
+# SPDX-License-Identifier: Apache-2.0
+
+if SOC_RV32_5STAGE
+
+config SYS_CLOCK_HW_CYCLES_PER_SEC
+	default 50000000
+
+# Second-level interrupt support for src/intc.v (rv32_5stage,intc), which
+# aggregates peripheral IRQs (UART TX/RX today) behind the CPU's own
+# riscv,cpu-intc external interrupt line (IRQ 11). See
+# drivers/interrupt_controller/intc_rv32_5stage.c.
+config MULTI_LEVEL_INTERRUPTS
+	default y
+
+config 2ND_LEVEL_INTERRUPTS
+	default y
+
+# Level-1 IRQs are 0-11 (see NUM_IRQS comment below); level-2 storage
+# starts right after.
+config 2ND_LVL_ISR_TBL_OFFSET
+	default 12
+
+# rv32_5stage,intc's own (level-1, parent) IRQ is 11, the machine
+# external interrupt line - matches interrupts-extended = <&intc0 11>
+# on the intc1 devicetree node.
+config 2ND_LVL_INTR_00_OFFSET
+	default 11
+
+# src/intc.v's NUM_SOURCES parameter - fixed in hardware.
+config MAX_IRQ_PER_AGGREGATOR
+	default 8
+
+# Just the one rv32_5stage,intc instance.
+config NUM_2ND_LEVEL_AGGREGATORS
+	default 1
+
+# Only mip/mie bits 7 (MTIP/MTIE) and 11 (MEIP/MEIE) are wired up in
+# hardware (trap_controller.v), but riscv,cpu-intc addresses IRQ lines by
+# their standard mip/mie bit position, so level-1 needs to cover through
+# 11 (0-11 = 12 slots). 8 more for the level-2 aggregator behind IRQ 11.
+config NUM_IRQS
+	default 20
+
+endif # SOC_RV32_5STAGE

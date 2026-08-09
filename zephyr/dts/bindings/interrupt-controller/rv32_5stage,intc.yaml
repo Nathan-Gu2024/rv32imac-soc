@@ -1,0 +1,21 @@
+description: |
+  Custom single-level external-interrupt aggregator (src/intc.v). NOT a
+  PLIC - no priorities, no claim/complete. Just one shared ENABLE mask
+  register and one shared, edge-latched, write-1-to-clear PENDING
+  register, both 32 bits wide (though only the low NUM_SOURCES bits are
+  meaningful). Forwards to the CPU's own riscv,cpu-intc external
+  interrupt line (mip.MEIP/mie.MEIE, bit 11) via interrupts-extended.
+
+compatible: "rv32_5stage,intc"
+
+include: [interrupt-controller.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  "#interrupt-cells":
+    const: 1
+
+interrupt-cells:
+  - irq

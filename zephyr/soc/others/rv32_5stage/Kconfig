@@ -1,0 +1,18 @@
+# Custom RV32IMC 5-stage pipelined RISC-V SoC (FPGA soft-core)
+# SPDX-License-Identifier: Apache-2.0
+
+config SOC_RV32_5STAGE
+	select RISCV
+	select RISCV_PRIVILEGED
+	select RISCV_ISA_EXT_M
+	select RISCV_ISA_EXT_C
+	select RISCV_ISA_EXT_ZICSR
+	select INCLUDE_RESET_VECTOR
+
+if SOC_RV32_5STAGE
+
+# No mcycle/minstret CSRs implemented in csr_file.v yet - only
+# mstatus/mie/mip/mtvec/mepc/mcause. Leaving RISCV_ISA_EXT_ZICNTR unselected
+# so Zephyr doesn't assume a working cycle/time/instret counter.
+
+endif # SOC_RV32_5STAGE

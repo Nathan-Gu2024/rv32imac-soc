@@ -1,0 +1,12 @@
+description: |
+  LED_ADDR MMIO in cpu.v: a single 32-bit write-only register, low 4 bits
+  drive 4 discrete LEDs directly (no per-bit direction/read-back - modeled
+  as a 4-line output-only GPIO controller). No interrupt.
+
+compatible: "rv32_5stage,led-gpio"
+
+include: [gpio-controller.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true

@@ -1,0 +1,4 @@
+name: rv32_5stage
+build:
+  cmake: .
+  kconfig: Kconfig

@@ -111,12 +111,14 @@ module rom (
             6'd40: rom_out = 16'h5081; // divu (alu_sel=5'd17)
             6'd41: rom_out = 16'h5101; // rem  (alu_sel=5'd18)
             6'd42: rom_out = 16'h5181; // remu (alu_sel=5'd19)
+            6'd43: rom_out = 16'h1181; // sltu  (alu_sel=5'd3, same shape as slt but b_sel=reg not imm)
+            6'd44: rom_out = 16'h11C1; // sltiu (alu_sel=5'd3, same shape as slti but unsigned)
             default: rom_out = 16'h0000;
         endcase
     end
 
     always @(*) begin
-        reg_wen = rom_out[0];
+        reg_wen = rom_out[0];  
         imm_sel = rom_out[3:1];
         a_sel = rom_out[5];
         b_sel = rom_out[6];
@@ -159,6 +161,7 @@ module rom_decoder (
                 10'b01100_001_01: rom_address = 6'd4; // mulh
                 10'b01100_011_01: rom_address = 6'd5; // mulhu
                 10'b01100_010_00: rom_address = 6'd6; // slt
+                10'b01100_011_00: rom_address = 6'd43; // sltu
                 10'b01100_100_00: rom_address = 6'd7; // xor
                 10'b01100_101_00: rom_address = 6'd8; // srl
                 10'b01100_101_10: rom_address = 6'd9; // sra
@@ -184,6 +187,7 @@ module rom_decoder (
                 // I-Type ALU (f7 bits are part of immediate)
                 10'b00100_000_?_?: rom_address = 6'd15; // addi
                 10'b00100_010_?_?: rom_address = 6'd17; // slti
+                10'b00100_011_?_?: rom_address = 6'd44; // sltiu
                 10'b00100_100_?_?: rom_address = 6'd18; // xori
                 10'b00100_110_?_?: rom_address = 6'd21; // ori
                 10'b00100_111_?_?: rom_address = 6'd22; // andi

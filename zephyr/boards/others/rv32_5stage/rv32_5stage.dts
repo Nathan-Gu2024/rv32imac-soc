@@ -1,0 +1,129 @@
+/*
+ * Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+
+#include <mem.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "rv32_5stage";
+	compatible = "rv32_5stage";
+
+	chosen {
+		zephyr,sram = &ram0;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "riscv";
+			reg = <0>;
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i", "m", "c", "zicsr";
+			status = "okay";
+
+			intc0: interrupt-controller {
+				compatible = "riscv,cpu-intc";
+				interrupt-controller;
+				#address-cells = <0>;
+				#interrupt-cells = <1>;
+			};
+		};
+	};
+
+	/*
+	 * DDR3 via S_AXI_HP0 (see axi_cache_adapter.v / icache.v / dcache.v).
+	 * Zephyr's image runs entirely out of here - the CPU's reset vector
+	 * is fixed at TCM_BASE (0x4000_0000) in program_counter, so a small
+	 * hand-written boot stub baked into TCM (outside of Zephyr's own
+	 * build/devicetree, see fpga/ddr.mem) jumps here before Zephyr's own
+	 * _start ever runs. TCM itself is intentionally NOT described here
+	 * since Zephyr never touches it directly once running.
+	 */
+	ram0: memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 DT_SIZE_M(512)>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		interrupt-parent = <&intc0>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * clint_timer.v: mtime/mtimecmp only (no msip - software
+		 * interrupts aren't implemented), so this uses the generic
+		 * riscv,machine-timer binding rather than the full
+		 * sifive,clint0 (which also expects an MSIP region).
+		 * mip.MTIP/mie.MTIE are bit 7, the standard position.
+		 */
+		mtimer: timer@2000000 {
+			compatible = "riscv,machine-timer";
+			reg = <0x02000000 0x8 0x02000008 0x8>;
+			reg-names = "mtime", "mtimecmp";
+			interrupts-extended = <&intc0 7>;
+			status = "okay";
+		};
+
+		/*
+		 * intc.v: a single-level external-interrupt aggregator, NOT
+		 * a PLIC (no priorities/claim-complete - just one shared
+		 * ENABLE mask and one shared, write-1-to-clear PENDING
+		 * register). Needs a custom driver; peripherals with an
+		 * interrupt line (uart0) sit underneath it, and it forwards
+		 * to the CPU's external line, mip.MEIP/mie.MEIE (bit 11).
+		 */
+		intc1: interrupt-controller@4000 {
+			compatible = "rv32_5stage,intc";
+			reg = <0x00004000 0x8>;
+			reg-names = "enable_pending";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupts-extended = <&intc0 11>;
+			status = "okay";
+		};
+
+		/*
+		 * uart_mmio.v. Needs a custom driver - register layout is
+		 * TX_DATA/TX_STATUS/RX_DATA/RX_STATUS, not a standard 16550
+		 * or similar. Source 0 (TX-complete) and source 1 (RX-data)
+		 * on intc1.
+		 */
+		uart0: serial@40001000 {
+			compatible = "rv32_5stage,uart";
+			reg = <0x40001000 0x10>;
+			interrupt-parent = <&intc1>;
+			interrupts = <0>, <1>;
+			interrupt-names = "tx", "rx";
+			current-speed = <115200>;
+			status = "okay";
+		};
+
+		/*
+		 * LED_ADDR in cpu.v - single-cycle MMIO write, low 4 bits.
+		 * No interrupt. Needs a custom gpio-style driver if used
+		 * from Zephyr (e.g. via gpio-leds); not required for basic
+		 * console/timer/interrupt bring-up.
+		 */
+		leds0: gpio@2000 {
+			compatible = "rv32_5stage,led-gpio";
+			reg = <0x00002000 0x4>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <4>;
+			status = "okay";
+		};
+	};
+};

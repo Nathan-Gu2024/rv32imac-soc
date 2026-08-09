@@ -1,0 +1,10 @@
+# Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+# SPDX-License-Identifier: Apache-2.0
+
+# No separate flash - the whole Zephyr image runs out of DDR (loaded via
+# xsdb dow, same as every other DDR test program in this project so far).
+CONFIG_XIP=n
+
+CONFIG_SERIAL=y
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y

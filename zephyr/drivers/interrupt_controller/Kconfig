@@ -1,0 +1,28 @@
+# Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+# Second-level interrupt aggregator (src/intc.v).
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig INTC_RV32_5STAGE
+	bool "RV32 5-stage custom interrupt controller"
+	default y
+	depends on DT_HAS_RV32_5STAGE_INTC_ENABLED
+	depends on MULTI_LEVEL_INTERRUPTS
+	select 2ND_LEVEL_INTERRUPTS
+	help
+	  Second-level interrupt aggregator for src/intc.v: one shared
+	  enable mask and one shared, edge-latched, write-1-to-clear
+	  pending register, feeding the CPU's own riscv,cpu-intc external
+	  interrupt line (mip.MEIP, IRQ 11). Not a PLIC - no priorities,
+	  no claim/complete.
+
+if INTC_RV32_5STAGE
+
+config INTC_RV32_5STAGE_INIT_PRIORITY
+	int "Init priority"
+	default 0
+	help
+	  Must initialize (and enable its own level-1 IRQ) before any
+	  device behind it - e.g. the UART in interrupt-driven mode -
+	  tries to enable its own line.
+
+endif # INTC_RV32_5STAGE

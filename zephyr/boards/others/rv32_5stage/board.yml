@@ -1,0 +1,6 @@
+board:
+  name: rv32_5stage
+  full_name: RV32IMC 5-Stage Pipelined RISC-V (Zynq-7020 FPGA soft-core)
+  vendor: others
+  socs:
+    - name: rv32_5stage
