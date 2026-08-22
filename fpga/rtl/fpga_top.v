@@ -4,7 +4,7 @@ module fpga_top #(
     parameter AXI_DATA_WIDTH = 64
 )(
     input wire clk,
-    input wire rst,          
+    input wire rst,
 
     // Physical UART pins - driven/read directly by cpu_pipelined's internal
     // uart_mmio peripheral (MMIO at 0x4000_1000; see uart_mmio.v).
@@ -50,9 +50,6 @@ module fpga_top #(
     output wire m_axi_bready
 );
 
-    // Internal reset is active-high.
-//    wire rst = ~rst_n;
-
     // CPU I-cache lower-memory line interface
     wire icache_req_valid;
     wire [31:0] icache_req_addr;
@@ -76,24 +73,31 @@ module fpga_top #(
     wire mem_ready;
 
     wire [3:0] cpu_leds;
-    wire [31:0] debug_pc, debug_instr;
+    // ILA probes for tracing PC/instruction/memory-stall behavior.
+    (* mark_debug = "true" *) wire [31:0] debug_pc, debug_instr;
 
-    wire debug_dcache_valid;
+    (* mark_debug = "true" *) wire debug_dcache_valid;
     wire debug_dcache_ready;
-    wire debug_tcm_d_req;
-    wire debug_tcm_d_ready;
-    wire debug_global_mem_stall;
-    
+    (* mark_debug = "true" *) wire debug_tcm_d_req;
+    (* mark_debug = "true" *) wire debug_tcm_d_ready;
+    (* mark_debug = "true" *) wire debug_global_mem_stall;
+    (* mark_debug = "true" *) wire [31:0] debug_raw_pc;
+    (* mark_debug = "true" *) wire debug_id_predicted_taken;
+    (* mark_debug = "true" *) wire debug_cache_ready;
+
     cpu_pipelined CPU_CORE (
         .debug_pc(debug_pc),
-        .debug_instr(debug_instr), 
+        .debug_instr(debug_instr),
         .debug_dcache_valid(debug_dcache_valid),
         .debug_dcache_ready(debug_dcache_ready),
-        .debug_tcm_d_req(debug_tcm_d_req), 
-        .debug_tcm_d_ready(debug_tcm_d_ready), 
-        .debug_global_mem_stall(debug_global_mem_stall), 
-        
-        
+        .debug_tcm_d_req(debug_tcm_d_req),
+        .debug_tcm_d_ready(debug_tcm_d_ready),
+        .debug_global_mem_stall(debug_global_mem_stall),
+        .debug_raw_pc(debug_raw_pc),
+        .debug_id_predicted_taken(debug_id_predicted_taken),
+        .debug_cache_ready(debug_cache_ready),
+
+
         .clk(clk),
         .rst(rst),
 
@@ -187,51 +191,15 @@ module fpga_top #(
         .m_axi_bvalid(m_axi_bvalid),
         .m_axi_bready(m_axi_bready)
     );
-    reg [26:0] heartbeat; 
+    (* mark_debug = "true" *) reg [26:0] heartbeat;
     always @(posedge clk) begin
-        if (rst) 
+        if (rst)
             heartbeat <= 27'd0;
         else
             heartbeat <= heartbeat + 1'b1;
-    end     
-    
-    reg seen_dcache_valid;
-    reg seen_tcm_d_req;
-    reg seen_tcm_d_ready;
-    always @(posedge clk) begin
-        if (rst) begin
-            seen_dcache_valid <= 1'b0;
-            seen_tcm_d_req <= 1'b0;
-            seen_tcm_d_ready <= 1'b0;
-        end else begin
-            if (debug_dcache_valid)
-                seen_dcache_valid <= 1'b1;
-            if (debug_tcm_d_req)
-                seen_tcm_d_req <= 1'b1;
-            if (debug_tcm_d_ready)
-                seen_tcm_d_ready <= 1'b1;
-        end
-    end
-    
-    reg [31:0] counter;
-
-    always @(posedge clk) begin
-        if (rst)
-            counter <= 0;
-        else
-            counter <= counter + 1;
     end
 
-//    assign leds = counter[27:24];
-    
-//    assign leds[3] = heartbeat[25];
-
-//    assign leds[2] = seen_dcache_valid;
-//    assign leds[1] = seen_tcm_d_req;
-//    assign leds[0] = seen_tcm_d_ready;
-    
-     assign leds[3:0] = cpu_leds[3:0];
-//    assign leds[2:0] = debug_instr[2:0];
+    assign leds[3:0] = cpu_leds[3:0];
 
 //    assign leds[2] = debug_pc[4];
 //    assign leds[1] = debug_pc[3];

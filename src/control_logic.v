@@ -6,12 +6,12 @@ module control_logic (
     output wire [4:0] alu_sel,
     output wire out_is_lr, out_is_sc, out_is_amo,
     output wire [4:0] out_atomic_op,
-    output wire csr_wen, 
+    output wire csr_wen,
 
-    output wire [1:0] csr_op, 
-    output wire csr_use_imm, 
+    output wire [1:0] csr_op,
+    output wire csr_use_imm,
     output wire [4:0] csr_uimm
-    
+
 );
 
     wire [5:0] rom_address;
@@ -20,7 +20,7 @@ module control_logic (
     wire is_lr = is_atomic_inst && (atomic_funct5 == 5'b00010);
     wire is_sc = is_atomic_inst && (atomic_funct5 == 5'b00011);
     wire is_amo = is_atomic_inst && !is_lr && !is_sc;
-    
+
     wire is_system_inst = (inst[6:0] == 7'b1110011);
 
     rom_decoder decoder (
@@ -38,7 +38,7 @@ module control_logic (
         .imm_sel(imm_sel),
         .alu_sel(alu_sel)
     );
-    
+
     assign out_is_lr = is_lr;
     assign out_is_sc = is_sc;
     assign out_is_amo = is_amo;
@@ -51,7 +51,7 @@ module control_logic (
     // If funct3 bit 2 is high (101, 110, 111), it's an immediate variant
     assign csr_use_imm = is_system_inst && csr_funct3[2];
     assign csr_uimm = inst[19:15]; // The 5-bit unsigned immediate field
-    
+
 endmodule
 
 module rom (
@@ -103,7 +103,7 @@ module rom (
             6'd34: rom_out = 16'h2069; // jal
             6'd35: rom_out = 16'h2041; // jalr
             6'd36: rom_out = 16'h004F; // lr.w
-            6'd37: rom_out = 16'h184F; // sc.w 
+            6'd37: rom_out = 16'h184F; // sc.w
             6'd38: rom_out = 16'h8030; // csrrw
             // bit14 is the new alu_sel[4] bit (was spare/0 in every entry above,
             // so none of the existing 39 entries change meaning).
@@ -118,7 +118,7 @@ module rom (
     end
 
     always @(*) begin
-        reg_wen = rom_out[0];  
+        reg_wen = rom_out[0];
         imm_sel = rom_out[3:1];
         a_sel = rom_out[5];
         b_sel = rom_out[6];
@@ -148,10 +148,14 @@ module rom_decoder (
             else if (funct5 == 5'b00011)
                 rom_address = 6'd37; // sc.w
             else
-                rom_address = 6'd0; // Fallback for AMO (add) until implemented / needed
+                // Every real AMO variant shares LR.W's control word
+                // (address=rs1, mem_rw=0, wb_sel=MEM) - the AMO sequencer in
+                // cpu.v owns write timing itself and picks the actual op
+                // from is_amo/atomic_op, decoded separately above.
+                rom_address = 6'd36; // share lr.w's control word
         end else if (inst[6:2] == 5'b11100) begin
-            rom_address = 6'd0; 
-        end else begin 
+            rom_address = 6'd0;
+        end else begin
             casex ({opcode, funct3, f7_bit5, f7_bit0})
                 // R-Types (All bits matter)
                 10'b01100_000_00: rom_address = 6'd0; // add
@@ -183,7 +187,7 @@ module rom_decoder (
                 10'b01000_000_?_?: rom_address = 6'd23; // sb
                 10'b01000_001_?_?: rom_address = 6'd24; // sh
                 10'b01000_010_?_?: rom_address = 6'd25; // sw
-                
+
                 // I-Type ALU (f7 bits are part of immediate)
                 10'b00100_000_?_?: rom_address = 6'd15; // addi
                 10'b00100_010_?_?: rom_address = 6'd17; // slti
@@ -191,12 +195,12 @@ module rom_decoder (
                 10'b00100_100_?_?: rom_address = 6'd18; // xori
                 10'b00100_110_?_?: rom_address = 6'd21; // ori
                 10'b00100_111_?_?: rom_address = 6'd22; // andi
-                
+
                 // I-Type Shifts (f7_bit5 is a modifier, f7_bit0 mask to be safe)
                 10'b00100_001_0_?: rom_address = 6'd16; // slli
                 10'b00100_101_0_?: rom_address = 6'd19; // srli
                 10'b00100_101_1_?: rom_address = 6'd20; // srai
-                
+
                 // B-Type Branches (f7 bits are part of immediate)
                 10'b11000_000_?_?: rom_address = 6'd26; // beq
                 10'b11000_001_?_?: rom_address = 6'd27; // bne
@@ -204,17 +208,17 @@ module rom_decoder (
                 10'b11000_101_?_?: rom_address = 6'd29; // bge
                 10'b11000_110_?_?: rom_address = 6'd30; // bltu
                 10'b11000_111_?_?: rom_address = 6'd31; // bgeu
-                
+
                 // U-Type and J-Type (funct3 and f7 bits are all part of immediate)
                 10'b00101_???_?_?: rom_address = 6'd32; // auipc
                 10'b01101_???_?_?: rom_address = 6'd33; // lui
                 10'b11011_???_?_?: rom_address = 6'd34; // jal
-                
+
                 // JALR (I-Type, funct3 is 000)
                 10'b11001_000_?_?: rom_address = 6'd35; // jalr
-                
+
                 default: rom_address = 6'd0;
             endcase
-        end 
+        end
     end
 endmodule

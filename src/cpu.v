@@ -27,13 +27,13 @@ module cpu_pipelined (
     input wire uart_rx,
     output reg [3:0] leds,
 
-    output wire [31:0] icache_mem_req_addr, 
-    output wire icache_mem_req_valid, 
-    input wire [127:0] icache_mem_read_data, 
-    input wire icache_mem_ready, 
-    
-    output wire [31:0] dmem_req_addr, 
-    output wire [31:0] store_data, 
+    output wire [31:0] icache_mem_req_addr,
+    output wire icache_mem_req_valid,
+    input wire [127:0] icache_mem_read_data,
+    input wire icache_mem_ready,
+
+    output wire [31:0] dmem_req_addr,
+    output wire [31:0] store_data,
     output wire [3:0] mem_write_mask,
 
     // D-cache lower-memory line interface
@@ -42,15 +42,19 @@ module cpu_pipelined (
     output wire [127:0] dcache_mem_wline,
     input wire [127:0] dcache_mem_read_data_block,
     input wire dcache_mem_ready,
-    
-    // debug
-    output wire [31:0] debug_pc, 
-    output wire [31:0] debug_instr, 
+
+    // debug (ILA probes; debug_pc/debug_instr are the ID-stage pc/inst,
+    // debug_raw_pc is one stage earlier - the raw IF-stage fetch)
+    output wire [31:0] debug_pc,
+    output wire [31:0] debug_instr,
     output wire debug_dcache_valid,
     output wire debug_dcache_ready,
     output wire debug_tcm_d_req,
     output wire debug_tcm_d_ready,
-    output wire debug_global_mem_stall
+    output wire debug_global_mem_stall,
+    output wire [31:0] debug_raw_pc,
+    output wire debug_id_predicted_taken,
+    output wire debug_cache_ready
 );
     // Control / stalls
     wire stall;
@@ -68,6 +72,8 @@ module cpu_pipelined (
     wire is_compressed;
     wire actual_pc_sel;
 
+    wire [31:0] ex_redirect_target;
+
     // icache
     wire cache_ready;
     wire icache_valid;
@@ -84,6 +90,11 @@ module cpu_pipelined (
     wire [31:0] rs2_data;
     wire [31:0] imm;
     wire pc_sel;
+
+    // Static branch prediction, computed in ID (see assigns below for why).
+    wire id_is_branch;
+    wire id_predicted_taken;
+    wire [31:0] id_predicted_target;
     wire reg_wen;
     wire a_sel;
     wire b_sel;
@@ -95,14 +106,15 @@ module cpu_pipelined (
     wire [2:0] imm_sel;
     wire [4:0] alu_sel;
     wire [4:0] atomic_op;
-    wire csr_wen; 
-    wire [1:0] csr_op; 
-    wire csr_use_imm; 
-    wire [4:0] csr_uimm; 
+    wire csr_wen;
+    wire [1:0] csr_op;
+    wire csr_use_imm;
+    wire [4:0] csr_uimm;
 
     // ID/EX
     wire id_ex_compressed;
     wire id_ex_valid;
+    wire id_ex_predicted_taken;
     wire [31:0] id_ex_pc;
     wire [31:0] id_ex_rs1;
     wire [31:0] id_ex_rs2;
@@ -119,11 +131,11 @@ module cpu_pipelined (
     wire id_ex_is_amo;
     wire [1:0] id_ex_wb_sel;
     wire [4:0] id_ex_alu_sel;
-    wire id_ex_csr_wen; 
-    wire [1:0] id_ex_csr_op; 
-    wire id_ex_csr_use_imm; 
+    wire id_ex_csr_wen;
+    wire [1:0] id_ex_csr_op;
+    wire id_ex_csr_use_imm;
     wire [4:0] id_ex_csr_uimm;
- 
+
     // EX
     wire [31:0] alu_a;
     wire [31:0] alu_b;
@@ -151,6 +163,9 @@ module cpu_pipelined (
     wire id_ex_is_bgeu;
     wire id_ex_is_jal;
     wire id_ex_is_jalr;
+    wire branch_actual_taken;
+    wire branch_mispredicted;
+    wire [31:0] id_ex_pc_plus_inc;
     wire id_ex_br_eq;
     wire id_ex_br_lt;
     wire ex_is_csrrw;
@@ -227,7 +242,7 @@ module cpu_pipelined (
     wire mem_wb_reg_wen;
     wire [1:0] mem_wb_wb_sel;
 
-    // WB 
+    // WB
     wire [31:0] wb_data;
 
     // Cache / memory stall control
@@ -253,22 +268,29 @@ module cpu_pipelined (
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;
 
-    // Don't decode all 0x4xxxxxxx as MMIO because that
-    // collides with the TCM region at 0x4000_0000
-    // led/clint ack instantly, needs its own req/ready handshake
+    // Narrow masks, not a whole 0x4xxxxxxx page match - that would collide
+    // with the TCM region at 0x4000_0000. led/clint ack instantly; uart/intc
+    // need their own req/ready handshake (see below).
     assign is_led = (ex_mem_alu == LED_ADDR);
     assign is_uart = ((ex_mem_alu & UART_MMIO_MASK) == UART_MMIO_BASE);
     assign is_clint = ((ex_mem_alu & CLINT_MASK) == CLINT_BASE);
     assign is_intc = ((ex_mem_alu & INTC_MMIO_MASK) == INTC_MMIO_BASE);
     assign is_mmio = is_led | is_clint;
 
-    assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen;
+    // AMO's ROM entry shares wb_sel=00/reg_wen=1 with plain loads (it reuses
+    // the load writeback path to return the old value) - exclude it here so
+    // it doesn't also match is_load, which would otherwise make uart_valid/
+    // intc_valid (which key off is_load directly) fire a spurious peripheral
+    // read for an AMO targeting a UART/INTC address.
+    assign is_load = (ex_mem_wb_sel == 2'b00) && ex_mem_reg_wen && ~ex_mem_is_amo;
     assign is_store = ex_mem_mem_rw;
     assign store_commits = is_store && (~ex_mem_is_sc || sc_success_flag);
 
-    // TCM accesses go into dcache.v which bypass the cache and forward to tcm.v
-    assign dcache_ren = is_load & ~is_mmio & ~is_uart & ~is_intc;
-    assign dcache_wen = store_commits & ~is_mmio & ~is_uart & ~is_intc;
+    // No explicit TCM check needed here - dcache.v routes TCM-range
+    // addresses to tcm.v internally, bypassing the cache transparently.
+    wire mem_addr_is_cacheable = ~is_mmio & ~is_uart & ~is_intc;
+    assign dcache_ren = (is_load | amo_read_phase) & mem_addr_is_cacheable;
+    assign dcache_wen = (store_commits | amo_write_phase) & mem_addr_is_cacheable;
     assign dcache_valid = dcache_ren || dcache_wen;
     assign dmem_stall = dcache_valid && !dcache_ready;
 
@@ -345,12 +367,12 @@ module cpu_pipelined (
     end
     wire intc_stall = intc_valid && !intc_done;
 
-    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall;
+    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall | amo_stall;
 
     // TCM
     wire tcm_i_req, tcm_i_ready;
     wire [31:0] tcm_i_addr, tcm_i_rdata;
-    
+
     wire tcm_d_req, tcm_d_we, tcm_d_ready;
     wire [31:0] tcm_d_addr, tcm_d_wdata, tcm_d_rdata;
     wire [3:0] tcm_d_wmask;
@@ -359,84 +381,84 @@ module cpu_pipelined (
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES),
-        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr.mem")
+        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr_fixed.mem")
     ) TCM (
-        .clk(clk), 
-        .rst(rst), 
+        .clk(clk),
+        .rst(rst),
 
-        .i_req(tcm_i_req), 
-        .i_addr(tcm_i_addr), 
-        .i_rdata(tcm_i_rdata), 
-        .i_ready(tcm_i_ready), 
+        .i_req(tcm_i_req),
+        .i_addr(tcm_i_addr),
+        .i_rdata(tcm_i_rdata),
+        .i_ready(tcm_i_ready),
 
-        .d_req(tcm_d_req), 
-        .d_we(tcm_d_we), 
-        .d_addr(tcm_d_addr), 
-        .d_wdata(tcm_d_wdata), 
-        .d_wmask(tcm_d_wmask), 
-        .d_rdata(tcm_d_rdata), 
+        .d_req(tcm_d_req),
+        .d_we(tcm_d_we),
+        .d_addr(tcm_d_addr),
+        .d_wdata(tcm_d_wdata),
+        .d_wmask(tcm_d_wmask),
+        .d_rdata(tcm_d_rdata),
         .d_ready(tcm_d_ready)
-    ); 
+    );
 
     icache #(
-        .ADDR_WIDTH(32), 
-        .LINE_BYTES(16), 
-        .NUM_SETS(64), 
-        .NUM_WAYS(2), 
-        .TCM_BASE(TCM_BASE), 
+        .ADDR_WIDTH(32),
+        .LINE_BYTES(16),
+        .NUM_SETS(64),
+        .NUM_WAYS(2),
+        .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) ICACHE (
-        .clk(clk), 
+        .clk(clk),
         .rst(rst),
-        
-        .cpu_req_valid(icache_valid), 
-        .cpu_req_addr(pc), 
-        .cpu_rdata(if_inst), 
-        .cpu_ready(cache_ready), 
 
-        .tcm_req_valid(tcm_i_req), 
-        .tcm_req_addr(tcm_i_addr), 
-        .tcm_rdata(tcm_i_rdata), 
+        .cpu_req_valid(icache_valid),
+        .cpu_req_addr(pc),
+        .cpu_rdata(if_inst),
+        .cpu_ready(cache_ready),
+
+        .tcm_req_valid(tcm_i_req),
+        .tcm_req_addr(tcm_i_addr),
+        .tcm_rdata(tcm_i_rdata),
         .tcm_ready(tcm_i_ready),
 
-        .mem_req_valid(icache_mem_req_valid), 
-        .mem_req_addr(icache_mem_req_addr), 
-        .mem_rline(icache_mem_read_data), 
+        .mem_req_valid(icache_mem_req_valid),
+        .mem_req_addr(icache_mem_req_addr),
+        .mem_rline(icache_mem_read_data),
         .mem_ready(icache_mem_ready)
-    ); 
+    );
 
     dcache #(
-        .ADDR_WIDTH(32), 
-        .LINE_BYTES(16), 
-        .NUM_SETS(64), 
-        .NUM_WAYS(2), 
-        .TCM_BASE(TCM_BASE), 
+        .ADDR_WIDTH(32),
+        .LINE_BYTES(16),
+        .NUM_SETS(64),
+        .NUM_WAYS(2),
+        .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) DCACHE (
-        .clk(clk), 
+        .clk(clk),
         .rst(rst),
 
-        .cpu_req_valid(dcache_valid), 
-        .cpu_req_write(dcache_wen), 
-        .cpu_req_addr(ex_mem_alu), 
-        .cpu_wdata(store_data), 
+        .cpu_req_valid(dcache_valid),
+        .cpu_req_write(dcache_wen),
+        .cpu_req_addr(ex_mem_alu),
+        .cpu_wdata(store_data),
         .cpu_wmask(mem_write_mask),
-        .cpu_rdata(dcache_read_data), 
-        .cpu_ready(dcache_ready), 
+        .cpu_rdata(dcache_read_data),
+        .cpu_ready(dcache_ready),
 
         .tcm_req_valid(tcm_d_req),
-        .tcm_req_write(tcm_d_we), 
-        .tcm_req_addr(tcm_d_addr), 
-        .tcm_wdata(tcm_d_wdata), 
+        .tcm_req_write(tcm_d_we),
+        .tcm_req_addr(tcm_d_addr),
+        .tcm_wdata(tcm_d_wdata),
         .tcm_wmask(tcm_d_wmask),
-        .tcm_rdata(tcm_d_rdata), 
-        .tcm_ready(tcm_d_ready), 
+        .tcm_rdata(tcm_d_rdata),
+        .tcm_ready(tcm_d_ready),
 
-        .mem_req_valid(dcache_mem_req_valid), 
-        .mem_req_write(dcache_mem_req_write), 
-        .mem_req_addr(dcache_mem_req_addr), 
-        .mem_wline(dcache_mem_wline), 
-        .mem_rline(dcache_mem_read_data_block), 
+        .mem_req_valid(dcache_mem_req_valid),
+        .mem_req_write(dcache_mem_req_write),
+        .mem_req_addr(dcache_mem_req_addr),
+        .mem_wline(dcache_mem_wline),
+        .mem_rline(dcache_mem_read_data_block),
         .mem_ready(dcache_mem_ready)
     );
 
@@ -447,8 +469,8 @@ module cpu_pipelined (
     assign debug_dcache_ready = dcache_ready;
     assign debug_tcm_d_req = tcm_d_req;
     assign debug_tcm_d_ready = tcm_d_ready;
-    assign debug_global_mem_stall = global_mem_stall;    
-    
+    assign debug_global_mem_stall = global_mem_stall;
+
     // IF
     assign raw_inst = if_inst;
 
@@ -462,14 +484,21 @@ module cpu_pipelined (
     assign final_inst = is_compressed ? inst_expanded : raw_inst;
     assign muxed_if_inst = final_inst;
     assign pc_inc = is_compressed ? 32'd2 : 32'd4;
-    assign actual_pc_sel = pc_trap_override | pc_sel;
-    assign actual_jump_target = pc_trap_override ? trap_target_pc : alu_out;
+
+    // Priority: trap (highest) > EX-stage redirect (misprediction fixup or
+    // an unconditional jump - always correct, since it belongs to an
+    // older instruction than whatever IF is currently fetching) > this
+    // cycle's own ID-stage static prediction > sequential fetch (lowest).
+    assign actual_pc_sel = pc_trap_override | pc_sel | id_predicted_taken;
+    assign actual_jump_target = pc_trap_override ? trap_target_pc :
+                                 pc_sel           ? ex_redirect_target :
+                                                     id_predicted_target;
     program_counter PC (
-        .clk(clk), 
+        .clk(clk),
         .rst(rst),
-        .stall(stall | global_mem_stall), 
-        .pc_sel(actual_pc_sel), 
-        .mem_address(actual_jump_target), 
+        .stall(stall | global_mem_stall),
+        .pc_sel(actual_pc_sel),
+        .mem_address(actual_jump_target),
         .pc_inc(pc_inc),
         .pc(pc)
     );
@@ -479,7 +508,7 @@ module cpu_pipelined (
         .rst(rst),
         .stall(stall),
         .mem_stall(global_mem_stall),
-        .flush(pc_sel | flush_if),
+        .flush(pc_sel | flush_if | id_predicted_taken),
         .pc_in(pc),
         .inst_in(muxed_if_inst),
         .compressed_in(is_compressed),
@@ -488,43 +517,58 @@ module cpu_pipelined (
         .compressed_out(if_id_compressed),
         .valid_out(if_id_valid)
     );
-    
+
+    // Static branch prediction: backward-taken/forward-not-taken, off the
+    // already-latched if_id_inst/imm (no same-cycle icache/TCM fetch
+    // dependency). Only conditional branches are predicted; JAL/JALR stay
+    // unconditional, always-redirect from EX. Gated by ~stall so a
+    // load-use-stalled branch isn't evicted as a bubble by if_id_reg's
+    // flush-beats-stall priority before it can be re-presented, and by
+    // ~global_mem_stall so the redirect never asserts mid-transaction.
+    assign id_is_branch = (if_id_inst[6:0] == 7'b1100011);
+    assign id_predicted_taken = id_is_branch & imm[31] & ~stall & ~global_mem_stall;
+    assign id_predicted_target = if_id_pc + imm;
+
     assign debug_instr = if_id_inst;
+    assign debug_pc = if_id_pc; // pairs with debug_instr - same if_id stage
+    assign debug_raw_pc = pc;
+    assign debug_id_predicted_taken = id_predicted_taken;
+    assign debug_cache_ready = cache_ready;
 
     // ID
     control_logic CL (
-        .inst(if_id_inst), 
-        .reg_wen(reg_wen), 
-        .imm_sel(imm_sel), 
-        .a_sel(a_sel), 
+        .inst(if_id_inst),
+        .reg_wen(reg_wen),
+        .imm_sel(imm_sel),
+        .a_sel(a_sel),
         .b_sel(b_sel),
         .alu_sel(alu_sel),
-        .mem_rw(mem_rw), 
+        .mem_rw(mem_rw),
         .wb_sel(wb_sel),
         .out_is_lr(is_lr),
         .out_is_sc(is_sc),
         .out_is_amo(is_amo),
         .out_atomic_op(atomic_op),
         .csr_wen(csr_wen),
-        .csr_op(csr_op), 
+        .csr_op(csr_op),
         .csr_use_imm(csr_use_imm),
         .csr_uimm(csr_uimm)
     );
 
     regfile RF (
-        .clk(clk), 
-        .reg_wen(mem_wb_reg_wen), 
+        .clk(clk),
+        .reg_wen(mem_wb_reg_wen),
         .read_index1(if_id_inst[19:15]),
         .read_index2(if_id_inst[24:20]),
-        .write_index(mem_wb_rd), 
-        .write_data(wb_data), 
+        .write_index(mem_wb_rd),
+        .write_data(wb_data),
         .read_data1(rs1_data),
         .read_data2(rs2_data)
     );
 
     immgen IMM (
-        .inst(if_id_inst), 
-        .imm_sel(imm_sel), 
+        .inst(if_id_inst),
+        .imm_sel(imm_sel),
         .imm(imm)
     );
 
@@ -541,46 +585,48 @@ module cpu_pipelined (
         .rd_in(if_id_inst[11:7]),
         .inst_in(if_id_inst),
         .compressed_in(if_id_compressed),
-        .reg_wen_in(reg_wen), 
+        .predicted_taken_in(id_predicted_taken),
+        .reg_wen_in(reg_wen),
         .mem_rw_in(mem_rw),
-        .a_sel_in(a_sel), 
-        .b_sel_in(b_sel), 
+        .a_sel_in(a_sel),
+        .b_sel_in(b_sel),
         .wb_sel_in(wb_sel),
-        .alu_sel_in(alu_sel), 
-        .is_lr_in(is_lr), 
-        .is_sc_in(is_sc), 
-        .is_amo_in(is_amo), 
-        .atomic_op_in(atomic_op), 
+        .alu_sel_in(alu_sel),
+        .is_lr_in(is_lr),
+        .is_sc_in(is_sc),
+        .is_amo_in(is_amo),
+        .atomic_op_in(atomic_op),
         .csr_wen_in(csr_wen),
         .csr_op_in(csr_op),
         .csr_use_imm_in(csr_use_imm),
         .csr_uimm_in(csr_uimm),
         .valid_in(if_id_valid),
         .is_lr_out(id_ex_is_lr),
-        .is_sc_out(id_ex_is_sc), 
-        .is_amo_out(id_ex_is_amo), 
-        .atomic_op_out(id_ex_atomic_op), 
+        .is_sc_out(id_ex_is_sc),
+        .is_amo_out(id_ex_is_amo),
+        .atomic_op_out(id_ex_atomic_op),
         .csr_wen_out(id_ex_csr_wen),
         .csr_op_out(id_ex_csr_op),
         .csr_use_imm_out(id_ex_csr_use_imm),
         .csr_uimm_out(id_ex_csr_uimm),
-        .pc_out(id_ex_pc), 
-        .rs1_out(id_ex_rs1), 
-        .rs2_out(id_ex_rs2), 
-        .imm_out(id_ex_imm), 
-        .rd_out(id_ex_rd), 
-        .inst_out(id_ex_inst), 
-        .reg_wen_out(id_ex_reg_wen), 
+        .pc_out(id_ex_pc),
+        .rs1_out(id_ex_rs1),
+        .rs2_out(id_ex_rs2),
+        .imm_out(id_ex_imm),
+        .rd_out(id_ex_rd),
+        .inst_out(id_ex_inst),
+        .reg_wen_out(id_ex_reg_wen),
         .mem_rw_out(id_ex_mem_rw),
         .a_sel_out(id_ex_a_sel),
         .b_sel_out(id_ex_b_sel),
         .wb_sel_out(id_ex_wb_sel),
         .alu_sel_out(id_ex_alu_sel),
         .compressed_out(id_ex_compressed),
+        .predicted_taken_out(id_ex_predicted_taken),
         .valid_out(id_ex_valid)
     );
 
-    // EX 
+    // EX
     // Forwarding
     // SC writes 0/1 to rd
     // JAL/JALR write PC+4, or PC+2 if the original instruction was compressed,
@@ -591,13 +637,13 @@ module cpu_pipelined (
                                  ex_mem_alu;
 
     assign fwd_rs1 = (fwd_a == 2'b01) ? ex_mem_forward_data :
-                    (fwd_a == 2'b10) ? wb_data : 
+                    (fwd_a == 2'b10) ? wb_data :
                     id_ex_rs1;
 
     assign fwd_rs2 = (fwd_b == 2'b01) ? ex_mem_forward_data :
-                    (fwd_b == 2'b10) ? wb_data : 
+                    (fwd_b == 2'b10) ? wb_data :
                     id_ex_rs2;
-    
+
     assign alu_a = id_ex_a_sel ? id_ex_pc : fwd_rs1;
     assign alu_b = id_ex_b_sel ? id_ex_imm : fwd_rs2;
 
@@ -662,29 +708,50 @@ module cpu_pipelined (
         .br_lt(id_ex_br_lt)
     );
 
-    assign pc_sel = (id_ex_br_eq & id_ex_is_beq) |
+    // Whether this conditional branch (if it is one) actually resolves
+    // taken, independent of what was predicted back in ID.
+    assign branch_actual_taken = (id_ex_br_eq & id_ex_is_beq) |
                 (~id_ex_br_eq & id_ex_is_bne) |
                 (id_ex_br_lt & (id_ex_is_blt | id_ex_is_bltu)) |
-                (~id_ex_br_lt & (id_ex_is_bge | id_ex_is_bgeu)) |
-                id_ex_is_jal | id_ex_is_jalr;
+                (~id_ex_br_lt & (id_ex_is_bge | id_ex_is_bgeu));
+
+    // Only conditional branches can be mispredicted (JAL/JALR were never
+    // predicted in the first place - id_ex_predicted_taken is always 0
+    // for them, since id_is_branch in ID only fires for opcode 1100011).
+    assign branch_mispredicted = id_ex_is_branch &
+                (branch_actual_taken != id_ex_predicted_taken);
+
+    // pc_sel now means "EX needs to redirect fetch": either an
+    // unconditional jump (always redirects, exactly as before - never
+    // predicted, so never "mispredicted"), or a conditional branch whose
+    // static prediction turned out wrong.
+    assign pc_sel = id_ex_is_jal | id_ex_is_jalr | branch_mispredicted;
+
+    // Redirect target for pc_sel: the branch/jump target (alu_out, PC+imm)
+    // when actually taken (correct-but-unpredicted, or JAL/JALR); the
+    // fall-through address when a predicted-taken branch actually wasn't.
+    assign id_ex_pc_plus_inc = id_ex_pc + (id_ex_compressed ? 32'd2 : 32'd4);
+    assign ex_redirect_target =
+        (id_ex_is_jal | id_ex_is_jalr | branch_actual_taken) ? alu_out
+                                                               : id_ex_pc_plus_inc;
 
     wire id_ex_mem_read = (id_ex_wb_sel == 2'b00) && id_ex_reg_wen;
-    
+
     hazard_unit HU (
         .id_ex_mem_read(id_ex_mem_read),
-        .id_ex_rd(id_ex_rd), 
+        .id_ex_rd(id_ex_rd),
         .id_ex_wb_sel(id_ex_wb_sel),
-        .if_id_rs1(if_id_inst[19:15]), 
+        .if_id_rs1(if_id_inst[19:15]),
         .if_id_rs2(if_id_inst[24:20]),
         .ex_mem_rd(ex_mem_rd),
         .mem_wb_rd(mem_wb_rd),
-        .ex_mem_reg_wen(ex_mem_reg_wen), 
+        .ex_mem_reg_wen(ex_mem_reg_wen),
         .mem_wb_reg_wen(mem_wb_reg_wen),
-        .id_ex_rs1(id_ex_inst[19:15]), 
+        .id_ex_rs1(id_ex_inst[19:15]),
         .id_ex_rs2(id_ex_inst[24:20]),
         .pc_sel(pc_sel),
-        .stall(stall), 
-        .fwd_a(fwd_a), 
+        .stall(stall),
+        .fwd_a(fwd_a),
         .fwd_b(fwd_b)
     );
 
@@ -749,26 +816,27 @@ module cpu_pipelined (
 
     assign actual_ex_result = id_ex_csr_wen ? csr_rdata : ex_result;
     ex_mem_reg EX_MEM (
-        .clk(clk), 
-        .rst(rst), 
+        .clk(clk),
+        .rst(rst),
         .mem_stall(global_mem_stall),
-        .alu_res_in(actual_ex_result), 
-        .rs2_in(fwd_rs2), 
-        .inst_in(flush_ex ? 32'h00000013 : id_ex_inst),
+        .flush(flush_ex),
+        .alu_res_in(actual_ex_result),
+        .rs2_in(fwd_rs2),
+        .inst_in(id_ex_inst),
         .pc_in(id_ex_pc),
         .compressed_in(id_ex_compressed),
         .rd_in(id_ex_rd),
         .reg_wen_in(id_ex_reg_wen),
-        .mem_rw_in(id_ex_mem_rw), 
+        .mem_rw_in(id_ex_mem_rw),
         .wb_sel_in(id_ex_wb_sel),
-        .is_lr_in(id_ex_is_lr), 
-        .is_sc_in(id_ex_is_sc), 
-        .is_amo_in(id_ex_is_amo), 
-        .atomic_op_in(id_ex_atomic_op), 
-        .is_lr_out(ex_mem_is_lr), 
-        .is_sc_out(ex_mem_is_sc), 
-        .is_amo_out(ex_mem_is_amo), 
-        .atomic_op_out(ex_mem_atomic_op), 
+        .is_lr_in(id_ex_is_lr),
+        .is_sc_in(id_ex_is_sc),
+        .is_amo_in(id_ex_is_amo),
+        .atomic_op_in(id_ex_atomic_op),
+        .is_lr_out(ex_mem_is_lr),
+        .is_sc_out(ex_mem_is_sc),
+        .is_amo_out(ex_mem_is_amo),
+        .atomic_op_out(ex_mem_atomic_op),
         .alu_res_out(ex_mem_alu),
         .rs2_out(ex_mem_rs2),
         .inst_out(ex_mem_inst),
@@ -808,7 +876,7 @@ module cpu_pipelined (
         .d_ready(uart_ready),
         .tx(uart_tx),
         .rx(uart_rx),
-        .tx_irq(uart_tx_irq), 
+        .tx_irq(uart_tx_irq),
         .rx_irq(uart_rx_irq)
     );
 
@@ -830,14 +898,73 @@ module cpu_pipelined (
     );
 
     // MEM
+    wire [31:0] ps_store_data;
     partial_store PS (
-        .inst(ex_mem_inst), 
-        .mem_address(ex_mem_alu), 
-        .data_from_reg(ex_mem_rs2), 
-        .mem_rw(ex_mem_mem_rw), 
-        .mem_write_mask(raw_write_mask), 
-        .data_to_mem(store_data)
-    ); 
+        .inst(ex_mem_inst),
+        .mem_address(ex_mem_alu),
+        .data_from_reg(ex_mem_rs2),
+        .mem_rw(ex_mem_mem_rw),
+        .mem_write_mask(raw_write_mask),
+        .data_to_mem(ps_store_data)
+    );
+    assign store_data = amo_write_phase ? amo_new_value : ps_store_data;
+
+    // AMO sequencer: an atomic read-modify-write (read old word, compute new
+    // word, write it back, return old word to rd) needs two dcache accesses,
+    // but the pipeline only does one per instruction - drives its own
+    // two-phase dcache_ren/dcache_wen sequence, holding the pipeline frozen
+    // via amo_stall (same idea as div_unit's multi-cycle stall, but div_unit
+    // never touches memory).
+    //
+    // amo_result_ready is latched (mirrors div_result_ready) rather than a
+    // live check so amo_stall can't drop between the read and write phases:
+    // interrupts are sampled gated by ~global_mem_stall, so an early drop
+    // could let a trap land mid-sequence - after the read but before the
+    // write commits, or flushing the write away after the read already
+    // happened. Holding the stall until one cycle after the write's own
+    // dcache_ready means the flush boundary only ever sees "not started" or
+    // "fully done".
+    localparam AMO_IDLE = 2'd0, AMO_READ = 2'd1, AMO_WRITE = 2'd2;
+    reg [1:0] amo_state;
+    reg [31:0] amo_old_value;
+    reg amo_result_ready;
+
+    wire amo_read_phase  = ex_mem_is_amo && (amo_state == AMO_READ);
+    wire amo_write_phase = ex_mem_is_amo && (amo_state == AMO_WRITE) && !amo_result_ready;
+    wire amo_stall = ex_mem_is_amo && !amo_result_ready;
+
+    reg [31:0] amo_new_value;
+    always @(*) begin
+        case (ex_mem_atomic_op)
+            5'b00001: amo_new_value = ex_mem_rs2;                                                                // AMOSWAP
+            5'b00000: amo_new_value = amo_old_value + ex_mem_rs2;                                                // AMOADD
+            5'b00100: amo_new_value = amo_old_value ^ ex_mem_rs2;                                                // AMOXOR
+            5'b01100: amo_new_value = amo_old_value & ex_mem_rs2;                                                // AMOAND
+            5'b01000: amo_new_value = amo_old_value | ex_mem_rs2;                                                // AMOOR
+            5'b10000: amo_new_value = ($signed(amo_old_value) < $signed(ex_mem_rs2)) ? amo_old_value : ex_mem_rs2; // AMOMIN
+            5'b10100: amo_new_value = ($signed(amo_old_value) > $signed(ex_mem_rs2)) ? amo_old_value : ex_mem_rs2; // AMOMAX
+            5'b11000: amo_new_value = (amo_old_value < ex_mem_rs2) ? amo_old_value : ex_mem_rs2;                 // AMOMINU
+            5'b11100: amo_new_value = (amo_old_value > ex_mem_rs2) ? amo_old_value : ex_mem_rs2;                 // AMOMAXU
+            default:  amo_new_value = ex_mem_rs2;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (rst || !ex_mem_is_amo) begin
+            amo_state <= AMO_IDLE;
+            amo_result_ready <= 1'b0;
+        end else begin
+            case (amo_state)
+                AMO_IDLE: amo_state <= AMO_READ;
+                AMO_READ: if (dcache_ready) begin
+                    amo_old_value <= dcache_read_data;
+                    amo_state <= AMO_WRITE;
+                end
+                AMO_WRITE: if (dcache_ready) amo_result_ready <= 1'b1;
+                default: amo_state <= AMO_IDLE;
+            endcase
+        end
+    end
 
     // LR/SC reservation bookkeeping should follow the MEM-stage operation,
     // not unrelated front-end stalls. LR may complete while the I-cache is
@@ -846,8 +973,9 @@ module cpu_pipelined (
     // remains stable until the SC instruction can advance to WB
     assign lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
     assign sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
-    assign normal_store_reservation_clear = is_store && !ex_mem_is_sc &&
-                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready) || (is_intc && intc_ready));
+    assign normal_store_reservation_clear = (is_store && !ex_mem_is_sc &&
+                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready) || (is_intc && intc_ready))) ||
+                                             (amo_write_phase && dcache_ready);
 
     reservation_monitor RM (
         .clk(clk),
@@ -861,7 +989,7 @@ module cpu_pipelined (
     );
 
     assign block_sc_store = ex_mem_is_sc & ~sc_success_flag;
-    assign mem_write_mask = block_sc_store ? 4'b0000 : raw_write_mask;
+    assign mem_write_mask = amo_write_phase ? 4'b1111 : (block_sc_store ? 4'b0000 : raw_write_mask);
     assign final_alu_to_wb = ex_mem_is_sc ?
                              (sc_success_flag ? 32'd0 : 32'd1) :
                              ex_mem_alu;
@@ -877,17 +1005,18 @@ module cpu_pipelined (
         .timer_interrupt(timer_interrupt)
     );
 
-    assign final_mem_read_data = is_clint ? clint_rdata :
+    assign final_mem_read_data = ex_mem_is_amo ? amo_old_value :
+                                 is_clint ? clint_rdata :
                                  is_led ? {28'b0, leds} :
                                  is_uart ? uart_rdata_latched :
                                  is_intc ? intc_rdata_latched :
                                             dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
-        .rst(rst), 
+        .rst(rst),
         .mem_stall(global_mem_stall),
         .inst_in(ex_mem_inst),
-        .alu_res_in(final_alu_to_wb), 
+        .alu_res_in(final_alu_to_wb),
         .mem_data_in(final_mem_read_data),
         .pc_in(ex_mem_pc),
         .compressed_in(ex_mem_compressed),
@@ -923,18 +1052,18 @@ module cpu_pipelined (
 endmodule
 
 module program_counter (
-    input wire [31:0] mem_address, pc_inc, 
+    input wire [31:0] mem_address, pc_inc,
     input wire clk, rst, pc_sel, stall,
     output reg [31:0] pc
 );
     wire [31:0] next_pc = pc_sel ? mem_address : pc + pc_inc;
 
     always @(posedge clk) begin
-//        if (rst) 
+//        if (rst)
 //            pc <= 32'b0;
-//        else if (!stall) 
+//        else if (!stall)
 //            pc <= next_pc;
-        if (rst) 
+        if (rst)
             pc <= 32'h4000_0000;
         else if (!stall)
             pc <= next_pc;
@@ -955,20 +1084,21 @@ module if_id_reg (
     // downstream logic (interrupt-taking) can tell the difference.
     output reg valid_out
 );
+    task clear;
+        begin
+            pc_out <= 32'b0;
+            inst_out <= 32'h00000013;
+            compressed_out <= 1'b0;
+            valid_out <= 1'b0;
+        end
+    endtask
+
     always @(posedge clk) begin
-        if (rst) begin
-            pc_out <= 32'b0;
-            inst_out <= 32'h00000013;
-            compressed_out <= 1'b0;
-            valid_out <= 1'b0;
-        end else if (mem_stall) begin
+        if (rst) clear;
+        else if (mem_stall) begin
             // Freeze
-        end else if (flush) begin
-            pc_out <= 32'b0;
-            inst_out <= 32'h00000013;
-            compressed_out <= 1'b0;
-            valid_out <= 1'b0;
-        end else if (!stall) begin
+        end else if (flush) clear;
+        else if (!stall) begin
             pc_out <= pc_in;
             inst_out <= inst_in;
             compressed_out <= compressed_in;
@@ -987,6 +1117,7 @@ module id_ex_reg (
     input wire [4:0] alu_sel_in,
     input wire [31:0] inst_in,
     input wire compressed_in,
+    input wire predicted_taken_in,
     input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
     input wire csr_wen_in,
@@ -1003,6 +1134,7 @@ module id_ex_reg (
     output reg [4:0] alu_sel_out,
     output reg [31:0] inst_out,
     output reg compressed_out,
+    output reg predicted_taken_out,
     output reg csr_wen_out,
     output reg [1:0] csr_op_out,
     output reg csr_use_imm_out,
@@ -1012,57 +1144,40 @@ module id_ex_reg (
     // marked invalid all the way through EX.
     output reg valid_out
 );
+    task clear;
+        begin
+            mem_rw_out <= 0;
+            rd_out <= 5'b0;
+            pc_out <= 0;
+            rs1_out <= 0;
+            rs2_out <= 0;
+            imm_out <= 0;
+            reg_wen_out <= 0;
+            a_sel_out <= 0;
+            b_sel_out <= 0;
+            wb_sel_out <= 0;
+            alu_sel_out <= 0;
+            inst_out <= 32'h00000013;
+            compressed_out <= 1'b0;
+            predicted_taken_out <= 1'b0;
+            is_lr_out <= 1'b0;
+            is_sc_out <= 1'b0;
+            is_amo_out <= 1'b0;
+            atomic_op_out <= 5'b0;
+            csr_wen_out <= 1'b0;
+            csr_op_out <= 2'b0;
+            csr_use_imm_out <= 1'b0;
+            csr_uimm_out <= 5'b0;
+            valid_out <= 1'b0;
+        end
+    endtask
 
     always @(posedge clk) begin
-        if (rst) begin
-            mem_rw_out <= 0;
-            rd_out <= 5'b0;
-            pc_out <= 0;
-            rs1_out <= 0;
-            rs2_out <= 0;
-            imm_out <= 0;
-            reg_wen_out <= 0;
-            a_sel_out <= 0;
-            b_sel_out <= 0;
-            wb_sel_out <= 0;
-            alu_sel_out <= 0;
-            inst_out <= 32'h00000013;
-            compressed_out <= 1'b0;
-            is_lr_out <= 1'b0;
-            is_sc_out <= 1'b0;
-            is_amo_out <= 1'b0;
-            atomic_op_out <= 5'b0;
-            csr_wen_out <= 1'b0;
-            csr_op_out <= 2'b0;
-            csr_use_imm_out <= 1'b0;
-            csr_uimm_out <= 5'b0;
-            valid_out <= 1'b0;
-        end else if (mem_stall) begin
+        if (rst) clear;
+        else if (mem_stall) begin
             // Freeze
-        end else if (flush) begin
-            mem_rw_out <= 0;
-            rd_out <= 5'b0;
-            pc_out <= 0;
-            rs1_out <= 0;
-            rs2_out <= 0;
-            imm_out <= 0;
-            reg_wen_out <= 0;
-            a_sel_out <= 0;
-            b_sel_out <= 0;
-            wb_sel_out <= 0;
-            alu_sel_out <= 0;
-            inst_out <= 32'h00000013;
-            compressed_out <= 1'b0;
-            is_lr_out <= 1'b0;
-            is_sc_out <= 1'b0;
-            is_amo_out <= 1'b0;
-            atomic_op_out <= 5'b0;
-            csr_wen_out <= 1'b0;
-            csr_op_out <= 2'b0;
-            csr_use_imm_out <= 1'b0;
-            csr_uimm_out <= 5'b0;
-            valid_out <= 1'b0;
-        end else begin
+        end else if (flush) clear;
+        else begin
             mem_rw_out <= mem_rw_in;
             rd_out <= rd_in;
             pc_out <= pc_in;
@@ -1077,6 +1192,7 @@ module id_ex_reg (
             alu_sel_out <= alu_sel_in;
             inst_out <= inst_in;
             compressed_out <= compressed_in;
+            predicted_taken_out <= predicted_taken_in;
             is_lr_out <= is_lr_in;
             is_sc_out <= is_sc_in;
             is_amo_out <= is_amo_in;
@@ -1092,7 +1208,7 @@ endmodule
 
 
 module ex_mem_reg (
-    input wire clk, rst, mem_stall,
+    input wire clk, rst, mem_stall, flush,
     input wire [31:0] alu_res_in, rs2_in, inst_in, pc_in,
     input wire compressed_in,
     input wire [4:0] rd_in,
@@ -1125,6 +1241,19 @@ module ex_mem_reg (
             atomic_op_out <= 5'b0;
         end else if (mem_stall) begin
             // Freeze
+        end else if (flush) begin
+            // Only the control fields that can cause a side effect
+            // (register writeback, memory write, LR/SC/AMO sequencing) need
+            // clearing here - without this, a trap taken while this
+            // instruction sat in EX would let it leak through and complete
+            // normally in MEM/WB even though mepc points back at it for
+            // re-execution after mret, causing it to run twice.
+            reg_wen_out <= 1'b0;
+            mem_rw_out <= 1'b0;
+            is_lr_out <= 1'b0;
+            is_sc_out <= 1'b0;
+            is_amo_out <= 1'b0;
+            inst_out <= 32'h00000013;
         end else begin
             alu_res_out <= alu_res_in;
             rs2_out <= rs2_in;
@@ -1183,4 +1312,3 @@ module mem_wb_reg (
     end
 
 endmodule
- 
