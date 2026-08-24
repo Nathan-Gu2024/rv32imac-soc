@@ -20,6 +20,8 @@
 `include "../src/uart_rx.v"
 `include "../src/uart_mmio.v"
 `include "../src/intc.v"
+`include "../src/axi_lite_bridge.v"
+`include "../src/mm_accel.v"
 
 module cpu_pipelined (
     input wire clk, rst,
@@ -91,10 +93,28 @@ module cpu_pipelined (
     wire [31:0] imm;
     wire pc_sel;
 
-    // Static branch prediction, computed in ID (see assigns below for why).
+    // Gshare dynamic branch prediction, computed in ID (see assigns below).
     wire id_is_branch;
     wire id_predicted_taken;
     wire [31:0] id_predicted_target;
+    wire [9:0] pht_index;
+    wire [9:0] id_ex_pht_index;
+    wire [9:0] ghr_before;
+
+    // Return Address Stack (RAS): predicts JALR-return targets (push on
+    // call, pop on ret). JAL is also redirected here since its target is
+    // trivially PC+imm, same as a taken branch - see assigns below.
+    wire predict_commit;
+    wire id_is_jal;
+    wire id_is_jalr;
+    wire id_rd_is_link;
+    wire id_rs1_is_link;
+    wire id_ras_push_pattern;
+    wire id_ras_pop_pattern;
+    wire ras_empty;
+    wire [31:0] ras_top;
+    wire id_ras_hit;
+    wire id_jal_taken;
     wire reg_wen;
     wire a_sel;
     wire b_sel;
@@ -115,6 +135,7 @@ module cpu_pipelined (
     wire id_ex_compressed;
     wire id_ex_valid;
     wire id_ex_predicted_taken;
+    wire [31:0] id_ex_predicted_target;
     wire [31:0] id_ex_pc;
     wire [31:0] id_ex_rs1;
     wire [31:0] id_ex_rs2;
@@ -165,6 +186,7 @@ module cpu_pipelined (
     wire id_ex_is_jalr;
     wire branch_actual_taken;
     wire branch_mispredicted;
+    wire jalr_ras_mispredicted;
     wire [31:0] id_ex_pc_plus_inc;
     wire id_ex_br_eq;
     wire id_ex_br_lt;
@@ -208,6 +230,7 @@ module cpu_pipelined (
     wire is_uart;
     wire is_clint;
     wire is_intc;
+    wire is_accel;
     wire uart_ready;
     wire [31:0] uart_rdata;
     wire uart_tx_irq;
@@ -215,6 +238,8 @@ module cpu_pipelined (
     wire intc_ready;
     wire [31:0] intc_rdata;
     wire intc_irq_out;
+    wire accel_ready;
+    wire [31:0] accel_rdata;
     wire mie_mtie, mie_meie;
     wire timer_fires, external_fires;
     wire is_load;
@@ -262,6 +287,8 @@ module cpu_pipelined (
     localparam [31:0] UART_MMIO_MASK = 32'hFFFF_FFF0;
     localparam [31:0] CLINT_BASE = 32'h0200_0000;
     localparam [31:0] CLINT_MASK = 32'hFFFF_FFF0;
+    localparam [31:0] ACCEL_MMIO_BASE = 32'h0000_5000;
+    localparam [31:0] ACCEL_MMIO_MASK = 32'hFFFF_FF00;
     localparam [31:0] TCM_BASE = 32'h4000_0000;
     localparam [31:0] TCM_BYTES = 32'h0001_0000;
 
@@ -275,6 +302,7 @@ module cpu_pipelined (
     assign is_uart = ((ex_mem_alu & UART_MMIO_MASK) == UART_MMIO_BASE);
     assign is_clint = ((ex_mem_alu & CLINT_MASK) == CLINT_BASE);
     assign is_intc = ((ex_mem_alu & INTC_MMIO_MASK) == INTC_MMIO_BASE);
+    assign is_accel = ((ex_mem_alu & ACCEL_MMIO_MASK) == ACCEL_MMIO_BASE);
     assign is_mmio = is_led | is_clint;
 
     // AMO's ROM entry shares wb_sel=00/reg_wen=1 with plain loads (it reuses
@@ -288,7 +316,7 @@ module cpu_pipelined (
 
     // No explicit TCM check needed here - dcache.v routes TCM-range
     // addresses to tcm.v internally, bypassing the cache transparently.
-    wire mem_addr_is_cacheable = ~is_mmio & ~is_uart & ~is_intc;
+    wire mem_addr_is_cacheable = ~is_mmio & ~is_uart & ~is_intc & ~is_accel;
     assign dcache_ren = (is_load | amo_read_phase) & mem_addr_is_cacheable;
     assign dcache_wen = (store_commits | amo_write_phase) & mem_addr_is_cacheable;
     assign dcache_valid = dcache_ren || dcache_wen;
@@ -322,6 +350,7 @@ module cpu_pipelined (
     // live uart_rdata/intc_rdata wires, for is_uart/is_intc loads.
     reg [31:0] uart_rdata_latched;
     reg [31:0] intc_rdata_latched;
+    reg [31:0] accel_rdata_latched;
 
     wire uart_valid = is_uart & (is_load | store_commits);
     wire uart_req = uart_valid & ~uart_pending & ~uart_done;
@@ -367,7 +396,33 @@ module cpu_pipelined (
     end
     wire intc_stall = intc_valid && !intc_done;
 
-    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall | amo_stall;
+    // accel: same two-tier req/pending pattern as uart/intc above. Its
+    // d_ready comes from axi_lite_bridge and is a one-shot pulse just like
+    // uart/intc's, even though internally it takes several cycles longer
+    // (a full AXI4-Lite AW+W+B or AR+R handshake) - this pattern already
+    // tolerates arbitrary internal latency, proven by uart/intc.
+    wire accel_valid = is_accel & (is_load | store_commits);
+    wire accel_req = accel_valid & ~accel_pending & ~accel_done;
+    reg accel_pending;
+    reg accel_done;
+    always @(posedge clk) begin
+        if (rst) begin
+            accel_pending <= 1'b0;
+            accel_done <= 1'b0;
+            accel_rdata_latched <= 32'b0;
+        end else begin
+            if (accel_req) accel_pending <= 1'b1;
+            else if (accel_ready) accel_pending <= 1'b0;
+
+            if (accel_ready) begin
+                accel_done <= 1'b1;
+                accel_rdata_latched <= accel_rdata;
+            end else if (!global_mem_stall) accel_done <= 1'b0;
+        end
+    end
+    wire accel_stall = accel_valid && !accel_done;
+
+    assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall | amo_stall | accel_stall;
 
     // TCM
     wire tcm_i_req, tcm_i_ready;
@@ -403,6 +458,22 @@ module cpu_pipelined (
     icache #(
         .ADDR_WIDTH(32),
         .LINE_BYTES(16),
+        // Reverted to the original 64 sets (2KB) - proven to synthesize
+        // and run on real hardware throughout this project. cache_core.v's
+        // tag/data reads are combinational (hit_line/hit_way0/1/victim_*
+        // are asynchronous reads off data_array/tag_array,
+        // cache_core.v:52-57), which Xilinx BRAM primitives can't
+        // implement (block RAM requires a synchronous read port) - so
+        // this array synthesizes as distributed RAM + F7/F8 mux trees,
+        // not BRAM. 1024 sets failed DRC outright (50186 F7 muxes needed,
+        // 26600 available); even 128 sets still tripped the placer's
+        // utilization heuristic in combination with gshare's PHT table
+        // (also a 1024-entry combinational-read array, cpu.v ~line 574),
+        // which apparently pushes the F7/F8-coupled LUT packing past what
+        // placement tolerates even though no single resource hit 100%.
+        // A properly-sized bigger icache would need cache_core's read
+        // path reworked to be synchronous so it can infer real BRAM -
+        // not attempted here, bigger/riskier change shared with dcache.
         .NUM_SETS(64),
         .NUM_WAYS(2),
         .TCM_BASE(TCM_BASE),
@@ -518,16 +589,124 @@ module cpu_pipelined (
         .valid_out(if_id_valid)
     );
 
-    // Static branch prediction: backward-taken/forward-not-taken, off the
-    // already-latched if_id_inst/imm (no same-cycle icache/TCM fetch
-    // dependency). Only conditional branches are predicted; JAL/JALR stay
-    // unconditional, always-redirect from EX. Gated by ~stall so a
-    // load-use-stalled branch isn't evicted as a bubble by if_id_reg's
-    // flush-beats-stall priority before it can be re-presented, and by
-    // ~global_mem_stall so the redirect never asserts mid-transaction.
+    // Gshare dynamic branch prediction: a 2-bit-saturating-counter PHT
+    // indexed by PC XOR global history, off the already-latched
+    // if_id_inst/imm (no same-cycle icache/TCM fetch dependency - stays in
+    // ID deliberately, see cpu.v history for why IF-stage prediction was
+    // reverted). Gated by ~stall so a load-use-stalled branch isn't evicted
+    // as a bubble by if_id_reg's flush-beats-stall priority before it can
+    // be re-presented, and by ~global_mem_stall so the redirect never
+    // asserts mid-transaction. JAL/JALR prediction (always-taken / RAS,
+    // below) share this same ID-stage redirect path.
+    //
+    // Correctness never depends on prediction accuracy: every branch is
+    // re-verified in EX against branch_actual_taken regardless of what was
+    // predicted (see branch_mispredicted below), so a bug here can only
+    // cost extra flush cycles, never break program correctness. bits[10:1]
+    // (not [11:2]) since this core supports RVC/2-byte alignment.
+    (* ram_style = "distributed" *) reg [1:0] pht [0:1023];
+    reg [9:0] ghr;
+    integer pht_init_i;
+    initial begin
+        for (pht_init_i = 0; pht_init_i < 1024; pht_init_i = pht_init_i + 1)
+            pht[pht_init_i] = 2'b01; // weakly not-taken; self-trains regardless
+    end
+
+    // Shared by gshare's GHR speculative shift and the RAS push/pop below:
+    // this ID-stage instruction is actually advancing to EX (not stalled)
+    // and isn't about to be squashed by an EX-stage redirect or a trap.
+    assign predict_commit = ~stall & ~global_mem_stall & ~pc_sel & ~flush_if & ~flush_id;
+
     assign id_is_branch = (if_id_inst[6:0] == 7'b1100011);
-    assign id_predicted_taken = id_is_branch & imm[31] & ~stall & ~global_mem_stall;
-    assign id_predicted_target = if_id_pc + imm;
+    assign pht_index = if_id_pc[10:1] ^ ghr;
+    assign id_predicted_taken = (id_is_branch & pht[pht_index][1] & ~stall & ~global_mem_stall)
+                               | id_jal_taken
+                               | id_ras_hit;
+    assign id_predicted_target = id_ras_hit ? ras_top : (if_id_pc + imm);
+    // XOR is self-inverse: id_ex_pht_index (= the pc/ghr pair used when this
+    // branch was predicted) XORed with that same pc recovers the GHR value
+    // from just before this branch's speculative shift, for rollback below.
+    assign ghr_before = id_ex_pht_index ^ id_ex_pc[10:1];
+
+    always @(posedge clk) begin
+        if (rst) begin
+            ghr <= 10'b0;
+        end else if (branch_mispredicted) begin
+            // Rollback wins: the flush this mispredict triggers also
+            // discards the current (younger) ID-stage instruction, so any
+            // speculative shift it would contribute this same cycle is for
+            // a path that's being thrown away anyway.
+            ghr <= {ghr_before[8:0], branch_actual_taken};
+        end else if (id_is_branch & predict_commit) begin
+            // Speculative shift-in of the PREDICTED bit (0 or 1 - gated on
+            // a prediction existing, via id_is_branch, not on its value;
+            // gating on id_predicted_taken itself would silently skip a
+            // history entry for every not-taken prediction, corrupting GHR
+            // into something that stops correlating with real branch
+            // behavior).
+            ghr <= {ghr[8:0], id_predicted_taken};
+        end
+    end
+
+    always @(posedge clk) begin
+        if (id_ex_is_branch) begin
+            if (branch_actual_taken)
+                pht[id_ex_pht_index] <= (pht[id_ex_pht_index] == 2'b11) ? 2'b11 : pht[id_ex_pht_index] + 2'b01;
+            else
+                pht[id_ex_pht_index] <= (pht[id_ex_pht_index] == 2'b00) ? 2'b00 : pht[id_ex_pht_index] - 2'b01;
+        end
+    end
+
+    // Return Address Stack: predicts JALR-return targets by pushing the
+    // link address on call (rd = x1/x5) and popping it on return
+    // (rs1 = x1/x5, rd not a link reg), per the RISC-V-suggested RAS hint
+    // encoding. JAL is folded in here too since its target is trivially
+    // PC+imm - it just always "hits" (id_jal_taken), no stack involved.
+    //
+    // v1 collapses the rare "pop-then-push" case (rd AND rs1 both link
+    // regs, rd != rs1 - e.g. a tail call through a register) into
+    // push-only: id_ras_push_pattern fires on rd being a link register,
+    // full stop, regardless of rs1. This still leaves a genuine return
+    // later unmatched to a real push, but per the correctness invariant
+    // above that only costs a missed prediction, never a wrong result.
+    assign id_is_jal = (if_id_inst[6:0] == 7'b1101111);
+    assign id_is_jalr = (if_id_inst[6:0] == 7'b1100111);
+    assign id_rd_is_link = (if_id_inst[11:7] == 5'd1) | (if_id_inst[11:7] == 5'd5);
+    assign id_rs1_is_link = (if_id_inst[19:15] == 5'd1) | (if_id_inst[19:15] == 5'd5);
+    assign id_ras_push_pattern = id_rd_is_link & (id_is_jal | id_is_jalr);
+    assign id_ras_pop_pattern = id_is_jalr & id_rs1_is_link & ~id_rd_is_link;
+    assign id_jal_taken = id_is_jal & ~stall & ~global_mem_stall;
+
+    localparam RAS_DEPTH = 8;
+    reg [31:0] ras_stack [0:RAS_DEPTH-1];
+    reg [2:0] ras_sp;    // next free push slot
+    reg [3:0] ras_count; // 0..8, saturates (overflow just overwrites oldest)
+
+    assign ras_empty = (ras_count == 4'd0);
+    assign ras_top = ras_stack[ras_sp - 3'd1];
+    assign id_ras_hit = id_ras_pop_pattern & ~ras_empty & predict_commit;
+
+    // predict_commit already excludes any ID-stage instruction that won't
+    // survive to EX, so - unlike GHR - no misprediction rollback path is
+    // needed here: nothing ever gets pushed/popped speculatively only to
+    // be undone later. The one accepted gap: a trap taken *after* this
+    // commit, while the JAL/JALR itself sits in EX/MEM, replays it from
+    // mepc post-mret and can double-push or extra-pop, drifting RAS depth
+    // over time - symmetric to GHR's own accepted trap-replay exposure,
+    // and bounded to costing extra flush cycles, never correctness.
+    always @(posedge clk) begin
+        if (rst) begin
+            ras_sp <= 3'b0;
+            ras_count <= 4'b0;
+        end else if (id_ras_push_pattern & predict_commit) begin
+            ras_stack[ras_sp] <= if_id_pc + (if_id_compressed ? 32'd2 : 32'd4);
+            ras_sp <= ras_sp + 3'd1;
+            ras_count <= (ras_count == RAS_DEPTH[3:0]) ? RAS_DEPTH[3:0] : ras_count + 4'd1;
+        end else if (id_ras_pop_pattern & predict_commit & ~ras_empty) begin
+            ras_sp <= ras_sp - 3'd1;
+            ras_count <= ras_count - 4'd1;
+        end
+    end
 
     assign debug_instr = if_id_inst;
     assign debug_pc = if_id_pc; // pairs with debug_instr - same if_id stage
@@ -586,6 +765,8 @@ module cpu_pipelined (
         .inst_in(if_id_inst),
         .compressed_in(if_id_compressed),
         .predicted_taken_in(id_predicted_taken),
+        .predicted_target_in(id_predicted_target),
+        .pht_index_in(pht_index),
         .reg_wen_in(reg_wen),
         .mem_rw_in(mem_rw),
         .a_sel_in(a_sel),
@@ -623,6 +804,8 @@ module cpu_pipelined (
         .alu_sel_out(id_ex_alu_sel),
         .compressed_out(id_ex_compressed),
         .predicted_taken_out(id_ex_predicted_taken),
+        .predicted_target_out(id_ex_predicted_target),
+        .pht_index_out(id_ex_pht_index),
         .valid_out(id_ex_valid)
     );
 
@@ -646,6 +829,18 @@ module cpu_pipelined (
 
     assign alu_a = id_ex_a_sel ? id_ex_pc : fwd_rs1;
     assign alu_b = id_ex_b_sel ? id_ex_imm : fwd_rs2;
+
+    // Dedicated to the branch/jump redirect path (ex_redirect_target,
+    // jalr_ras_mispredicted) - both only ever need alu_sel=0 (add),
+    // verified against every ROM entry that reaches them (branches/jal/
+    // jalr all decode alu_sel=0 in control_logic.v). Bypasses the general
+    // alu module's full 14-way case-select mux (including two unconditional
+    // 32x32 multiplies), which alu_out can't avoid since it's also shared
+    // with register writeback, which needs every alu_sel case - a real
+    // structural shortening of the tightest timing path (WNS=0.092ns
+    // measured on real hardware pre-this-change), not something synthesis
+    // could specialize on its own.
+    wire [31:0] redirect_target_adder = alu_a + alu_b;
 
     alu ALU (
         .a(alu_a),
@@ -715,24 +910,39 @@ module cpu_pipelined (
                 (id_ex_br_lt & (id_ex_is_blt | id_ex_is_bltu)) |
                 (~id_ex_br_lt & (id_ex_is_bge | id_ex_is_bgeu));
 
-    // Only conditional branches can be mispredicted (JAL/JALR were never
-    // predicted in the first place - id_ex_predicted_taken is always 0
-    // for them, since id_is_branch in ID only fires for opcode 1100011).
     assign branch_mispredicted = id_ex_is_branch &
                 (branch_actual_taken != id_ex_predicted_taken);
 
-    // pc_sel now means "EX needs to redirect fetch": either an
-    // unconditional jump (always redirects, exactly as before - never
-    // predicted, so never "mispredicted"), or a conditional branch whose
-    // static prediction turned out wrong.
-    assign pc_sel = id_ex_is_jal | id_ex_is_jalr | branch_mispredicted;
+    // JALR's target is register-computed, so unlike JAL/branches (whose ID-
+    // stage and EX-stage target computations are structurally identical off
+    // the same threaded pc/imm) a RAS-predicted JALR's ID-stage guess can
+    // genuinely disagree with the real target. id_ex_is_jalr &
+    // id_ex_predicted_taken unambiguously means "this JALR was RAS-hit
+    // predicted", since id_predicted_taken's only JALR-reachable term is
+    // id_ras_hit.
+    assign jalr_ras_mispredicted = id_ex_is_jalr & id_ex_predicted_taken &
+                (redirect_target_adder != id_ex_predicted_target);
 
-    // Redirect target for pc_sel: the branch/jump target (alu_out, PC+imm)
-    // when actually taken (correct-but-unpredicted, or JAL/JALR); the
-    // fall-through address when a predicted-taken branch actually wasn't.
+    // pc_sel means "EX needs to redirect fetch": a JAL/JALR that ID didn't
+    // already correctly redirect (predicted_taken=0 - e.g. RAS-empty JALR,
+    // or the rare same-cycle-stall edge case), a RAS-predicted JALR whose
+    // guess was wrong, or a conditional branch whose prediction was wrong.
+    // When none of these hold, ID's own early redirect (JAL: always-taken
+    // PC+imm; JALR: RAS pop) was already correct, so no redundant
+    // re-redirect/flush happens here - that's the actual performance win.
+    assign pc_sel = (id_ex_is_jal & ~id_ex_predicted_taken) |
+                (id_ex_is_jalr & (~id_ex_predicted_taken | jalr_ras_mispredicted)) |
+                branch_mispredicted;
+
+    // Redirect target for pc_sel: redirect_target_adder is always ground
+    // truth (PC+imm for JAL/taken-branch, rs1+imm for JALR) regardless of
+    // why pc_sel fired, so this needs no change for the RAS/JAL-in-ID
+    // cases above. Uses the dedicated adder (not alu_out) to bypass the
+    // general ALU's case-select mux on this timing-critical path - see
+    // redirect_target_adder's declaration above.
     assign id_ex_pc_plus_inc = id_ex_pc + (id_ex_compressed ? 32'd2 : 32'd4);
     assign ex_redirect_target =
-        (id_ex_is_jal | id_ex_is_jalr | branch_actual_taken) ? alu_out
+        (id_ex_is_jal | id_ex_is_jalr | branch_actual_taken) ? redirect_target_adder
                                                                : id_ex_pc_plus_inc;
 
     wire id_ex_mem_read = (id_ex_wb_sel == 2'b00) && id_ex_reg_wen;
@@ -897,6 +1107,67 @@ module cpu_pipelined (
         .irq_out(intc_irq_out)
     );
 
+    // AI accelerator (2x2 output-stationary systolic matmul, INT8/INT32):
+    // axi_lite_bridge converts this same d_req-style handshake into a real
+    // AXI4-Lite master transaction, talking to mm_accel's AXI4-Lite slave
+    // port on-chip - see src/mm_accel.v for the register map.
+    wire [31:0] accel_axi_awaddr, accel_axi_wdata, accel_axi_araddr, accel_axi_rdata;
+    wire [3:0] accel_axi_wstrb;
+    wire accel_axi_awvalid, accel_axi_awready, accel_axi_wvalid, accel_axi_wready;
+    wire accel_axi_bvalid, accel_axi_bready;
+    wire [1:0] accel_axi_bresp, accel_axi_rresp;
+    wire accel_axi_arvalid, accel_axi_arready, accel_axi_rvalid, accel_axi_rready;
+
+    axi_lite_bridge ACCEL_BRIDGE (
+        .clk(clk),
+        .rst(rst),
+        .d_req(accel_req),
+        .d_we(store_commits),
+        .d_addr(ex_mem_alu),
+        .d_wdata(ex_mem_rs2),
+        .d_rdata(accel_rdata),
+        .d_ready(accel_ready),
+        .m_axi_awaddr(accel_axi_awaddr),
+        .m_axi_awvalid(accel_axi_awvalid),
+        .m_axi_awready(accel_axi_awready),
+        .m_axi_wdata(accel_axi_wdata),
+        .m_axi_wstrb(accel_axi_wstrb),
+        .m_axi_wvalid(accel_axi_wvalid),
+        .m_axi_wready(accel_axi_wready),
+        .m_axi_bresp(accel_axi_bresp),
+        .m_axi_bvalid(accel_axi_bvalid),
+        .m_axi_bready(accel_axi_bready),
+        .m_axi_araddr(accel_axi_araddr),
+        .m_axi_arvalid(accel_axi_arvalid),
+        .m_axi_arready(accel_axi_arready),
+        .m_axi_rdata(accel_axi_rdata),
+        .m_axi_rresp(accel_axi_rresp),
+        .m_axi_rvalid(accel_axi_rvalid),
+        .m_axi_rready(accel_axi_rready)
+    );
+
+    mm_accel ACCEL (
+        .clk(clk),
+        .rst(rst),
+        .s_axi_awaddr(accel_axi_awaddr),
+        .s_axi_awvalid(accel_axi_awvalid),
+        .s_axi_awready(accel_axi_awready),
+        .s_axi_wdata(accel_axi_wdata),
+        .s_axi_wstrb(accel_axi_wstrb),
+        .s_axi_wvalid(accel_axi_wvalid),
+        .s_axi_wready(accel_axi_wready),
+        .s_axi_bresp(accel_axi_bresp),
+        .s_axi_bvalid(accel_axi_bvalid),
+        .s_axi_bready(accel_axi_bready),
+        .s_axi_araddr(accel_axi_araddr),
+        .s_axi_arvalid(accel_axi_arvalid),
+        .s_axi_arready(accel_axi_arready),
+        .s_axi_rdata(accel_axi_rdata),
+        .s_axi_rresp(accel_axi_rresp),
+        .s_axi_rvalid(accel_axi_rvalid),
+        .s_axi_rready(accel_axi_rready)
+    );
+
     // MEM
     wire [31:0] ps_store_data;
     partial_store PS (
@@ -974,7 +1245,7 @@ module cpu_pipelined (
     assign lr_reservation_set = ex_mem_is_lr && dcache_ren && dcache_ready;
     assign sc_reservation_clear = ex_mem_is_sc && ~global_mem_stall;
     assign normal_store_reservation_clear = (is_store && !ex_mem_is_sc &&
-                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready) || (is_intc && intc_ready))) ||
+                                             (is_mmio || (dcache_wen && dcache_ready) || (is_uart && uart_ready) || (is_intc && intc_ready) || (is_accel && accel_ready))) ||
                                              (amo_write_phase && dcache_ready);
 
     reservation_monitor RM (
@@ -1010,6 +1281,7 @@ module cpu_pipelined (
                                  is_led ? {28'b0, leds} :
                                  is_uart ? uart_rdata_latched :
                                  is_intc ? intc_rdata_latched :
+                                 is_accel ? accel_rdata_latched :
                                             dcache_read_data;
     mem_wb_reg MEM_WB (
         .clk(clk),
@@ -1118,6 +1390,8 @@ module id_ex_reg (
     input wire [31:0] inst_in,
     input wire compressed_in,
     input wire predicted_taken_in,
+    input wire [31:0] predicted_target_in,
+    input wire [9:0] pht_index_in,
     input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
     input wire csr_wen_in,
@@ -1135,6 +1409,8 @@ module id_ex_reg (
     output reg [31:0] inst_out,
     output reg compressed_out,
     output reg predicted_taken_out,
+    output reg [31:0] predicted_target_out,
+    output reg [9:0] pht_index_out,
     output reg csr_wen_out,
     output reg [1:0] csr_op_out,
     output reg csr_use_imm_out,
@@ -1160,6 +1436,8 @@ module id_ex_reg (
             inst_out <= 32'h00000013;
             compressed_out <= 1'b0;
             predicted_taken_out <= 1'b0;
+            predicted_target_out <= 32'b0;
+            pht_index_out <= 10'b0;
             is_lr_out <= 1'b0;
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
@@ -1193,6 +1471,8 @@ module id_ex_reg (
             inst_out <= inst_in;
             compressed_out <= compressed_in;
             predicted_taken_out <= predicted_taken_in;
+            predicted_target_out <= predicted_target_in;
+            pht_index_out <= pht_index_in;
             is_lr_out <= is_lr_in;
             is_sc_out <= is_sc_in;
             is_amo_out <= is_amo_in;

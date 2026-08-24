@@ -169,6 +169,83 @@ module tb_coremark_sim;
         if (!rst) cycle_count = cycle_count + 1;
     end
 
+    integer branch_count = 0;
+    integer mispredict_count = 0;
+    always @(posedge clk) begin
+        if (!rst && DUT.id_ex_is_branch) begin
+            branch_count = branch_count + 1;
+            if (DUT.branch_mispredicted) mispredict_count = mispredict_count + 1;
+        end
+    end
+
+    integer jalr_count = 0;
+    integer jalr_ras_hit_count = 0;
+    integer jalr_ras_mispredict_count = 0;
+    always @(posedge clk) begin
+        if (!rst && DUT.id_ex_is_jalr) begin
+            jalr_count = jalr_count + 1;
+            if (DUT.id_ex_predicted_taken) begin
+                jalr_ras_hit_count = jalr_ras_hit_count + 1;
+                if (DUT.jalr_ras_mispredicted) jalr_ras_mispredict_count = jalr_ras_mispredict_count + 1;
+            end
+        end
+    end
+
+    // Stall breakdown: global_mem_stall is an OR of these sub-causes
+    // (cpu.v:425) - counting each separately (instead of just the combined
+    // total) shows where cycles are actually going, the same
+    // instrumentation-first approach used to size the branch/RAS wins
+    // before deciding what to build next.
+    integer stall_cycles = 0;          // load-use hazard (hazard_unit)
+    integer imem_stall_cycles = 0;     // icache miss
+    integer dmem_stall_cycles = 0;     // dcache miss
+    integer div_stall_cycles = 0;      // in-flight DIV/REM
+    integer uart_stall_cycles = 0;
+    integer intc_stall_cycles = 0;
+    integer amo_stall_cycles = 0;
+    integer accel_stall_cycles = 0;
+    integer global_mem_stall_cycles = 0; // union of the above (may overlap)
+    always @(posedge clk) begin
+        if (!rst) begin
+            if (DUT.stall) stall_cycles = stall_cycles + 1;
+            if (DUT.imem_stall) imem_stall_cycles = imem_stall_cycles + 1;
+            if (DUT.dmem_stall) dmem_stall_cycles = dmem_stall_cycles + 1;
+            if (DUT.div_stall) div_stall_cycles = div_stall_cycles + 1;
+            if (DUT.uart_stall) uart_stall_cycles = uart_stall_cycles + 1;
+            if (DUT.intc_stall) intc_stall_cycles = intc_stall_cycles + 1;
+            if (DUT.amo_stall) amo_stall_cycles = amo_stall_cycles + 1;
+            if (DUT.accel_stall) accel_stall_cycles = accel_stall_cycles + 1;
+            if (DUT.global_mem_stall) global_mem_stall_cycles = global_mem_stall_cycles + 1;
+        end
+    end
+
+    // Icache prefetcher activity: how often it fires, and how often the
+    // prefetched line actually gets consumed by a real demand fetch before
+    // being superseded by the next prefetch attempt (an approximation - it
+    // doesn't detect eviction independently, just "was this exact line hit
+    // by a real request before we moved on to tracking the next one").
+    integer prefetch_issued = 0;
+    integer prefetch_useful = 0;
+    reg [31:0] tracked_prefetch_line;
+    reg tracked_prefetch_valid;
+    initial tracked_prefetch_valid = 1'b0;
+    always @(posedge clk) begin
+        if (rst) begin
+            tracked_prefetch_valid = 1'b0;
+        end else begin
+            if (DUT.ICACHE.want_prefetch) begin
+                prefetch_issued = prefetch_issued + 1;
+                tracked_prefetch_line = DUT.ICACHE.prefetch_target;
+                tracked_prefetch_valid = 1'b1;
+            end else if (tracked_prefetch_valid && DUT.ICACHE.cache_req_valid &&
+                         DUT.ICACHE.cache_hit && !DUT.ICACHE.line2_active &&
+                         ({DUT.ICACHE.cache_req_addr[31:4], 4'b0} == tracked_prefetch_line)) begin
+                prefetch_useful = prefetch_useful + 1;
+                tracked_prefetch_valid = 1'b0;
+            end
+        end
+    end
+
     // Stuck-PC watchdog: if PC hasn't moved in a very long time, bail out
     // instead of burning the full timeout budget.
     reg [31:0] last_pc;
@@ -180,7 +257,9 @@ module tb_coremark_sim;
             last_pc = debug_pc;
             if (stuck_count > 200000) begin
                 $display("\n[STUCK] PC has not moved for 200000 cycles at pc=0x%08h", debug_pc);
-                $display("FINAL_CYCLES=%0d", cycle_count);
+                $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d JALR=%0d RAS_HITS=%0d RAS_MISS=%0d", cycle_count, branch_count, mispredict_count, jalr_count, jalr_ras_hit_count, jalr_ras_mispredict_count);
+            $display("STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
+            $display("PREFETCH_ISSUED=%0d PREFETCH_USEFUL=%0d", prefetch_issued, prefetch_useful);
                 $finish;
             end
         end
@@ -189,7 +268,7 @@ module tb_coremark_sim;
     initial begin
         #200_000_000; // 200ms sim time budget
         $display("\n[TIMEOUT] Simulation time budget exhausted");
-        $display("FINAL_CYCLES=%0d", cycle_count);
+        $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d", cycle_count, branch_count, mispredict_count);
         $finish;
     end
 
@@ -209,7 +288,9 @@ module tb_coremark_sim;
                 quiet_cycles = quiet_cycles + 1;
                 if (quiet_cycles > 500000) begin
                     $display("\n[DONE] UART output quiesced");
-                    $display("FINAL_CYCLES=%0d", cycle_count);
+                    $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d JALR=%0d RAS_HITS=%0d RAS_MISS=%0d", cycle_count, branch_count, mispredict_count, jalr_count, jalr_ras_hit_count, jalr_ras_mispredict_count);
+            $display("STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
+            $display("PREFETCH_ISSUED=%0d PREFETCH_USEFUL=%0d", prefetch_issued, prefetch_useful);
                     $finish;
                 end
             end
