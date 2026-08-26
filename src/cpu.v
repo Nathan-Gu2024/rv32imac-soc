@@ -93,28 +93,35 @@ module cpu_pipelined (
     wire [31:0] imm;
     wire pc_sel;
 
-    // Gshare dynamic branch prediction, computed in ID (see assigns below).
-    wire id_is_branch;
-    wire id_predicted_taken;
-    wire [31:0] id_predicted_target;
-    wire [9:0] pht_index;
+    // Gshare dynamic branch prediction + RAS, computed in IF (see assigns
+    // below) - relocated from ID this session for a same-cycle redirect;
+    // if_id_* are the IF-stage prediction relayed one stage forward
+    // through if_id_reg (NOT recomputed in ID) for id_ex_reg to consume,
+    // exactly like if_id_pc/if_id_inst already are.
+    wire if_is_branch;
+    wire if_predicted_taken;
+    wire [31:0] if_predicted_target;
+    wire [9:0] if_pht_index;
+    wire if_id_predicted_taken;
+    wire [31:0] if_id_predicted_target;
+    wire [9:0] if_id_pht_index;
     wire [9:0] id_ex_pht_index;
     wire [9:0] ghr_before;
 
     // Return Address Stack (RAS): predicts JALR-return targets (push on
     // call, pop on ret). JAL is also redirected here since its target is
     // trivially PC+imm, same as a taken branch - see assigns below.
-    wire predict_commit;
-    wire id_is_jal;
-    wire id_is_jalr;
-    wire id_rd_is_link;
-    wire id_rs1_is_link;
-    wire id_ras_push_pattern;
-    wire id_ras_pop_pattern;
+    wire if_predict_commit;
+    wire if_is_jal;
+    wire if_is_jalr;
+    wire if_rd_is_link;
+    wire if_rs1_is_link;
+    wire if_ras_push_pattern;
+    wire if_ras_pop_pattern;
     wire ras_empty;
     wire [31:0] ras_top;
-    wire id_ras_hit;
-    wire id_jal_taken;
+    wire if_ras_hit;
+    wire if_jal_taken;
     wire reg_wen;
     wire a_sel;
     wire b_sel;
@@ -436,7 +443,12 @@ module cpu_pipelined (
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES),
-        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr_fixed.mem")
+        // Relative to src/ (matches the `include convention used throughout
+        // this file) so $readmemh resolves correctly regardless of build
+        // environment - was a machine-specific absolute Windows path,
+        // which is invisible to iverilog on WSL and to the OpenLane Docker
+        // container alike (neither has C:/Users/... mounted).
+        .INIT_FILE("../fpga/ddr_fixed.mem")
     ) TCM (
         .clk(clk),
         .rst(rst),
@@ -556,54 +568,46 @@ module cpu_pipelined (
     assign muxed_if_inst = final_inst;
     assign pc_inc = is_compressed ? 32'd2 : 32'd4;
 
-    // Priority: trap (highest) > EX-stage redirect (misprediction fixup or
-    // an unconditional jump - always correct, since it belongs to an
-    // older instruction than whatever IF is currently fetching) > this
-    // cycle's own ID-stage static prediction > sequential fetch (lowest).
-    assign actual_pc_sel = pc_trap_override | pc_sel | id_predicted_taken;
-    assign actual_jump_target = pc_trap_override ? trap_target_pc :
-                                 pc_sel           ? ex_redirect_target :
-                                                     id_predicted_target;
-    program_counter PC (
-        .clk(clk),
-        .rst(rst),
-        .stall(stall | global_mem_stall),
-        .pc_sel(actual_pc_sel),
-        .mem_address(actual_jump_target),
-        .pc_inc(pc_inc),
-        .pc(pc)
-    );
+    // Gshare dynamic branch prediction + Return Address Stack, computed
+    // HERE in IF (relocated from ID this session) for a true same-cycle
+    // redirect - 0 bubble cycles for a correctly-predicted taken branch/
+    // JAL/RAS-hit JALR, instead of the 1-bubble cost of predicting one
+    // stage later. This reintroduces a same-cycle icache dependency
+    // (if_is_branch/if_is_jal key off muxed_if_inst) that this project
+    // reverted once before for timing reasons - kept deliberately
+    // minimal (opcode/rd/rs1 bit-checks and a dedicated B/J-type
+    // immediate extraction, bypassing control_logic's ROM entirely,
+    // which none of these checks need) to limit how much new logic sits
+    // on that already-tight path. Correctness never depends on
+    // prediction accuracy regardless of where this sits: every branch is
+    // re-verified in EX against branch_actual_taken (see
+    // branch_mispredicted below), so a bug here can only cost extra
+    // flush cycles, never break program correctness.
+    assign if_is_branch = (muxed_if_inst[6:0] == 7'b1100011);
+    assign if_is_jal = (muxed_if_inst[6:0] == 7'b1101111);
+    assign if_is_jalr = (muxed_if_inst[6:0] == 7'b1100111);
+    assign if_rd_is_link = (muxed_if_inst[11:7] == 5'd1) | (muxed_if_inst[11:7] == 5'd5);
+    assign if_rs1_is_link = (muxed_if_inst[19:15] == 5'd1) | (muxed_if_inst[19:15] == 5'd5);
+    assign if_ras_push_pattern = if_rd_is_link & (if_is_jal | if_is_jalr);
+    assign if_ras_pop_pattern = if_is_jalr & if_rs1_is_link & ~if_rd_is_link;
+    assign if_jal_taken = if_is_jal & ~stall & ~global_mem_stall;
 
-    if_id_reg IF_ID (
-        .clk(clk),
-        .rst(rst),
-        .stall(stall),
-        .mem_stall(global_mem_stall),
-        .flush(pc_sel | flush_if | id_predicted_taken),
-        .pc_in(pc),
-        .inst_in(muxed_if_inst),
-        .compressed_in(is_compressed),
-        .pc_out(if_id_pc),
-        .inst_out(if_id_inst),
-        .compressed_out(if_id_compressed),
-        .valid_out(if_id_valid)
-    );
+    // Dedicated B-type/J-type immediate extraction - opcode alone
+    // determines the format for these two cases, so this bypasses
+    // immgen/control_logic's general ROM-based imm_sel decode entirely.
+    wire [31:0] if_b_imm = {{20{muxed_if_inst[31]}}, muxed_if_inst[7],
+                             muxed_if_inst[30:25], muxed_if_inst[11:8], 1'b0};
+    wire [31:0] if_j_imm = {{12{muxed_if_inst[31]}}, muxed_if_inst[19:12],
+                             muxed_if_inst[20], muxed_if_inst[30:21], 1'b0};
+    // Both sums computed in parallel off pc (not gated behind an
+    // if_is_branch-selected immediate first) so the branch/JAL mux sits
+    // AFTER the adder, not in series before it - structurally shortens
+    // this timing-critical path by one mux level, same technique as the
+    // dedicated redirect_target_adder fix earlier this session.
+    wire [31:0] if_pc_plus_b_imm = pc + if_b_imm;
+    wire [31:0] if_pc_plus_j_imm = pc + if_j_imm;
+    wire [31:0] if_branch_or_jal_target = if_is_branch ? if_pc_plus_b_imm : if_pc_plus_j_imm;
 
-    // Gshare dynamic branch prediction: a 2-bit-saturating-counter PHT
-    // indexed by PC XOR global history, off the already-latched
-    // if_id_inst/imm (no same-cycle icache/TCM fetch dependency - stays in
-    // ID deliberately, see cpu.v history for why IF-stage prediction was
-    // reverted). Gated by ~stall so a load-use-stalled branch isn't evicted
-    // as a bubble by if_id_reg's flush-beats-stall priority before it can
-    // be re-presented, and by ~global_mem_stall so the redirect never
-    // asserts mid-transaction. JAL/JALR prediction (always-taken / RAS,
-    // below) share this same ID-stage redirect path.
-    //
-    // Correctness never depends on prediction accuracy: every branch is
-    // re-verified in EX against branch_actual_taken regardless of what was
-    // predicted (see branch_mispredicted below), so a bug here can only
-    // cost extra flush cycles, never break program correctness. bits[10:1]
-    // (not [11:2]) since this core supports RVC/2-byte alignment.
     (* ram_style = "distributed" *) reg [1:0] pht [0:1023];
     reg [9:0] ghr;
     integer pht_init_i;
@@ -612,17 +616,16 @@ module cpu_pipelined (
             pht[pht_init_i] = 2'b01; // weakly not-taken; self-trains regardless
     end
 
-    // Shared by gshare's GHR speculative shift and the RAS push/pop below:
-    // this ID-stage instruction is actually advancing to EX (not stalled)
-    // and isn't about to be squashed by an EX-stage redirect or a trap.
-    assign predict_commit = ~stall & ~global_mem_stall & ~pc_sel & ~flush_if & ~flush_id;
+    // Shared by GHR's speculative shift and RAS push/pop below: this
+    // IF-stage instruction is actually advancing to ID (not stalled) and
+    // isn't about to be squashed by an EX-stage redirect or a trap.
+    assign if_predict_commit = ~stall & ~global_mem_stall & ~pc_sel & ~flush_if & ~flush_id;
 
-    assign id_is_branch = (if_id_inst[6:0] == 7'b1100011);
-    assign pht_index = if_id_pc[10:1] ^ ghr;
-    assign id_predicted_taken = (id_is_branch & pht[pht_index][1] & ~stall & ~global_mem_stall)
-                               | id_jal_taken
-                               | id_ras_hit;
-    assign id_predicted_target = id_ras_hit ? ras_top : (if_id_pc + imm);
+    assign if_pht_index = pc[10:1] ^ ghr;
+    assign if_predicted_taken = (if_is_branch & pht[if_pht_index][1] & ~stall & ~global_mem_stall)
+                               | if_jal_taken
+                               | if_ras_hit;
+    assign if_predicted_target = if_ras_hit ? ras_top : if_branch_or_jal_target;
     // XOR is self-inverse: id_ex_pht_index (= the pc/ghr pair used when this
     // branch was predicted) XORed with that same pc recovers the GHR value
     // from just before this branch's speculative shift, for rollback below.
@@ -633,18 +636,18 @@ module cpu_pipelined (
             ghr <= 10'b0;
         end else if (branch_mispredicted) begin
             // Rollback wins: the flush this mispredict triggers also
-            // discards the current (younger) ID-stage instruction, so any
+            // discards the current (younger) IF-stage instruction, so any
             // speculative shift it would contribute this same cycle is for
             // a path that's being thrown away anyway.
             ghr <= {ghr_before[8:0], branch_actual_taken};
-        end else if (id_is_branch & predict_commit) begin
+        end else if (if_is_branch & if_predict_commit) begin
             // Speculative shift-in of the PREDICTED bit (0 or 1 - gated on
-            // a prediction existing, via id_is_branch, not on its value;
-            // gating on id_predicted_taken itself would silently skip a
+            // a prediction existing, via if_is_branch, not on its value;
+            // gating on if_predicted_taken itself would silently skip a
             // history entry for every not-taken prediction, corrupting GHR
             // into something that stops correlating with real branch
             // behavior).
-            ghr <= {ghr[8:0], id_predicted_taken};
+            ghr <= {ghr[8:0], if_predicted_taken};
         end
     end
 
@@ -661,22 +664,14 @@ module cpu_pipelined (
     // link address on call (rd = x1/x5) and popping it on return
     // (rs1 = x1/x5, rd not a link reg), per the RISC-V-suggested RAS hint
     // encoding. JAL is folded in here too since its target is trivially
-    // PC+imm - it just always "hits" (id_jal_taken), no stack involved.
+    // PC+imm - it just always "hits" (if_jal_taken), no stack involved.
     //
     // v1 collapses the rare "pop-then-push" case (rd AND rs1 both link
     // regs, rd != rs1 - e.g. a tail call through a register) into
-    // push-only: id_ras_push_pattern fires on rd being a link register,
+    // push-only: if_ras_push_pattern fires on rd being a link register,
     // full stop, regardless of rs1. This still leaves a genuine return
     // later unmatched to a real push, but per the correctness invariant
     // above that only costs a missed prediction, never a wrong result.
-    assign id_is_jal = (if_id_inst[6:0] == 7'b1101111);
-    assign id_is_jalr = (if_id_inst[6:0] == 7'b1100111);
-    assign id_rd_is_link = (if_id_inst[11:7] == 5'd1) | (if_id_inst[11:7] == 5'd5);
-    assign id_rs1_is_link = (if_id_inst[19:15] == 5'd1) | (if_id_inst[19:15] == 5'd5);
-    assign id_ras_push_pattern = id_rd_is_link & (id_is_jal | id_is_jalr);
-    assign id_ras_pop_pattern = id_is_jalr & id_rs1_is_link & ~id_rd_is_link;
-    assign id_jal_taken = id_is_jal & ~stall & ~global_mem_stall;
-
     localparam RAS_DEPTH = 8;
     reg [31:0] ras_stack [0:RAS_DEPTH-1];
     reg [2:0] ras_sp;    // next free push slot
@@ -684,34 +679,74 @@ module cpu_pipelined (
 
     assign ras_empty = (ras_count == 4'd0);
     assign ras_top = ras_stack[ras_sp - 3'd1];
-    assign id_ras_hit = id_ras_pop_pattern & ~ras_empty & predict_commit;
+    assign if_ras_hit = if_ras_pop_pattern & ~ras_empty & if_predict_commit;
 
-    // predict_commit already excludes any ID-stage instruction that won't
-    // survive to EX, so - unlike GHR - no misprediction rollback path is
-    // needed here: nothing ever gets pushed/popped speculatively only to
-    // be undone later. The one accepted gap: a trap taken *after* this
-    // commit, while the JAL/JALR itself sits in EX/MEM, replays it from
-    // mepc post-mret and can double-push or extra-pop, drifting RAS depth
-    // over time - symmetric to GHR's own accepted trap-replay exposure,
-    // and bounded to costing extra flush cycles, never correctness.
+    // if_predict_commit already excludes any IF-stage instruction that
+    // won't survive to ID, so - unlike GHR - no misprediction rollback
+    // path is needed here: nothing ever gets pushed/popped speculatively
+    // only to be undone later. The one accepted gap: a trap taken *after*
+    // this commit, while the JAL/JALR itself sits further down the
+    // pipeline, replays it from mepc post-mret and can double-push or
+    // extra-pop, drifting RAS depth over time - symmetric to GHR's own
+    // accepted trap-replay exposure, and bounded to costing extra flush
+    // cycles, never correctness.
     always @(posedge clk) begin
         if (rst) begin
             ras_sp <= 3'b0;
             ras_count <= 4'b0;
-        end else if (id_ras_push_pattern & predict_commit) begin
-            ras_stack[ras_sp] <= if_id_pc + (if_id_compressed ? 32'd2 : 32'd4);
+        end else if (if_ras_push_pattern & if_predict_commit) begin
+            ras_stack[ras_sp] <= pc + (is_compressed ? 32'd2 : 32'd4);
             ras_sp <= ras_sp + 3'd1;
             ras_count <= (ras_count == RAS_DEPTH[3:0]) ? RAS_DEPTH[3:0] : ras_count + 4'd1;
-        end else if (id_ras_pop_pattern & predict_commit & ~ras_empty) begin
+        end else if (if_ras_pop_pattern & if_predict_commit & ~ras_empty) begin
             ras_sp <= ras_sp - 3'd1;
             ras_count <= ras_count - 4'd1;
         end
     end
 
+    // Priority: trap (highest) > EX-stage redirect (misprediction fixup or
+    // an unconditional jump - always correct, since it belongs to an
+    // older instruction than whatever IF is currently fetching) > this
+    // cycle's own IF-stage prediction > sequential fetch (lowest).
+    assign actual_pc_sel = pc_trap_override | pc_sel | if_predicted_taken;
+    assign actual_jump_target = pc_trap_override ? trap_target_pc :
+                                 pc_sel           ? ex_redirect_target :
+                                                     if_predicted_target;
+    program_counter PC (
+        .clk(clk),
+        .rst(rst),
+        .stall(stall | global_mem_stall),
+        .pc_sel(actual_pc_sel),
+        .mem_address(actual_jump_target),
+        .pc_inc(pc_inc),
+        .pc(pc)
+    );
+
+    if_id_reg IF_ID (
+        .clk(clk),
+        .rst(rst),
+        .stall(stall),
+        .mem_stall(global_mem_stall),
+        .flush(pc_sel | flush_if),
+        .pc_in(pc),
+        .inst_in(muxed_if_inst),
+        .compressed_in(is_compressed),
+        .predicted_taken_in(if_predicted_taken),
+        .predicted_target_in(if_predicted_target),
+        .pht_index_in(if_pht_index),
+        .pc_out(if_id_pc),
+        .inst_out(if_id_inst),
+        .compressed_out(if_id_compressed),
+        .predicted_taken_out(if_id_predicted_taken),
+        .predicted_target_out(if_id_predicted_target),
+        .pht_index_out(if_id_pht_index),
+        .valid_out(if_id_valid)
+    );
+
     assign debug_instr = if_id_inst;
     assign debug_pc = if_id_pc; // pairs with debug_instr - same if_id stage
     assign debug_raw_pc = pc;
-    assign debug_id_predicted_taken = id_predicted_taken;
+    assign debug_id_predicted_taken = if_id_predicted_taken;
     assign debug_cache_ready = cache_ready;
 
     // ID
@@ -764,9 +799,9 @@ module cpu_pipelined (
         .rd_in(if_id_inst[11:7]),
         .inst_in(if_id_inst),
         .compressed_in(if_id_compressed),
-        .predicted_taken_in(id_predicted_taken),
-        .predicted_target_in(id_predicted_target),
-        .pht_index_in(pht_index),
+        .predicted_taken_in(if_id_predicted_taken),
+        .predicted_target_in(if_id_predicted_target),
+        .pht_index_in(if_id_pht_index),
         .reg_wen_in(reg_wen),
         .mem_rw_in(mem_rw),
         .a_sel_in(a_sel),
@@ -913,13 +948,13 @@ module cpu_pipelined (
     assign branch_mispredicted = id_ex_is_branch &
                 (branch_actual_taken != id_ex_predicted_taken);
 
-    // JALR's target is register-computed, so unlike JAL/branches (whose ID-
+    // JALR's target is register-computed, so unlike JAL/branches (whose IF-
     // stage and EX-stage target computations are structurally identical off
-    // the same threaded pc/imm) a RAS-predicted JALR's ID-stage guess can
+    // the same threaded pc/imm) a RAS-predicted JALR's IF-stage guess can
     // genuinely disagree with the real target. id_ex_is_jalr &
     // id_ex_predicted_taken unambiguously means "this JALR was RAS-hit
-    // predicted", since id_predicted_taken's only JALR-reachable term is
-    // id_ras_hit.
+    // predicted", since if_predicted_taken's only JALR-reachable term is
+    // if_ras_hit.
     assign jalr_ras_mispredicted = id_ex_is_jalr & id_ex_predicted_taken &
                 (redirect_target_adder != id_ex_predicted_target);
 
@@ -1348,8 +1383,14 @@ module if_id_reg (
     input wire clk, rst, stall, flush, mem_stall,
     input wire [31:0] pc_in, inst_in,
     input wire compressed_in,
+    input wire predicted_taken_in,
+    input wire [31:0] predicted_target_in,
+    input wire [9:0] pht_index_in,
     output reg [31:0] pc_out, inst_out,
     output reg compressed_out,
+    output reg predicted_taken_out,
+    output reg [31:0] predicted_target_out,
+    output reg [9:0] pht_index_out,
     // 0 whenever this slot holds a flush-inserted bubble rather than a
     // genuinely fetched instruction (indistinguishable from a real NOP by
     // inst_out/pc_out alone - both read as 0x13/0 either way). Needed so
@@ -1361,6 +1402,9 @@ module if_id_reg (
             pc_out <= 32'b0;
             inst_out <= 32'h00000013;
             compressed_out <= 1'b0;
+            predicted_taken_out <= 1'b0;
+            predicted_target_out <= 32'b0;
+            pht_index_out <= 10'b0;
             valid_out <= 1'b0;
         end
     endtask
@@ -1374,6 +1418,9 @@ module if_id_reg (
             pc_out <= pc_in;
             inst_out <= inst_in;
             compressed_out <= compressed_in;
+            predicted_taken_out <= predicted_taken_in;
+            predicted_target_out <= predicted_target_in;
+            pht_index_out <= pht_index_in;
             valid_out <= 1'b1;
         end
     end

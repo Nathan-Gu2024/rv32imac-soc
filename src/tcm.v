@@ -12,7 +12,15 @@ module tcm #(
     parameter ADDR_WIDTH = 32,
     parameter TCM_BASE = 32'h4000_0000,
     parameter TCM_BYTES = 65536,
-    parameter INIT_FILE = "main.mem"
+    // Empty by default (see the `if (INIT_FILE != "")` guard below) rather
+    // than a placeholder filename - Yosys's Verilog-2005 frontend appears
+    // to evaluate $readmemh against this DEFAULT during initial AST/RTLIL
+    // generation, before per-instance parameter overrides (e.g. cpu.v's
+    // .INIT_FILE(...)) are applied, so a nonexistent default filename here
+    // breaks OpenLane/Yosys synthesis even though Vivado and iverilog both
+    // correctly honor the override. Real callers always override this
+    // explicitly; boot content doesn't matter for synthesis/PnR anyway.
+    parameter INIT_FILE = ""
 ) (
     input wire clk, rst,
     // Port A, read, instructions

@@ -5,8 +5,8 @@
     ],
     "CLOCK_PORT": "clk",
     "CLOCK_PERIOD": 20.0,
-    "FP_CORE_UTIL": 35,
-    "PL_TARGET_DENSITY": 0.40,
+    "FP_CORE_UTIL": 25,
+    "PL_TARGET_DENSITY": 0.30,
     "MAX_FANOUT_CONSTRAINT": 4,
     "SYNTH_STRATEGY": "AREA 1"
 }

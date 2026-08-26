@@ -73,17 +73,24 @@ module fpga_top #(
     wire mem_ready;
 
     wire [3:0] cpu_leds;
-    // ILA probes for tracing PC/instruction/memory-stall behavior.
-    (* mark_debug = "true" *) wire [31:0] debug_pc, debug_instr;
+    // Was ILA probe wiring (mark_debug) for tracing PC/instruction/memory-
+    // stall behavior - attributes removed since (a) hardware validation has
+    // been happening without needing them, and (b) mark_debug was found to
+    // parasitically lengthen a real timing-critical path (Vivado shares
+    // LUTs between functional and debug logic when they share fan-in;
+    // debug_cache_ready's own logic showed up at the start of the worst
+    // reported setup path). Left as plain wires - unused now, so synthesis
+    // trims them, without needing to touch cpu_pipelined's port list.
+    wire [31:0] debug_pc, debug_instr;
 
-    (* mark_debug = "true" *) wire debug_dcache_valid;
+    wire debug_dcache_valid;
     wire debug_dcache_ready;
-    (* mark_debug = "true" *) wire debug_tcm_d_req;
-    (* mark_debug = "true" *) wire debug_tcm_d_ready;
-    (* mark_debug = "true" *) wire debug_global_mem_stall;
-    (* mark_debug = "true" *) wire [31:0] debug_raw_pc;
-    (* mark_debug = "true" *) wire debug_id_predicted_taken;
-    (* mark_debug = "true" *) wire debug_cache_ready;
+    wire debug_tcm_d_req;
+    wire debug_tcm_d_ready;
+    wire debug_global_mem_stall;
+    wire [31:0] debug_raw_pc;
+    wire debug_id_predicted_taken;
+    wire debug_cache_ready;
 
     cpu_pipelined CPU_CORE (
         .debug_pc(debug_pc),
@@ -191,7 +198,7 @@ module fpga_top #(
         .m_axi_bvalid(m_axi_bvalid),
         .m_axi_bready(m_axi_bready)
     );
-    (* mark_debug = "true" *) reg [26:0] heartbeat;
+    reg [26:0] heartbeat;
     always @(posedge clk) begin
         if (rst)
             heartbeat <= 27'd0;
