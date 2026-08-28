@@ -1,19 +1,29 @@
 `timescale 1ns/1ps
 
+// Data-side memory front end: routes a request either to the TCM (direct,
+// uncached) or to the BRAM-backed cache (dcache_bram.v).
+//
+// This used to hold a cache_core instance plus the 32-bit-to-128-bit write
+// expansion and the 128-bit-to-32-bit read extraction. All of that is gone:
+// dcache_bram stores each line as four 32-bit banks, so a store writes one
+// bank directly with native byte enables and a load selects one bank - no
+// full-line marshalling in either direction.
 module dcache #(
     parameter ADDR_WIDTH = 32,
     parameter LINE_BYTES = 16,
-    parameter NUM_SETS = 64,
-    parameter NUM_WAYS = 2,
+    parameter NUM_SETS = 1024,
     parameter TCM_BASE = 32'h4000_0000,
     parameter TCM_BYTES = 65536
 ) (
     input wire clk,
     input wire rst,
 
-    // CPU-side 32-bit load/store request
+    // CPU-side 32-bit load/store request. cpu_req_addr_next is the
+    // index+offset the MEM stage will present next cycle - see
+    // dcache_bram.v for why the arrays are addressed from it.
     input wire cpu_req_valid, cpu_req_write,
     input wire [ADDR_WIDTH-1:0] cpu_req_addr,
+    input wire [$clog2(NUM_SETS)+$clog2(LINE_BYTES)-1:0] cpu_req_addr_next,
     input wire [31:0] cpu_wdata,
     input wire [3:0] cpu_wmask,
     output wire [31:0] cpu_rdata,
@@ -34,13 +44,11 @@ module dcache #(
     input wire [LINE_BYTES*8-1:0] mem_rline,
     input wire mem_ready
 );
-    localparam LINE_BITS = LINE_BYTES * 8;
-    localparam OFFSET_BITS = $clog2(LINE_BYTES);
-
     wire cpu_addr_is_tcm = (cpu_req_addr >= TCM_BASE) &&
                            (cpu_req_addr < (TCM_BASE + TCM_BYTES));
 
-    // Route TCM requests with a 1-cycle pulse mask to prevent ghost writes/reads
+    // Route TCM requests with a 1-cycle pulse mask to prevent ghost
+    // writes/reads (unchanged).
     reg tcm_req_pending;
     always @(posedge clk) begin
         if (rst) begin
@@ -58,79 +66,35 @@ module dcache #(
     assign tcm_wdata = cpu_wdata;
     assign tcm_wmask = cpu_wmask;
 
-    // 2. Instantly expand 32-bit CPU writes into 128-bit cache line writes
-    wire [1:0] word_offset = cpu_req_addr[OFFSET_BITS-1:2];
-    reg [LINE_BITS-1:0] cache_wline;
-    reg [LINE_BYTES-1:0] cache_wmask;
+    wire [31:0] bram_rdata;
+    wire bram_ready;
 
-    always @(*) begin
-        cache_wline = {LINE_BITS{1'b0}};
-        cache_wmask = {LINE_BYTES{1'b0}};
-
-        case (word_offset)
-            2'd0: begin 
-                cache_wline[31:0] = cpu_wdata; 
-                cache_wmask[3:0] = cpu_wmask; 
-            end 2'd1: begin 
-                cache_wline[63:32] = cpu_wdata; 
-                cache_wmask[7:4] = cpu_wmask; 
-            end 2'd2: begin 
-                cache_wline[95:64] = cpu_wdata; 
-                cache_wmask[11:8] = cpu_wmask; 
-            end 2'd3: begin 
-                cache_wline[127:96] = cpu_wdata; 
-                cache_wmask[15:12] = cpu_wmask; 
-            end
-            default: begin 
-                cache_wline = {LINE_BITS{1'b0}}; 
-                cache_wmask = {LINE_BYTES{1'b0}}; 
-            end
-        endcase
-    end
-
-    // Instantiate Cache Core combinationally (TCM already routed above)
-    wire core_req_valid = cpu_req_valid && !cpu_addr_is_tcm;
-    wire [LINE_BITS-1:0] cache_rline;
-    wire cache_ready, cache_hit;
-
-    cache_core #(
+    dcache_bram #(
         .ADDR_WIDTH(ADDR_WIDTH),
         .LINE_BYTES(LINE_BYTES),
-        .NUM_SETS(NUM_SETS),
-        .NUM_WAYS(NUM_WAYS)
+        .NUM_SETS(NUM_SETS)
     ) core_inst (
         .clk(clk),
         .rst(rst),
-        .req_valid(core_req_valid),
-        .req_write(cpu_req_write),
-        .req_addr(cpu_req_addr),
-        .req_wline(cache_wline),
-        .req_wmask(cache_wmask),
-        .mem_rline(mem_rline),
-        .mem_ready(mem_ready),
-        .resp_rline(cache_rline),
-        .resp_ready(cache_ready),
-        .hit(cache_hit),
+
+        .cpu_req_valid(cpu_req_valid && !cpu_addr_is_tcm),
+        .cpu_req_write(cpu_req_write),
+        .cpu_req_addr(cpu_req_addr),
+        .cpu_req_addr_next(cpu_req_addr_next),
+        .cpu_wdata(cpu_wdata),
+        .cpu_wmask(cpu_wmask),
+        .cpu_rdata(bram_rdata),
+        .cpu_ready(bram_ready),
+
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),
         .mem_req_addr(mem_req_addr),
-        .mem_wline(mem_wline)
+        .mem_wline(mem_wline),
+        .mem_rline(mem_rline),
+        .mem_ready(mem_ready)
     );
 
-    // Instantly multiplex the specific 32-bit word out of the 128-bit cache line
-    reg [31:0] cache_rword;
-    always @(*) begin
-        case (word_offset)
-            2'd0: cache_rword = cache_rline[31:0];
-            2'd1: cache_rword = cache_rline[63:32];
-            2'd2: cache_rword = cache_rline[95:64];
-            2'd3: cache_rword = cache_rline[127:96];
-            default: cache_rword = 32'h0;
-        endcase
-    end
-
-    // Instantly return data and ready signal to CPU based on address target
-    assign cpu_rdata = cpu_addr_is_tcm ? tcm_rdata : cache_rword;
-    assign cpu_ready = cpu_addr_is_tcm ? tcm_ready : cache_ready;
+    assign cpu_rdata = cpu_addr_is_tcm ? tcm_rdata : bram_rdata;
+    assign cpu_ready = cpu_addr_is_tcm ? tcm_ready : bram_ready;
 
 endmodule

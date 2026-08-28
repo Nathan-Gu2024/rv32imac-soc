@@ -15,7 +15,7 @@
 `include "../src/dcache.v"
 `include "../src/icache.v"
 `include "../src/icache_bram.v"
-`include "../src/cache_core.v"
+`include "../src/dcache_bram.v"
 `include "../src/tcm.v"
 `include "../src/uart_tx.v"
 `include "../src/uart_rx.v"
@@ -303,6 +303,14 @@ module cpu_pipelined (
     localparam [31:0] TCM_BASE = 32'h4000_0000;
     localparam [31:0] TCM_BYTES = 32'h0001_0000;
 
+    // dcache geometry: 1024 sets x 16B = 16KB direct-mapped, in real Block
+    // RAM (see dcache_bram.v). Shared here because the EX-stage speculative
+    // address adder below needs to know how many address bits actually
+    // reach the array.
+    localparam DC_NUM_SETS = 1024;
+    localparam DC_IDX_BITS = 10;   // $clog2(DC_NUM_SETS)
+    localparam DC_OFF_BITS = 4;    // $clog2(16)
+
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;
 
@@ -507,8 +515,7 @@ module cpu_pipelined (
     dcache #(
         .ADDR_WIDTH(32),
         .LINE_BYTES(16),
-        .NUM_SETS(64),
-        .NUM_WAYS(2),
+        .NUM_SETS(DC_NUM_SETS),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) DCACHE (
@@ -518,6 +525,7 @@ module cpu_pipelined (
         .cpu_req_valid(dcache_valid),
         .cpu_req_write(dcache_wen),
         .cpu_req_addr(ex_mem_alu),
+        .cpu_req_addr_next(dc_addr_next),
         .cpu_wdata(store_data),
         .cpu_wmask(mem_write_mask),
         .cpu_rdata(dcache_read_data),
@@ -979,6 +987,25 @@ module cpu_pipelined (
     assign ex_redirect_target =
         (id_ex_is_jal | id_ex_is_jalr | branch_actual_taken) ? redirect_target_adder
                                                                : id_ex_pc_plus_inc;
+
+    // Speculative dcache index: the address MEM will present next cycle.
+    // Only the low DC_SPEC_W bits ever reach the array address pins, so
+    // this is a narrow dedicated adder run in parallel with the ALU rather
+    // than a tap off alu_out - ALU-to-BRAM-address-setup is the one new
+    // timing arc this conversion introduces (same reasoning as
+    // redirect_target_adder above). Loads and stores both compute
+    // rs1 + imm, matching alu_a/alu_b's a_sel=rs1 / b_sel=imm selection.
+    //
+    // global_mem_stall (and NOT stall) is the right gate: ex_mem_reg has no
+    // stall port, so on a load-use stall EX's real instruction still
+    // advances to MEM next cycle and the speculation stays correct. When
+    // frozen, MEM holds its instruction, so ex_mem_alu is the right source.
+    // AMO uses rs1 only; if its immediate isn't zero the speculation simply
+    // misses and dcache_bram's spec_ok costs one stall cycle - never data.
+    localparam DC_SPEC_W = DC_IDX_BITS + DC_OFF_BITS;
+    wire [DC_SPEC_W-1:0] dc_ea_spec = fwd_rs1[DC_SPEC_W-1:0] + id_ex_imm[DC_SPEC_W-1:0];
+    wire [DC_SPEC_W-1:0] dc_addr_next = global_mem_stall ? ex_mem_alu[DC_SPEC_W-1:0]
+                                                         : dc_ea_spec;
 
     wire id_ex_mem_read = (id_ex_wb_sel == 2'b00) && id_ex_reg_wen;
 

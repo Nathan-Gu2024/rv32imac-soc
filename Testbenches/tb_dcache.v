@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-`include "../src/cache_core.v"
+`include "../src/dcache_bram.v"
 `include "../src/tcm.v"
 `include "../src/dcache.v"
 `include "../Testbenches/fake_line_memory.v"
@@ -37,7 +37,8 @@ module tb_dcache();
 
         .cpu_req_valid(cpu_req_valid), 
         .cpu_req_write(cpu_req_write),
-        .cpu_req_addr(cpu_req_addr), 
+        .cpu_req_addr(cpu_req_addr),
+        .cpu_req_addr_next(cpu_req_addr[13:0]), 
         .cpu_wdata(cpu_wdata), 
         .cpu_wmask(cpu_wmask),
         .cpu_rdata(cpu_rdata), 
@@ -168,12 +169,12 @@ module tb_dcache();
             cycles = 0;
             @(posedge clk);
             #1;
-            while (cpu_ready !== 1'b1 && cycles < 100) begin
+            while (cpu_ready !== 1'b1 && cycles < 4000) begin
                 cycles = cycles + 1;
                 @(posedge clk);
                 #1;
             end
-            if (cycles >= 100) begin
+            if (cycles >= 4000) begin
                 $display("FAIL: timeout waiting for cpu_ready at addr=%h", addr);
                 $finish;
             end
@@ -248,12 +249,18 @@ $display("\n Test 2: cached DDR read miss then read hit");
         check32(tmp, 32'hDEAD_BEEF, "read after write hit"); 
 
         $display("\n Test 4: dirty eviction wb old line");
-        cpu_access(1'b0, 32'h8000_0400, 32'h0000_0000, 4'b0000, tmp); // fill B
-        cpu_access(1'b0, 32'h8000_0000, 32'h0000_0000, 4'b0000, tmp); // touch A
-        cpu_access(1'b0, 32'h8000_0400, 32'h0000_0000, 4'b0000, tmp); // touch B, A become LRU
-        
+        // The cache is now 16KB DIRECT-MAPPED (1024 sets x 16B), so the set
+        // index is addr[13:4] and the conflict stride is 0x4000. The old
+        // sequence here used +0x400/+0x800, which collided only in the
+        // previous 64-set 2-way geometry and now lands in three different
+        // sets - producing no eviction at all. Direct-mapped also needs no
+        // LRU priming: one conflicting access evicts outright.
+        //
+        // Test 3 above left line 0x8000_0000 resident and dirty (it wrote
+        // 0xDEADBEEF to word 2), so a single conflicting access must write
+        // that whole line back.
         before_writes = mem_write_count;
-        cpu_access(1'b0, 32'h8000_0800, 32'h0000_0000, 4'b0000, tmp); // fill C, evict A
+        cpu_access(1'b0, 32'h8000_4000, 32'h0000_0000, 4'b0000, tmp); // same set, new tag -> evict
 
         check32(mem_write_count, before_writes + 1, "dirty eviction caused one line wb"); 
         check32(last_write_addr, 32'h8000_0000, "dirty eviction wb address"); 

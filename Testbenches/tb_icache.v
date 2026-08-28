@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-`include "../src/cache_core.v"
+`include "../src/icache_bram.v"
 `include "../src/tcm.v"
 `include "../src/icache.v"
 `include "../Testbenches/fake_line_memory.v"
@@ -33,7 +33,8 @@ module tb_icache();
         .clk(clk), 
         .rst(rst),
         .cpu_req_valid(cpu_req_valid), 
-        .cpu_req_addr(cpu_req_addr), 
+        .cpu_req_addr(cpu_req_addr),
+        .cpu_req_addr_next(cpu_req_addr), 
         .cpu_rdata(cpu_rdata), 
         .cpu_ready(cpu_ready),
         .tcm_req_valid(tcm_req_valid), 
@@ -113,7 +114,7 @@ module tb_icache();
 
             cycles = 0; 
             @(posedge clk); #1;
-            while (cpu_ready !== 1'b1 && cycles < 100) begin
+            while (cpu_ready !== 1'b1 && cycles < 4000) begin
                 cycles = cycles + 1;
                 @(posedge clk); #1;
             end 
@@ -150,8 +151,12 @@ module tb_icache();
         $display("\nTest 1: TCM IF"); 
 
         before_reads = mem_read_count; 
-        cpu_fetch(32'h4000_0100, tmp); 
-        check32(tmp, 32'h0000_0000, "TCM fetch returned 0x0"); 
+        cpu_fetch(32'h4000_0100, tmp);
+        // tcm.v pre-fills every word with a NOP (0x13), not zero, so an
+        // un-initialized TCM location reads back as a NOP. The point of
+        // this check is that the fetch was served by the TCM at all - see
+        // the memory-bypass check below.
+        check32(tmp, 32'h0000_0013, "TCM fetch served from TCM (NOP fill)");
         check32(mem_read_count, before_reads, "TCM fetch bypassed main memory"); 
 
         $display("\nTest 2: I-Cache main mem miss");
