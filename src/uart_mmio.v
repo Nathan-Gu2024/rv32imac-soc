@@ -3,10 +3,10 @@ module uart_mmio #(
     // divisors are CLK_FREQ/BAUD_RATE, so if this disagrees with the real
     // clock the line runs at the wrong baud and the terminal shows mojibake
     // rather than failing outright - which is exactly what happened when
-    // FCLK_CLK0 moved 50 -> 55.5556 MHz and this was still 50_000_000
+    // FCLK_CLK0 moved off 50 MHz and this was still 50_000_000
     // (divisor 434 gave ~128000 baud against a 115200 terminal).
     // Single point of truth for both sub-instances below.
-    parameter CLK_FREQ  = 55_555_556,   // 18.000 ns period
+    parameter CLK_FREQ  = 60_000_000,   // 16.667 ns period (PS7 FCLK_CLK0)
     parameter BAUD_RATE = 115200
 ) (
     input wire clk,

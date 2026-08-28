@@ -23,7 +23,7 @@
 
 /* Must match PS7 FCLK_CLK0 and uart_mmio.v's CLK_FREQ parameter (and
  * Zephyr's SYS_CLOCK_HW_CYCLES_PER_SEC in Kconfig.defconfig). */
-#define CLOCKS_PER_SEC 55555556
+#define CLOCKS_PER_SEC 60000000
 
 #if VALIDATION_RUN
 volatile ee_s32 seed1_volatile = 0x3415;
