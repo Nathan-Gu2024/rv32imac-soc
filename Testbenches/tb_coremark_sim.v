@@ -65,11 +65,9 @@ module tb_coremark_sim;
         .debug_global_mem_stall(debug_global_mem_stall)
     );
 
-    // Point the TCM boot stub at the known-good OneDrive copy (the WSL repo
-    // copy of this .mem file is not tracked; ddr_fixed.mem already jumps to
-    // 0x00100000, matching Testbenches/linker_sim.ld's .text base).
-    defparam DUT.TCM.INIT_FILE =
-        "/mnt/c/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr_fixed.mem";
+    // TCM boot stub, as a repo-relative path so any clone can run this.
+    // ddr_fixed.mem jumps to 0x00100000, matching linker_sim.ld's .text base.
+    defparam DUT.TCM.INIT_FILE = "../fpga/ddr_fixed.mem";
 
     // ---- Mock "DDR" word memory, 2MB (word idx 0 .. 524287) ----
     localparam DDR_WORDS = 524288;

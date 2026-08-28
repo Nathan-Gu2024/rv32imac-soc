@@ -359,7 +359,7 @@ module cpu_pipelined_baseline (
         .ADDR_WIDTH(32),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES),
-        .INIT_FILE("C:/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr.mem")
+        .INIT_FILE("../fpga/ddr_fixed.mem")
     ) TCM (
         .clk(clk), 
         .rst(rst), 

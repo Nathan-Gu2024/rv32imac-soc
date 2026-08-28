@@ -9,7 +9,7 @@ module imem (
     reg [2:0] delay_counter;
 
     initial begin
-        $readmemh("C:\Users\natha\OneDrive\Desktop\FPGA\test.hex", rom);
+        $readmemh("test.hex", rom);
     end 
     
     always @(posedge clk) begin

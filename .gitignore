@@ -28,3 +28,10 @@ Thumbs.db
 *~
 
 *.png
+# Build artifacts - regenerate with fpga/coremark/build.sh and the
+# per-test build steps described in the README.
+Testbenches/build_*/
+Testbenches/sim
+fpga/coremark/build/
+fpga/coremark/build_sim/
+fpga/tests/build_*/

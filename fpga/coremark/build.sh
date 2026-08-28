@@ -7,7 +7,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLCHAIN=/home/nathangu/tools/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-
+# Override with: RISCV_PREFIX=/path/to/riscv-none-elf- bash build.sh
+TOOLCHAIN="${RISCV_PREFIX:-riscv-none-elf-}"
 CC="${TOOLCHAIN}gcc"
 OBJCOPY="${TOOLCHAIN}objcopy"
 

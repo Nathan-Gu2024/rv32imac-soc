@@ -69,7 +69,7 @@ module tb_amo_test;
     );
 
     defparam DUT.TCM.INIT_FILE =
-        "/mnt/c/Users/natha/OneDrive/Desktop/RV32-5-stage-processor-main/fpga/ddr_fixed.mem";
+        "../fpga/ddr_fixed.mem";
 
     localparam DDR_WORDS = 524288;
     reg [31:0] ddr_mem [0:DDR_WORDS-1];
