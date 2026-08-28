@@ -14,6 +14,7 @@
 `include "../src/clint_timer.v"
 `include "../src/dcache.v"
 `include "../src/icache.v"
+`include "../src/icache_bram.v"
 `include "../src/cache_core.v"
 `include "../src/tcm.v"
 `include "../src/uart_tx.v"
@@ -64,6 +65,9 @@ module cpu_pipelined (
 
     // IF
     wire [31:0] pc;
+    // The value pc will hold next cycle - drives icache_bram's array
+    // addresses so a cache hit costs no extra stall cycle.
+    wire [31:0] pc_next;
     wire [31:0] if_inst;
     wire [31:0] raw_inst;
     wire [31:0] inst_expanded;
@@ -470,24 +474,13 @@ module cpu_pipelined (
     icache #(
         .ADDR_WIDTH(32),
         .LINE_BYTES(16),
-        // Reverted to the original 64 sets (2KB) - proven to synthesize
-        // and run on real hardware throughout this project. cache_core.v's
-        // tag/data reads are combinational (hit_line/hit_way0/1/victim_*
-        // are asynchronous reads off data_array/tag_array,
-        // cache_core.v:52-57), which Xilinx BRAM primitives can't
-        // implement (block RAM requires a synchronous read port) - so
-        // this array synthesizes as distributed RAM + F7/F8 mux trees,
-        // not BRAM. 1024 sets failed DRC outright (50186 F7 muxes needed,
-        // 26600 available); even 128 sets still tripped the placer's
-        // utilization heuristic in combination with gshare's PHT table
-        // (also a 1024-entry combinational-read array, cpu.v ~line 574),
-        // which apparently pushes the F7/F8-coupled LUT packing past what
-        // placement tolerates even though no single resource hit 100%.
-        // A properly-sized bigger icache would need cache_core's read
-        // path reworked to be synchronous so it can infer real BRAM -
-        // not attempted here, bigger/riskier change shared with dcache.
-        .NUM_SETS(64),
-        .NUM_WAYS(2),
+        // 2048 sets * 16B = 32KB, direct-mapped, in real Block RAM (see
+        // icache_bram.v). Sized to hold CoreMark's whole ~23KB
+        // .text+.rodata so steady-state instruction misses go to ~zero;
+        // costs ~10 of the ~124 free BRAM tiles. The old cache_core-based
+        // icache was stuck at 2KB because its arrays were read
+        // combinationally and could only be distributed LUTRAM.
+        .NUM_SETS(2048),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) ICACHE (
@@ -496,6 +489,7 @@ module cpu_pipelined (
 
         .cpu_req_valid(icache_valid),
         .cpu_req_addr(pc),
+        .cpu_req_addr_next(pc_next),
         .cpu_rdata(if_inst),
         .cpu_ready(cache_ready),
 
@@ -719,7 +713,8 @@ module cpu_pipelined (
         .pc_sel(actual_pc_sel),
         .mem_address(actual_jump_target),
         .pc_inc(pc_inc),
-        .pc(pc)
+        .pc(pc),
+        .pc_next_out(pc_next)
     );
 
     if_id_reg IF_ID (
@@ -886,7 +881,12 @@ module cpu_pipelined (
 
     // Comb divide fails timing so this runs as a
     // ~33-cycle multi-cycle op that stalls the whole pipeline via global_mem_stall
-    wire is_div_op = id_ex_alu_sel[4];
+    // alu_sel 16-19 (div/divu/rem/remu) exactly - NOT simply alu_sel[4].
+    // The old "bit 4 means divide" shortcut silently claimed the whole
+    // upper half of the alu_sel space, so any later extension using a
+    // value >= 20 would stall on the divider and write back a quotient.
+    // Zba (sh1add/sh2add/sh3add, alu_sel 20-22) is the first such case.
+    wire is_div_op = (id_ex_alu_sel[4:2] == 3'b100);
     wire div_is_signed = ~id_ex_alu_sel[0];
     wire div_want_rem = id_ex_alu_sel[1];
     wire div_busy, div_done;
@@ -1361,17 +1361,24 @@ endmodule
 module program_counter (
     input wire [31:0] mem_address, pc_inc,
     input wire clk, rst, pc_sel, stall,
-    output reg [31:0] pc
+    output reg [31:0] pc,
+    // The value `pc` will actually hold next cycle. icache_bram addresses
+    // its BRAMs from this so a hit costs no extra cycle (see icache_bram.v).
+    // Exported from here rather than recomputed at the call site on purpose:
+    // if the two ever diverged, the cache would return the wrong line for
+    // the PC being fetched, i.e. execute a wrong instruction. Note the
+    // `stall` term - plain next_pc is NOT what pc holds while stalled.
+    output wire [31:0] pc_next_out
 );
+    localparam [31:0] RESET_PC = 32'h4000_0000;
+
     wire [31:0] next_pc = pc_sel ? mem_address : pc + pc_inc;
 
+    assign pc_next_out = rst ? RESET_PC : (stall ? pc : next_pc);
+
     always @(posedge clk) begin
-//        if (rst)
-//            pc <= 32'b0;
-//        else if (!stall)
-//            pc <= next_pc;
         if (rst)
-            pc <= 32'h4000_0000;
+            pc <= RESET_PC;
         else if (!stall)
             pc <= next_pc;
     end

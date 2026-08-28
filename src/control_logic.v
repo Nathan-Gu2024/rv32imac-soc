@@ -113,6 +113,14 @@ module rom (
             6'd42: rom_out = 16'h5181; // remu (alu_sel=5'd19)
             6'd43: rom_out = 16'h1181; // sltu  (alu_sel=5'd3, same shape as slt but b_sel=reg not imm)
             6'd44: rom_out = 16'h11C1; // sltiu (alu_sel=5'd3, same shape as slti but unsigned)
+            // Zba shifted-add: plain R-type shape (reg_wen=1, a_sel=rs1,
+            // b_sel=rs2, wb_sel=ALU), differing from add only in alu_sel.
+            // Same control word as mulh (6'd4), differing only in alu_sel -
+            // the signed/unsigned split lives entirely in the ALU.
+            6'd48: rom_out = 16'h1501; // mulhsu (alu_sel=5'd10)
+            6'd45: rom_out = 16'h5201; // sh1add (alu_sel=5'd20)
+            6'd46: rom_out = 16'h5281; // sh2add (alu_sel=5'd21)
+            6'd47: rom_out = 16'h5301; // sh3add (alu_sel=5'd22)
             default: rom_out = 16'h0000;
         endcase
     end
@@ -155,6 +163,20 @@ module rom_decoder (
                 rom_address = 6'd36; // share lr.w's control word
         end else if (inst[6:2] == 5'b11100) begin
             rom_address = 6'd0;
+        end else if (opcode == 5'b01100 && inst[31:25] == 7'b0010000) begin
+            // Zba shifted-add, intercepted ahead of the casex below rather
+            // than widening its selector. That selector is
+            // {opcode, funct3, inst[30], inst[25]}, and Zba's funct7
+            // (0010000) has BOTH of those bits 0 - identical to funct7=0
+            // - so sh1add/sh2add/sh3add would otherwise alias exactly onto
+            // slt/xor/or. Matching the full funct7 here keeps the existing
+            // 10-bit table untouched.
+            case (funct3)
+                3'b010:  rom_address = 6'd45; // sh1add
+                3'b100:  rom_address = 6'd46; // sh2add
+                3'b110:  rom_address = 6'd47; // sh3add
+                default: rom_address = 6'd0;
+            endcase
         end else begin
             casex ({opcode, funct3, f7_bit5, f7_bit0})
                 // R-Types (All bits matter)
@@ -163,6 +185,7 @@ module rom_decoder (
                 10'b01100_000_10: rom_address = 6'd2; // sub
                 10'b01100_001_00: rom_address = 6'd3; // sll
                 10'b01100_001_01: rom_address = 6'd4; // mulh
+                10'b01100_010_01: rom_address = 6'd48; // mulhsu
                 10'b01100_011_01: rom_address = 6'd5; // mulhu
                 10'b01100_010_00: rom_address = 6'd6; // slt
                 10'b01100_011_00: rom_address = 6'd43; // sltu

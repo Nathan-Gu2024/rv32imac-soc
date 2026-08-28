@@ -20,7 +20,7 @@ CORE_SRCS="$SCRIPT_DIR/src/core_main.c $SCRIPT_DIR/src/core_list_join.c $SCRIPT_
 PORT_SRCS="$SCRIPT_DIR/core_portme.c $SCRIPT_DIR/ee_printf.c $SCRIPT_DIR/cvt.c"
 
 "$CC" \
-    -march=rv32imc_zicsr -mabi=ilp32 -mcmodel=medlow \
+    -march=rv32imac_zicsr_zba -mabi=ilp32 -mcmodel=medlow \
     -ffreestanding -nostartfiles -O2 -g \
     -Wall \
     -I "$SCRIPT_DIR/src" -I "$SCRIPT_DIR" \

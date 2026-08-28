@@ -5,9 +5,14 @@
  *
  * Timing uses clint_timer.v's mtime register directly: mtime increments by
  * exactly 1 every clock cycle (see clint_timer.v: "mtime <= mtime + 1"
- * unconditionally, every cycle), so at the synthesized 50MHz clock this is
- * a genuine, cycle-accurate free-running counter - no separate cycle CSR
- * needed (this CPU doesn't implement mcycle/minstret).
+ * unconditionally, every cycle), so it is a genuine, cycle-accurate
+ * free-running counter - no separate cycle CSR needed (this CPU doesn't
+ * implement mcycle/minstret).
+ *
+ * Because mtime counts CYCLES, CLOCKS_PER_SEC below must track the actual
+ * PL clock. Getting it wrong does not fail loudly - it silently scales the
+ * reported Iterations/Sec, so a clock increase can appear to do nothing at
+ * all while the tick count quietly proves otherwise.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -16,9 +21,9 @@
 
 #define CLINT_MTIME_LO (*(volatile ee_u32 *)0x02000000)
 
-/* Matches the synthesized SYS_CLOCK_HW_CYCLES_PER_SEC used everywhere else
- * on this board (Kconfig.defconfig, uart_tx.v/uart_rx.v CLK_FREQ params). */
-#define CLOCKS_PER_SEC 50000000
+/* Must match PS7 FCLK_CLK0 and uart_mmio.v's CLK_FREQ parameter (and
+ * Zephyr's SYS_CLOCK_HW_CYCLES_PER_SEC in Kconfig.defconfig). */
+#define CLOCKS_PER_SEC 55555556
 
 #if VALIDATION_RUN
 volatile ee_s32 seed1_volatile = 0x3415;

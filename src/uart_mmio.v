@@ -1,4 +1,14 @@
-module uart_mmio (
+module uart_mmio #(
+    // MUST match the actual PL clock (PS7 FCLK_CLK0). The TX/RX bit
+    // divisors are CLK_FREQ/BAUD_RATE, so if this disagrees with the real
+    // clock the line runs at the wrong baud and the terminal shows mojibake
+    // rather than failing outright - which is exactly what happened when
+    // FCLK_CLK0 moved 50 -> 55.5556 MHz and this was still 50_000_000
+    // (divisor 434 gave ~128000 baud against a 115200 terminal).
+    // Single point of truth for both sub-instances below.
+    parameter CLK_FREQ  = 55_555_556,   // 18.000 ns period
+    parameter BAUD_RATE = 115200
+) (
     input wire clk,
     input wire rst,
 
@@ -29,8 +39,8 @@ module uart_mmio (
 
     // Instantiate your exact UART module here
     uart_tx #(
-        .CLK_FREQ(50_000_000),
-        .BAUD_RATE(115200)
+        .CLK_FREQ(CLK_FREQ),
+        .BAUD_RATE(BAUD_RATE)
     ) tx_inst (
         .clk(clk),
         .rst(rst),
@@ -44,8 +54,8 @@ module uart_mmio (
     wire rx_valid;
 
     uart_rx #(
-        .CLK_FREQ(50_000_000),
-        .BAUD_RATE(115200)
+        .CLK_FREQ(CLK_FREQ),
+        .BAUD_RATE(BAUD_RATE)
     ) rx_inst (
         .clk(clk),
         .rst(rst),

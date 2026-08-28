@@ -219,31 +219,14 @@ module tb_coremark_sim;
         end
     end
 
-    // Icache prefetcher activity: how often it fires, and how often the
-    // prefetched line actually gets consumed by a real demand fetch before
-    // being superseded by the next prefetch attempt (an approximation - it
-    // doesn't detect eviction independently, just "was this exact line hit
-    // by a real request before we moved on to tracking the next one").
-    integer prefetch_issued = 0;
-    integer prefetch_useful = 0;
-    reg [31:0] tracked_prefetch_line;
-    reg tracked_prefetch_valid;
-    initial tracked_prefetch_valid = 1'b0;
+    // Icache refill activity. The prefetcher is gone (see icache.v) - what
+    // matters now is how often the BRAM cache actually has to go to memory,
+    // which should fall to near-zero once the working set is resident.
+    integer icache_refills = 0;
     always @(posedge clk) begin
-        if (rst) begin
-            tracked_prefetch_valid = 1'b0;
-        end else begin
-            if (DUT.ICACHE.want_prefetch) begin
-                prefetch_issued = prefetch_issued + 1;
-                tracked_prefetch_line = DUT.ICACHE.prefetch_target;
-                tracked_prefetch_valid = 1'b1;
-            end else if (tracked_prefetch_valid && DUT.ICACHE.cache_req_valid &&
-                         DUT.ICACHE.cache_hit && !DUT.ICACHE.line2_active &&
-                         ({DUT.ICACHE.cache_req_addr[31:4], 4'b0} == tracked_prefetch_line)) begin
-                prefetch_useful = prefetch_useful + 1;
-                tracked_prefetch_valid = 1'b0;
-            end
-        end
+        if (!rst && DUT.ICACHE.BRAM_CACHE.mem_req_valid &&
+                    DUT.ICACHE.BRAM_CACHE.mem_ready)
+            icache_refills = icache_refills + 1;
     end
 
     // Stuck-PC watchdog: if PC hasn't moved in a very long time, bail out
@@ -259,7 +242,7 @@ module tb_coremark_sim;
                 $display("\n[STUCK] PC has not moved for 200000 cycles at pc=0x%08h", debug_pc);
                 $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d JALR=%0d RAS_HITS=%0d RAS_MISS=%0d", cycle_count, branch_count, mispredict_count, jalr_count, jalr_ras_hit_count, jalr_ras_mispredict_count);
             $display("STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
-            $display("PREFETCH_ISSUED=%0d PREFETCH_USEFUL=%0d", prefetch_issued, prefetch_useful);
+            $display("ICACHE_REFILLS=%0d", icache_refills);
                 $finish;
             end
         end
@@ -290,7 +273,7 @@ module tb_coremark_sim;
                     $display("\n[DONE] UART output quiesced");
                     $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d JALR=%0d RAS_HITS=%0d RAS_MISS=%0d", cycle_count, branch_count, mispredict_count, jalr_count, jalr_ras_hit_count, jalr_ras_mispredict_count);
             $display("STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
-            $display("PREFETCH_ISSUED=%0d PREFETCH_USEFUL=%0d", prefetch_issued, prefetch_useful);
+            $display("ICACHE_REFILLS=%0d", icache_refills);
                     $finish;
                 end
             end

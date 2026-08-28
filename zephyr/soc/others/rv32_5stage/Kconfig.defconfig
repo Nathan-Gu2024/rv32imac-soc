@@ -3,8 +3,11 @@
 
 if SOC_RV32_5STAGE
 
+# Must match PS7 FCLK_CLK0, uart_mmio.v's CLK_FREQ parameter, and
+# fpga/coremark/core_portme.c's CLOCKS_PER_SEC. clint_timer.v's mtime
+# increments once per clock cycle, so this is literally the PL clock rate.
 config SYS_CLOCK_HW_CYCLES_PER_SEC
-	default 50000000
+	default 55555556
 
 # Second-level interrupt support for src/intc.v (rv32_5stage,intc), which
 # aggregates peripheral IRQs (UART TX/RX today) behind the CPU's own
