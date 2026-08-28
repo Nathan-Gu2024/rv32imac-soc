@@ -21,13 +21,6 @@ LUTs and 6% of its flip-flops.
 | On-chip power | 1.51 W |
 | ISA | RV32IMAC + Zicsr + Zba, machine mode |
 
-For reference, [ultraembedded/riscv](https://github.com/ultraembedded/riscv),
-a well-known open-source RV32IM core, reports 2.94 CoreMark/MHz. This design
-reaches 3.17 while additionally implementing compressed instructions,
-atomics, and branch prediction. (Benchmark conditions differ — that core's
-memory configuration isn't documented — so treat it as a rough reference
-point rather than a controlled comparison.)
-
 ## Architecture
 
 ```
