@@ -20,7 +20,17 @@ module tcm #(
     // breaks OpenLane/Yosys synthesis even though Vivado and iverilog both
     // correctly honor the override. Real callers always override this
     // explicitly; boot content doesn't matter for synthesis/PnR anyway.
-    parameter INIT_FILE = ""
+    parameter INIT_FILE = "",
+    // 1 for FPGA and simulation, 0 for ASIC synthesis. Set to 0 and the
+    // boot-image preload below (and its temp_mem scratch array) is not
+    // elaborated at all. See the comment on that block for why it costs
+    // ~TCM_WORDS x 32 flip-flops if left in on an ASIC target.
+    //
+    // A parameter rather than an `ifdef because OpenLane's VERILOG_DEFINES
+    // reaches the linter but not the Yosys Verilog frontend in this
+    // version, whereas SYNTH_PARAMETERS demonstrably works - it is already
+    // what sets the cache sizes.
+    parameter INIT_ENABLE = 1
 ) (
     input wire clk, rst,
     // Port A, read, instructions
@@ -45,27 +55,44 @@ module tcm #(
     (* ram_style = "block" *) reg [15:0] mem_odd [0 : TCM_WORDS - 1];
 
     // 2. Initialization (NOPs + Readmemh)
-    reg [31:0] temp_mem [0 : TCM_WORDS - 1];
-    integer i;
+    //
+    // Excluded from ASIC synthesis. On FPGA and in simulation this preloads
+    // the boot image, and Vivado bakes the result into the bitstream. An
+    // ASIC has no equivalent - a real chip loads its TCM over a port at
+    // startup - and Yosys implements `initial` as flop reset values, so it
+    // cannot constant-fold temp_mem away. Left in, it costs TCM_WORDS x 32
+    // flip-flops (~33k at a 4KB TCM, ~13% of the whole design's cells) for
+    // an array nothing reads after elaboration.
+    //
+    // Gated on INIT_ENABLE, not INIT_FILE: the generate condition has to be
+    // a parameter the testbenches never defparam, because defparam and a
+    // generate condition on the same parameter interact badly. Testbenches
+    // override INIT_FILE freely; INIT_ENABLE only ever changes for ASIC.
+    generate
+    if (INIT_ENABLE) begin : g_init
+        reg [31:0] temp_mem [0 : TCM_WORDS - 1];
+        integer i;
 
-    initial begin
-        // Fill every word with a NOP before loading the real program
-        for (i = 0; i < TCM_WORDS; i = i + 1) begin
-            temp_mem[i] = 32'h00000013;
-        end
+        initial begin
+            // Fill every word with a NOP before loading the real program
+            for (i = 0; i < TCM_WORDS; i = i + 1) begin
+                temp_mem[i] = 32'h00000013;
+            end
 
-        // Load the actual program
-        if (INIT_FILE != "") begin
-            $display("Loading TCM file %s", INIT_FILE);
-            $readmemh(INIT_FILE, temp_mem);
-        end
+            // Load the actual program
+            if (INIT_FILE != "") begin
+                $display("Loading TCM file %s", INIT_FILE);
+                $readmemh(INIT_FILE, temp_mem);
+            end
 
-        // Split the 32-bit temporary array into the 16-bit physical banks
-        for (i = 0; i < TCM_WORDS; i = i + 1) begin
-            mem_even[i] = temp_mem[i][15:0];
-            mem_odd[i] = temp_mem[i][31:16];
+            // Split the 32-bit temporary array into the 16-bit physical banks
+            for (i = 0; i < TCM_WORDS; i = i + 1) begin
+                mem_even[i] = temp_mem[i][15:0];
+                mem_odd[i] = temp_mem[i][31:16];
+            end
         end
     end
+    endgenerate
 
     // 3. Address Decoding & Alignment Logic
     wire [ADDR_WIDTH-1:0] i_offset = i_addr - TCM_BASE;
@@ -143,15 +170,6 @@ module tcm #(
     // Stitch data combinationally (Data fetches in RV32 are always aligned)
     always @(*) begin
         d_rdata = {d_rdata_odd, d_rdata_even};
-    end
-
-    // Debug Display
-    always @(posedge clk) begin
-        if (d_req)
-            $display("TCM %s addr=%h data=%h",
-                     d_we ? "WRITE" : "READ",
-                     d_addr,
-                     d_we ? d_wdata : d_rdata);
     end
 
 endmodule

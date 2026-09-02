@@ -24,7 +24,28 @@
 `include "../src/axi_lite_bridge.v"
 `include "../src/mm_accel.v"
 
-module cpu_pipelined (
+// Memory sizing is parameterized because the FPGA and ASIC targets want
+// very different points, from identical RTL.
+//
+// On FPGA these arrays infer Block RAM and are essentially free. An ASIC
+// flow without SRAM macros has no equivalent - they synthesize as flip
+// flops, and at these defaults that is roughly a million of them, some 35x
+// the rest of the design. So the OpenLane flow overrides them downward via
+// SYNTH_PARAMETERS in openlane/cpu/config.json rather than forking the RTL.
+//
+// Defaults are the full FPGA configuration on purpose: every testbench
+// instantiates this module without overrides, so the verified numbers stay
+// the ones you get by default.
+module cpu_pipelined #(
+    parameter IC_NUM_SETS = 2048,          // 2048 x 16B = 32KB I-cache
+    parameter DC_NUM_SETS = 1024,          // 1024 x 16B = 16KB D-cache
+    parameter TCM_BYTES   = 32'h0001_0000, // 64KB tightly-coupled memory
+    // 1 for FPGA/simulation (TCM preloaded with the boot image from the
+    // bitstream), 0 for ASIC, where there is no such mechanism and the
+    // preload would cost ~TCM_WORDS x 32 flip-flops for nothing. Plumbed
+    // from here because SYNTH_PARAMETERS only reaches the top module.
+    parameter TCM_INIT_ENABLE = 1
+) (
     input wire clk, rst,
     output wire uart_tx,
     input wire uart_rx,
@@ -98,7 +119,7 @@ module cpu_pipelined (
     wire pc_sel;
 
     // Gshare dynamic branch prediction + RAS, computed in IF (see assigns
-    // below) - relocated from ID this session for a same-cycle redirect;
+    // below) for a same-cycle redirect;
     // if_id_* are the IF-stage prediction relayed one stage forward
     // through if_id_reg (NOT recomputed in ID) for id_ex_reg to consume,
     // exactly like if_id_pc/if_id_inst already are.
@@ -301,15 +322,14 @@ module cpu_pipelined (
     localparam [31:0] ACCEL_MMIO_BASE = 32'h0000_5000;
     localparam [31:0] ACCEL_MMIO_MASK = 32'hFFFF_FF00;
     localparam [31:0] TCM_BASE = 32'h4000_0000;
-    localparam [31:0] TCM_BYTES = 32'h0001_0000;
 
-    // dcache geometry: 1024 sets x 16B = 16KB direct-mapped, in real Block
-    // RAM (see dcache_bram.v). Shared here because the EX-stage speculative
-    // address adder below needs to know how many address bits actually
-    // reach the array.
-    localparam DC_NUM_SETS = 1024;
-    localparam DC_IDX_BITS = 10;   // $clog2(DC_NUM_SETS)
-    localparam DC_OFF_BITS = 4;    // $clog2(16)
+    // Derived from the DC_NUM_SETS parameter rather than pinned, so the
+    // EX-stage speculative address adder automatically narrows or widens
+    // with the cache. Getting these out of sync would silently mis-index
+    // the array (dcache_bram's spec_ok would catch it, but as a permanent
+    // stall rather than a hit).
+    localparam DC_IDX_BITS = $clog2(DC_NUM_SETS);
+    localparam DC_OFF_BITS = 4;    // $clog2(LINE_BYTES = 16)
 
     assign icache_valid = 1'b1;
     assign imem_stall = icache_valid & ~cache_ready;
@@ -460,7 +480,8 @@ module cpu_pipelined (
         // environment - was a machine-specific absolute Windows path,
         // which is invisible to iverilog on WSL and to the OpenLane Docker
         // container alike (neither has C:/Users/... mounted).
-        .INIT_FILE("../fpga/ddr_fixed.mem")
+        .INIT_FILE("../fpga/ddr_fixed.mem"),
+        .INIT_ENABLE(TCM_INIT_ENABLE)
     ) TCM (
         .clk(clk),
         .rst(rst),
@@ -482,13 +503,13 @@ module cpu_pipelined (
     icache #(
         .ADDR_WIDTH(32),
         .LINE_BYTES(16),
-        // 2048 sets * 16B = 32KB, direct-mapped, in real Block RAM (see
-        // icache_bram.v). Sized to hold CoreMark's whole ~23KB
-        // .text+.rodata so steady-state instruction misses go to ~zero;
-        // costs ~10 of the ~124 free BRAM tiles. The old cache_core-based
-        // icache was stuck at 2KB because its arrays were read
+        // Direct-mapped, in real Block RAM (see icache_bram.v). At the
+        // default 2048 sets that is 32KB - enough to hold CoreMark's whole
+        // ~23KB .text+.rodata, so steady-state instruction misses go to
+        // ~zero for ~10 of the ~124 free BRAM tiles. The old cache_core
+        // version was stuck at 2KB because its arrays were read
         // combinationally and could only be distributed LUTRAM.
-        .NUM_SETS(2048),
+        .NUM_SETS(IC_NUM_SETS),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) ICACHE (
@@ -571,20 +592,20 @@ module cpu_pipelined (
     assign pc_inc = is_compressed ? 32'd2 : 32'd4;
 
     // Gshare dynamic branch prediction + Return Address Stack, computed
-    // HERE in IF (relocated from ID this session) for a true same-cycle
-    // redirect - 0 bubble cycles for a correctly-predicted taken branch/
-    // JAL/RAS-hit JALR, instead of the 1-bubble cost of predicting one
-    // stage later. This reintroduces a same-cycle icache dependency
-    // (if_is_branch/if_is_jal key off muxed_if_inst) that this project
-    // reverted once before for timing reasons - kept deliberately
-    // minimal (opcode/rd/rs1 bit-checks and a dedicated B/J-type
-    // immediate extraction, bypassing control_logic's ROM entirely,
-    // which none of these checks need) to limit how much new logic sits
-    // on that already-tight path. Correctness never depends on
-    // prediction accuracy regardless of where this sits: every branch is
-    // re-verified in EX against branch_actual_taken (see
-    // branch_mispredicted below), so a bug here can only cost extra
-    // flush cycles, never break program correctness.
+    // HERE in IF rather than ID, giving a true same-cycle redirect: zero
+    // bubbles for a correctly-predicted taken branch / JAL / RAS-hit JALR,
+    // versus the one-bubble cost of predicting a stage later.
+    //
+    // The cost is a same-cycle icache dependency, since if_is_branch and
+    // if_is_jal key off muxed_if_inst. That path is timing-critical, so
+    // the logic here is deliberately minimal - opcode/rd/rs1 bit-checks
+    // plus a dedicated B/J-type immediate extraction that bypasses
+    // control_logic's ROM entirely, which none of these checks need.
+    //
+    // Correctness never depends on prediction accuracy, wherever this
+    // sits: every branch is re-verified in EX against branch_actual_taken
+    // (see branch_mispredicted below), so a bug here costs extra flush
+    // cycles and nothing more.
     assign if_is_branch = (muxed_if_inst[6:0] == 7'b1100011);
     assign if_is_jal = (muxed_if_inst[6:0] == 7'b1101111);
     assign if_is_jalr = (muxed_if_inst[6:0] == 7'b1100111);
@@ -604,8 +625,8 @@ module cpu_pipelined (
     // Both sums computed in parallel off pc (not gated behind an
     // if_is_branch-selected immediate first) so the branch/JAL mux sits
     // AFTER the adder, not in series before it - structurally shortens
-    // this timing-critical path by one mux level, same technique as the
-    // dedicated redirect_target_adder fix earlier this session.
+    // this timing-critical path by one mux level, same technique used by
+    // redirect_target_adder in EX.
     wire [31:0] if_pc_plus_b_imm = pc + if_b_imm;
     wire [31:0] if_pc_plus_j_imm = pc + if_j_imm;
     wire [31:0] if_branch_or_jal_target = if_is_branch ? if_pc_plus_b_imm : if_pc_plus_j_imm;

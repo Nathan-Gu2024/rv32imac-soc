@@ -1,0 +1,33 @@
+{
+    "DESIGN_NAME": "sram_test",
+    "VERILOG_FILES": [
+        "dir::src/sram_test.v",
+        "dir::../../src/sram_sky130.v"
+    ],
+    "CLOCK_PORT": "clk",
+    "CLOCK_PERIOD": 25.0,
+
+    "VERILOG_FILES_BLACKBOX": "dir::../../src/sky130_sram_blackbox.v",
+
+    "EXTRA_LEFS": "/home/nathangu/.ciel/sky130A/libs.ref/sky130_sram_macros/lef/sky130_sram_2kbyte_1rw1r_32x512_8.lef",
+    "EXTRA_GDS_FILES": "/home/nathangu/.ciel/sky130A/libs.ref/sky130_sram_macros/gds/sky130_sram_2kbyte_1rw1r_32x512_8.gds",
+    "EXTRA_LIBS": "/home/nathangu/.ciel/sky130A/libs.ref/sky130_sram_macros/lib/sky130_sram_2kbyte_1rw1r_32x512_8_TT_1p8V_25C.lib",
+
+    "VDD_NETS": "vccd1",
+    "GND_NETS": "vssd1",
+    "FP_PDN_MACRO_HOOKS": "u_sram.u_macro vccd1 vssd1 vccd1 vssd1",
+
+    "FP_SIZING": "absolute",
+    "DIE_AREA": "0 0 1000 900",
+    "MACRO_PLACEMENT_CFG": "dir::macro_placement.cfg",
+    "PL_TARGET_DENSITY": 0.40,
+    "PL_MACRO_HALO": "10 10",
+
+    "MAGIC_DRC_USE_GDS": 0,
+    "QUIT_ON_MAGIC_DRC": 0,
+
+    "ROUTING_CORES": 6,
+    "RUN_LVS": 0,
+    "RUN_CVC": 0,
+    "RUN_KLAYOUT_XOR": 0
+}
