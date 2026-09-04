@@ -46,9 +46,9 @@ module intc #(
 
     wire [NUM_SOURCES-1:0] irq_edge = irq_in & ~irq_in_prev;
 
-    wire is_intc_addr = (d_addr[31:12] == 20'h00004); // 0x0000_4XXX
-    wire is_enable_reg = (d_addr[11:0] == 12'h000); // 0x0000_4000
-    wire is_pending_reg = (d_addr[11:0] == 12'h004); // 0x0000_4004
+    wire is_intc_addr   = (d_addr[31:12] == 20'h00004); // 0x0000_4XXX
+    wire is_enable_reg  = (d_addr[11:0] == 12'h000);    // 0x0000_4000
+    wire is_pending_reg = (d_addr[11:0] == 12'h004);    // 0x0000_4004
 
     always @(posedge clk) begin
         if (rst) begin

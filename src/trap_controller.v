@@ -1,7 +1,7 @@
 module trap_controller (
     input wire [31:0] ex_pc, // pc of the instruction in EX
     input wire [31:0] ex_inst, // raw instruction currently in EX
-    input wire timer_irq, // CLINT timer interrupt, enabled+pending+globally-on
+    input wire timer_irq,    // CLINT timer interrupt, enabled+pending+globally-on
     input wire external_irq, // intc aggregate interrupt, enabled+pending+globally-on
     // from the CSR
     input wire [31:0] mtvec_out, // OS Kernel Address
