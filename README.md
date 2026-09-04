@@ -38,10 +38,40 @@ GDSII** with eleven SRAM macros, LVS-clean and XOR-clean.
 | CoreMark/MHz | **3.16** (see below) |
 
 The 37 MHz figure is I/O-bound, not core-bound: at a 20 ns constraint every
-setup violation was an output port and **zero** register-to-register paths
-failed. The worst of 958 reg-to-reg paths has 2.66 ns of slack at 20 ns,
-putting the core's own limit at 17.34 ns. Closing the gap means constraining
-I/O pin placement or registering the memory-side outputs, not faster tooling.
+setup violation was an output port (`store_data[*]`, crossing a 4900 µm die to
+a perimeter pin) and **zero** register-to-register paths failed. The worst of
+958 reg-to-reg paths has 2.66 ns of slack at 20 ns, putting the core's own
+limit at **17.34 ns / 57.7 MHz**; that path is the IF-stage next-PC mux chain
+(gshare / RAS / branch target) feeding the I-cache address. Closing the gap
+means constraining I/O pin placement or registering the memory-side outputs,
+not faster tooling. Notably the SRAM macros are **not** on any critical path —
+0.53 ns clock-to-out against a 27 ns period.
+
+### Figure of merit
+
+$$\text{FOM} = 10^{10} \times \frac{f_{max}}{\text{cycles} \times \sqrt{\text{area}}}$$
+
+with `f_max` in Hz, `area` in mm², and `cycles` the full CoreMark run from
+`tb_coremark_sim.v` at each build's own cache geometry (boot and UART output
+included — a fixed overhead that slightly favours the slower build).
+
+| Build | f_max | Cycles | Area | **FOM** | |
+|---|---|---|---|---|---|
+| Flip-flop, 256 B/256 B | 50.0 MHz | 16,648,911 | 3.328 mm² | **1.65 × 10¹⁰** | — |
+| SRAM macro, 8 KB/8 KB | 37.0 MHz | 8,975,373 | 10.584 mm² | **1.27 × 10¹⁰** | 0.77× |
+| SRAM macro, I/O fixed | 57.7 MHz | 8,975,373 | 10.584 mm² | **1.98 × 10¹⁰** | 1.20× |
+
+**The macro build trails on this metric as built, and that is worth stating
+plainly:** it buys 1.37× the performance (3.00 → 4.13 benchmark runs/sec) for
+3.2× the area, and √area charges 1.78× for that. CoreMark/MHz alone (1.70 →
+3.16) hides the trade; this does not.
+
+Two independent routes close it. The die is only **13.6% utilized** — roughly
+3.1 mm² of macros plus ~2.8 mm² of logic inside 10.58 mm², because the routing
+channels were sized for convergence rather than area — so break-even at the
+current clock is **6.28 mm²**. Alternatively, fixing the I/O paths raises
+break-even to **15.23 mm²**, which the design already clears. The I/O fix is
+the cheaper of the two: it is an SDC and pin-placement change, not silicon.
 
 ## Architecture
 
