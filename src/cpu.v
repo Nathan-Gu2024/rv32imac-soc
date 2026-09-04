@@ -44,7 +44,19 @@ module cpu_pipelined #(
     // bitstream), 0 for ASIC, where there is no such mechanism and the
     // preload would cost ~TCM_WORDS x 32 flip-flops for nothing. Plumbed
     // from here because SYNTH_PARAMETERS only reaches the top module.
-    parameter TCM_INIT_ENABLE = 1
+    parameter TCM_INIT_ENABLE = 1,
+    // 0 for FPGA/simulation: the D-cache arrays infer Block RAM. 1 for ASIC:
+    // they become sky130 OpenRAM macros instead of the ~1M flip-flops an
+    // inferred array costs there. Requires DC_NUM_SETS=512, the macro's
+    // fixed depth - dcache_bram.v turns a mismatch into an elaboration
+    // error rather than a silently truncated index.
+    parameter DC_USE_SRAM = 0,
+    // Same for the I-cache. Requires IC_NUM_SETS=512. Measured in sim: at
+    // 8KB I + 8KB D the design runs within 0.31% of the 32KB/16KB FPGA
+    // configuration, against +86% cycles at the 256B/256B geometry the
+    // flip-flop ASIC build was forced to use - which is why both caches are
+    // worth moving to macros, not just the D-cache.
+    parameter IC_USE_SRAM = 0
 ) (
     input wire clk, rst,
     output wire uart_tx,
@@ -510,6 +522,7 @@ module cpu_pipelined #(
         // version was stuck at 2KB because its arrays were read
         // combinationally and could only be distributed LUTRAM.
         .NUM_SETS(IC_NUM_SETS),
+        .USE_SRAM_MACRO(IC_USE_SRAM),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) ICACHE (
@@ -537,6 +550,7 @@ module cpu_pipelined #(
         .ADDR_WIDTH(32),
         .LINE_BYTES(16),
         .NUM_SETS(DC_NUM_SETS),
+        .USE_SRAM_MACRO(DC_USE_SRAM),
         .TCM_BASE(TCM_BASE),
         .TCM_BYTES(TCM_BYTES)
     ) DCACHE (

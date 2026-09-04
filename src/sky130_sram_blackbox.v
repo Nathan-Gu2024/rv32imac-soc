@@ -1,4 +1,17 @@
+/// sta-blackbox
 `timescale 1ns/1ps
+
+// The marker on the first line is required by OpenSTA, which reads this file
+// as a GATE-LEVEL NETLIST and whose parser does not accept a parameter list -
+// the `#(parameter VERBOSE = 0)` below is a syntax error to it:
+//
+//   Error while reading src/sky130_sram_blackbox.v:
+//   Make sure that this a gate-level netlist not an RTL file
+//   line 35, syntax error, unexpected '#', expecting ';' or '('
+//
+// `/// sta-blackbox` tells OpenSTA to skip the file and blackbox the modules
+// in it, which is exactly right: timing for this macro comes from its .lib
+// via EXTRA_LIBS, never from here.
 
 // Interface-only stub for the sky130 OpenRAM macro, for SYNTHESIS AND LINT.
 //
@@ -28,7 +41,13 @@
 // spurious warnings would hide a real one.
 /* verilator lint_off UNUSEDSIGNAL */
 /* verilator lint_off UNDRIVEN */
-module sky130_sram_2kbyte_1rw1r_32x512_8 (
+// VERBOSE exists here only so that sram_sky130.v's `#(.VERBOSE(0))` override
+// - which it needs to silence the simulation model's per-access $display -
+// is legal against this stub too. It has no meaning for a hard macro and
+// affects nothing in synthesis.
+module sky130_sram_2kbyte_1rw1r_32x512_8 #(
+    parameter VERBOSE = 0
+) (
     // Port 0: read/write
     input  wire        clk0,
     input  wire        csb0,

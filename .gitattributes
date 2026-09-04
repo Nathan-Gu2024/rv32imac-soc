@@ -1,0 +1,33 @@
+# This repo is edited from two places - the WSL working copy (LF) and the
+# OneDrive copy that Vivado builds from, via Windows editors (CRLF). Without
+# a rule here, a file that round-trips through the Windows side comes back
+# with every line changed, and `git status` reports it as modified when
+# nothing about it actually differs. src/div_unit.v, src/uart_rx.v and
+# Testbenches/tb_debug.v have all shown up that way; `git diff
+# --ignore-all-space` on them is empty.
+#
+# Normalize to LF in the repository. Checkouts still get whatever the
+# platform wants, so this does not disturb the Windows-side workflow.
+* text=auto eol=lf
+
+# Memory images are read by $readmemh and are already LF; keep them exactly
+# as committed rather than letting any future setting rewrite them. A
+# corrupted boot image or program image fails in ways that look like a CPU
+# bug, which is an expensive thing to debug.
+*.mem  -text
+*.hex  -text
+
+# True binaries - never touch.
+*.bin  binary
+*.elf  binary
+*.gds  binary
+*.gds.gz binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.xpr  binary
+*.bit  binary
+
+# Simulator and tool artifacts that occasionally get committed by accident;
+# treating them as binary keeps them out of textual diffs.
+*.vcd  -text -diff

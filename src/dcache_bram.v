@@ -24,10 +24,27 @@
 // downgrades any address-speculation error to one stall cycle, and the
 // store->load bypass below, which covers a genuinely undefined BRAM
 // behaviour rather than a mere timing nicety.
+// TARGET SELECTION - the five cache arrays have two implementations, chosen
+// by USE_SRAM_MACRO, from identical surrounding logic:
+//
+//   0 (default)  inferred Block RAM. FPGA and every testbench.
+//   1            five sky130 OpenRAM macros via sram_sky130.v. ASIC.
+//
+// The macro is physically 512 words x 32 bits, so USE_SRAM_MACRO=1 REQUIRES
+// NUM_SETS=512 (8KB here, against 16KB on FPGA). That is enforced below
+// rather than documented, because a mismatch would otherwise show up as a
+// silent port-width truncation on the index.
+//
+// The macro's 1RW+1R port structure fits this cache better than BRAM did:
+// the design already reads at one address (a_idx, speculative) and writes at
+// another (waddr) in the same cycle, which is exactly the two ports. Reads
+// go on port 1 and writes on port 0 - see the header of sram_sky130.v for
+// why that assignment is mandatory rather than stylistic.
 module dcache_bram #(
     parameter ADDR_WIDTH = 32,
     parameter LINE_BYTES = 16,
-    parameter NUM_SETS   = 1024   // 1024 * 16B = 16KB; power of 2
+    parameter NUM_SETS   = 1024,  // 1024 * 16B = 16KB; power of 2
+    parameter USE_SRAM_MACRO = 0
 ) (
     input  wire clk,
     input  wire rst,
@@ -63,18 +80,17 @@ module dcache_bram #(
     localparam S_FILL    = 3'd4;
     localparam S_RECHECK = 3'd5;
 
-    // Four 32-bit banks rather than one 128-bit array, so a store touches
-    // exactly one bank and uses native BRAM byte-write-enables.
-    (* ram_style = "block" *) reg [31:0]  d0 [0:NUM_SETS-1];
-    (* ram_style = "block" *) reg [31:0]  d1 [0:NUM_SETS-1];
-    (* ram_style = "block" *) reg [31:0]  d2 [0:NUM_SETS-1];
-    (* ram_style = "block" *) reg [31:0]  d3 [0:NUM_SETS-1];
-    // {valid, tag}. Valid lives in the BRAM word so the hit compare is
-    // register-to-register; BRAM can't be bulk-reset, hence S_INIT below.
-    (* ram_style = "block" *) reg [TAG:0] tagv [0:NUM_SETS-1];
-    // Flops, not BRAM: set per store, read at miss time. Deliberately NOT
-    // reset - a line's dirty bit is only ever consulted when its valid bit
-    // is set, and every line becomes valid via a refill, which clears it.
+    // The four 32-bit data banks and the {valid,tag} array live in the
+    // generate block further down - one bank per array rather than a single
+    // 128-bit array, so a store touches exactly one bank and uses native
+    // byte-write-enables on both targets.
+    //
+    // Flops on both targets, deliberately: dirty is one bit per set, and it
+    // is read COMBINATIONALLY by wb_needed. A registered-read memory (BRAM
+    // or macro alike) could not serve that without adding a cycle to the
+    // miss path. Not reset - a line's dirty bit is only ever consulted when
+    // its valid bit is set, and every line becomes valid via a refill,
+    // which clears it.
     reg dirty [0:NUM_SETS-1];
 
     reg [2:0]       state;
@@ -91,9 +107,13 @@ module dcache_bram #(
     wire [TAG-1:0] m_tag  = cpu_req_addr[ADDR_WIDTH-1:OFF+IDX];
     wire [1:0]     m_bank = cpu_req_addr[OFF-1:2];
 
-    reg [31:0]  q0, q1, q2, q3;
-    reg [TAG:0] q_tagv;
-    reg [IDX-1:0] q_a_idx;
+    // Registered array outputs, driven by whichever implementation the
+    // generate below selects. On the macro path these ARE the macro output
+    // registers; on the BRAM path they are inferred output registers. Either
+    // way the read is one cycle, which is what the a_idx speculation hides.
+    wire [31:0]  q0, q1, q2, q3;
+    wire [TAG:0] q_tagv;
+    reg  [IDX-1:0] q_a_idx;
 
     // Confirms the address speculated last cycle is the one MEM actually
     // wants. Combined with the tag compare (which covers [31:OFF+IDX]) every
@@ -129,32 +149,105 @@ module dcache_bram #(
 
     // ---- Store->load bypass (mandatory, not an optimization) ----
     // A store's write edge and the speculative read for the very next cycle
-    // can target the same set. Cross-port read-during-write on Xilinx SDP
-    // BRAM is UNDEFINED - WRITE_FIRST does not apply across ports - so the
-    // load would silently see stale data. One-deep is provably sufficient
-    // because the output registers re-latch every cycle.
+    // can target the same set. Cross-port read-during-write is UNDEFINED on
+    // BOTH targets - on Xilinx SDP BRAM because WRITE_FIRST does not apply
+    // across ports, and on the sky130 macro explicitly (its model prints a
+    // warning for it). The load would silently see stale data. One-deep is
+    // provably sufficient because the output registers re-latch every cycle.
+    //
+    // DO NOT DELETE THIS ON THE STRENGTH OF A PASSING MACRO-PATH TEST.
+    // Deleting the bypass and running Testbenches/tb_dcache_hazard.v gives:
+    //
+    //     BRAM path (default)   4 of 7 checks FAIL   <- bug caught
+    //     macro path (-DUSE_SRAM)  all 7 PASS        <- bug NOT caught
+    //
+    // The OpenRAM behavioral model schedules its port-0 write and its port-1
+    // read on the same negedge, and iverilog happens to order the write
+    // first - so the model resolves the undefined race as write-first and
+    // masks precisely the failure this bypass exists to prevent. That
+    // ordering is a property of one simulator, not a guarantee from the
+    // macro. The BRAM mutation above is the only mechanised evidence that
+    // the bypass is load-bearing; treat it as covering both targets, because
+    // the macro path cannot produce that evidence itself.
     reg        byp_v;
     reg [1:0]  byp_word;
     reg [3:0]  byp_be;
     reg [31:0] byp_data;
 
-    integer b;
-    always @(posedge clk) begin
-        q0 <= d0[a_idx];
-        q1 <= d1[a_idx];
-        q2 <= d2[a_idx];
-        q3 <= d3[a_idx];
-        q_tagv  <= tagv[a_idx];
-        q_a_idx <= a_idx;
-
-        for (b = 0; b < 4; b = b + 1) begin
-            if (be0[b]) d0[waddr][b*8 +: 8] <= wd0[b*8 +: 8];
-            if (be1[b]) d1[waddr][b*8 +: 8] <= wd1[b*8 +: 8];
-            if (be2[b]) d2[waddr][b*8 +: 8] <= wd2[b*8 +: 8];
-            if (be3[b]) d3[waddr][b*8 +: 8] <= wd3[b*8 +: 8];
+    // ---- The five cache arrays: one implementation per target ----
+    generate
+    if (USE_SRAM_MACRO) begin : g_sram
+        // The macro is physically 512 words deep, so a_idx / waddr /
+        // tagv_waddr must be exactly 9 bits. A NUM_SETS mismatch would be
+        // truncated silently at the wrapper port and mis-index every
+        // access, so it is made an elaboration error instead - the
+        // unresolvable module name below IS the error message.
+        if (NUM_SETS != 512) begin : g_depth_check
+            dcache_NUM_SETS_must_be_512_when_USE_SRAM_MACRO_is_set bad ();
         end
 
-        if (tagv_we) tagv[tagv_waddr] <= tagv_wdata;
+        // tagv occupies TAG+1 bits (20 at 512 sets) of a 32-bit macro word.
+        // The padding is written as zero and dropped on read; wmask is 4'hF
+        // because the word is only ever written whole.
+        wire [31:0] tagv_rd;
+
+        sram_sky130 u_d0 (.clk(clk), .raddr(a_idx), .rdata(q0),
+                          .we(|be0), .waddr(waddr), .wdata(wd0), .wmask(be0));
+        sram_sky130 u_d1 (.clk(clk), .raddr(a_idx), .rdata(q1),
+                          .we(|be1), .waddr(waddr), .wdata(wd1), .wmask(be1));
+        sram_sky130 u_d2 (.clk(clk), .raddr(a_idx), .rdata(q2),
+                          .we(|be2), .waddr(waddr), .wdata(wd2), .wmask(be2));
+        sram_sky130 u_d3 (.clk(clk), .raddr(a_idx), .rdata(q3),
+                          .we(|be3), .waddr(waddr), .wdata(wd3), .wmask(be3));
+
+        sram_sky130 u_tagv (.clk(clk), .raddr(a_idx), .rdata(tagv_rd),
+                            .we(tagv_we), .waddr(tagv_waddr),
+                            .wdata({{(32-(TAG+1)){1'b0}}, tagv_wdata}),
+                            .wmask(4'hF));
+
+        assign q_tagv = tagv_rd[TAG:0];
+
+    end else begin : g_bram
+        (* ram_style = "block" *) reg [31:0]  d0 [0:NUM_SETS-1];
+        (* ram_style = "block" *) reg [31:0]  d1 [0:NUM_SETS-1];
+        (* ram_style = "block" *) reg [31:0]  d2 [0:NUM_SETS-1];
+        (* ram_style = "block" *) reg [31:0]  d3 [0:NUM_SETS-1];
+        // Valid lives in the BRAM word so the hit compare is
+        // register-to-register; BRAM can't be bulk-reset, hence S_INIT.
+        (* ram_style = "block" *) reg [TAG:0] tagv [0:NUM_SETS-1];
+
+        reg [31:0]  q0_r, q1_r, q2_r, q3_r;
+        reg [TAG:0] q_tagv_r;
+
+        integer b;
+        always @(posedge clk) begin
+            q0_r     <= d0[a_idx];
+            q1_r     <= d1[a_idx];
+            q2_r     <= d2[a_idx];
+            q3_r     <= d3[a_idx];
+            q_tagv_r <= tagv[a_idx];
+
+            for (b = 0; b < 4; b = b + 1) begin
+                if (be0[b]) d0[waddr][b*8 +: 8] <= wd0[b*8 +: 8];
+                if (be1[b]) d1[waddr][b*8 +: 8] <= wd1[b*8 +: 8];
+                if (be2[b]) d2[waddr][b*8 +: 8] <= wd2[b*8 +: 8];
+                if (be3[b]) d3[waddr][b*8 +: 8] <= wd3[b*8 +: 8];
+            end
+
+            if (tagv_we) tagv[tagv_waddr] <= tagv_wdata;
+        end
+
+        assign q0 = q0_r;
+        assign q1 = q1_r;
+        assign q2 = q2_r;
+        assign q3 = q3_r;
+        assign q_tagv = q_tagv_r;
+    end
+    endgenerate
+
+    // ---- Bookkeeping, identical on both targets ----
+    always @(posedge clk) begin
+        q_a_idx <= a_idx;
 
         // Refills clear dirty; stores and AMO writes set it. Missing the
         // AMO case would silently lose the atomic update.

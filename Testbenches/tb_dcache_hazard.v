@@ -35,7 +35,30 @@ module tb_dcache_hazard;
     wire debug_id_predicted_taken;
     wire debug_cache_ready;
 
+    // Two D-cache array implementations run the SAME checks below. Define
+    // USE_SRAM to build against the sky130 SRAM macros instead of inferred
+    // Block RAM; the store->load bypass and the AMO path are exactly the
+    // hazards whose behaviour differs between the two memories, so running
+    // one config and not the other proves half of what is needed.
+    //
+    //   iverilog -g2005 -o /tmp/tb -s tb_dcache_hazard tb_dcache_hazard.v
+    //   iverilog -g2005 -DUSE_SRAM -o /tmp/tb -s tb_dcache_hazard \
+    //       tb_dcache_hazard.v ../src/sram_sky130.v \
+    //       $PDK/libs.ref/sky130_sram_macros/verilog/sky130_sram_2kbyte_1rw1r_32x512_8.v
+    //
+    // Parameter override rather than defparam on purpose: DC_USE_SRAM feeds
+    // a generate condition, and defparam on such a parameter is the exact
+    // interaction that broke TCM's INIT_ENABLE.
+`ifdef USE_SRAM
+    cpu_pipelined #(
+        .IC_NUM_SETS(512),      // the macro's fixed depth
+        .DC_NUM_SETS(512),
+        .IC_USE_SRAM(1),
+        .DC_USE_SRAM(1)
+    ) DUT (
+`else
     cpu_pipelined DUT (
+`endif
         .clk(clk), .rst(rst),
         .uart_tx(uart_tx_line),
         .uart_rx(uart_rx_line),

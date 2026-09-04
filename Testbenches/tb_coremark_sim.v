@@ -35,7 +35,57 @@ module tb_coremark_sim;
     wire debug_tcm_d_req, debug_tcm_d_ready;
     wire debug_global_mem_stall;
 
+    // Define USE_SRAM to run CoreMark against the sky130 SRAM-macro D-cache
+    // instead of inferred BRAM. The CRCs are the strongest correctness gate
+    // in the repo: they check millions of cache accesses end to end, so a
+    // mismatch here means corrupted data, not a tuning difference. Note the
+    // cache is 8KB in this config against 16KB by default, so the CYCLE
+    // COUNT legitimately differs - only the CRCs must match.
+    //
+    // Five configurations. The first three attribute a macro-path failure;
+    // the last two exist to MEASURE IPC, because the ASIC's CoreMark/MHz can
+    // only be quoted against the cache geometry the ASIC actually builds.
+    //
+    //   (default)     BRAM, IC 2048 / DC 1024   32KB I + 16KB D - the FPGA
+    //                                            config, where 3.17
+    //                                            CoreMark/MHz was measured
+    //   -DSMALL_DC    BRAM, IC 2048 / DC  512   isolates D-cache SIZE
+    //   -DUSE_SRAM    macro, IC 2048 / DC 512   isolates the MACRO
+    //   -DASIC_TARGET BRAM, IC  512 / DC  512    8KB I +  8KB D - what the
+    //                                            macro ASIC will build
+    //   -DASIC_NOW    BRAM, IC   16 / DC   16   256B each - today's ASIC
+    //                                            config, the number the
+    //                                            signed-off 3.328 mm^2 run
+    //                                            actually corresponds to
+    //
+    // ASIC_TARGET and ASIC_NOW use the BRAM path deliberately: it is
+    // cycle-identical to the macro path at the same geometry (verified
+    // bit-for-bit on every counter), and it simulates far faster.
+`ifdef USE_SRAM
+    cpu_pipelined #(
+        .IC_NUM_SETS(512),      // the macro's fixed depth
+        .DC_NUM_SETS(512),
+        .IC_USE_SRAM(1),
+        .DC_USE_SRAM(1)
+    ) DUT (
+`elsif SMALL_DC
+    cpu_pipelined #(
+        .DC_NUM_SETS(512),
+        .DC_USE_SRAM(0)
+    ) DUT (
+`elsif ASIC_TARGET
+    cpu_pipelined #(
+        .IC_NUM_SETS(512),
+        .DC_NUM_SETS(512)
+    ) DUT (
+`elsif ASIC_NOW
+    cpu_pipelined #(
+        .IC_NUM_SETS(16),
+        .DC_NUM_SETS(16)
+    ) DUT (
+`else
     cpu_pipelined DUT (
+`endif
         .clk(clk), .rst(rst),
         .uart_tx(uart_tx_line),
         .uart_rx(uart_rx_line),

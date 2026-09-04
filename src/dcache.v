@@ -12,6 +12,10 @@ module dcache #(
     parameter ADDR_WIDTH = 32,
     parameter LINE_BYTES = 16,
     parameter NUM_SETS = 1024,
+    // Passed straight to dcache_bram; see its header. 0 = inferred BRAM
+    // (FPGA, testbenches), 1 = sky130 SRAM macros (ASIC, requires
+    // NUM_SETS=512).
+    parameter USE_SRAM_MACRO = 0,
     parameter TCM_BASE = 32'h4000_0000,
     parameter TCM_BYTES = 65536
 ) (
@@ -72,7 +76,8 @@ module dcache #(
     dcache_bram #(
         .ADDR_WIDTH(ADDR_WIDTH),
         .LINE_BYTES(LINE_BYTES),
-        .NUM_SETS(NUM_SETS)
+        .NUM_SETS(NUM_SETS),
+        .USE_SRAM_MACRO(USE_SRAM_MACRO)
     ) core_inst (
         .clk(clk),
         .rst(rst),

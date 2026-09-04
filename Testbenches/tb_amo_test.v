@@ -35,7 +35,22 @@ module tb_amo_test;
     wire debug_id_predicted_taken;
     wire debug_cache_ready;
 
+    // Define USE_SRAM to run these same checks against the sky130 SRAM-macro
+    // D-cache instead of inferred BRAM. The AMO read-modify-write path is
+    // the one that holds an address across several cycles while writing it,
+    // so it is worth exercising on both memories. See tb_dcache_hazard.v for
+    // the build lines, and dcache_bram.v for why a pass here does NOT by
+    // itself validate the store->load bypass.
+`ifdef USE_SRAM
+    cpu_pipelined #(
+        .IC_NUM_SETS(512),      // the macro's fixed depth
+        .DC_NUM_SETS(512),
+        .IC_USE_SRAM(1),
+        .DC_USE_SRAM(1)
+    ) DUT (
+`else
     cpu_pipelined DUT (
+`endif
         .clk(clk), .rst(rst),
         .uart_tx(uart_tx_line),
         .uart_rx(uart_rx_line),

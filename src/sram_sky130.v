@@ -55,7 +55,19 @@ module sram_sky130 (
     // own name is parsed as a malformed pragma, which is why this one is
     // worded around it.
     /* verilator lint_off PINCONNECTEMPTY */
-    sky130_sram_2kbyte_1rw1r_32x512_8 u_macro (
+    // VERBOSE=0 is not cosmetic. The PDK behavioral model $displays a line on
+    // EVERY read and EVERY write of every instance. With five instances in
+    // the D-cache that is millions of lines across a CoreMark run, and
+    // because the model's $display emits newlines into the middle of the
+    // testbench's character-at-a-time UART output, it does not merely add
+    // noise - it shreds the program's stdout, so the CoreMark CRC lines can
+    // no longer be read at all. The same-address read-during-write WARNING
+    // is NOT gated by this and still prints, which is the one message worth
+    // keeping. The synthesis blackbox stub declares VERBOSE too, so this
+    // override is legal on both paths.
+    sky130_sram_2kbyte_1rw1r_32x512_8 #(
+        .VERBOSE (0)
+    ) u_macro (
         // Port 0: writes only. Both selects are active low.
         .clk0   (clk),
         .csb0   (~we),
