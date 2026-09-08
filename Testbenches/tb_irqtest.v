@@ -57,7 +57,10 @@ module tb_irqtest;
         rst = 1;
         for (i = 0; i < 16384; i = i + 1)
             temp_mem[i] = 32'h00000013;
-        $readmemh("../fpga/irqtest.mem", temp_mem);
+        // Path updated: the image lives in fpga/tests/, not fpga/. Same silent
+        // $readmemh failure mode as tb_uart_rx - empty TCM, CPU runs NOPs, and
+        // the test dies at its watchdog rather than reporting a missing file.
+        $readmemh("../fpga/tests/irqtest.mem", temp_mem);
         for (i = 0; i < 16384; i = i + 1) begin
             DUT.TCM.mem_even[i] = temp_mem[i][15:0];
             DUT.TCM.mem_odd[i]  = temp_mem[i][31:16];
@@ -82,7 +85,10 @@ module tb_irqtest;
             @(posedge clk);
             $display("t=%0t pc=%h if_id_inst=%h trap_taken=%b timer_fires=%b external_fires=%b mepc=%h mstatus=%h mie=%h pending=%b uart_irq=%b tx_ready=%b",
                 $time, DUT.pc, DUT.if_id_inst, DUT.trap_taken, DUT.timer_fires, DUT.external_fires,
-                DUT.mepc_out, DUT.CSR.mstatus, DUT.CSR.mie, DUT.INTC.pending, DUT.uart_irq, DUT.UART.tx_ready);
+                // uart_irq was split into uart_tx_irq / uart_rx_irq in cpu.v;
+                // this debug $display still named the old single signal, which
+                // failed elaboration outright rather than just printing wrong.
+                DUT.mepc_out, DUT.CSR.mstatus, DUT.CSR.mie, DUT.INTC.pending, DUT.uart_rx_irq, DUT.UART.tx_ready);
         end
         $display("FINAL pc=%h leds=%b", DUT.pc, leds);
         $finish;

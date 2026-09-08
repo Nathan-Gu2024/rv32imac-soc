@@ -16,6 +16,15 @@ module tb_mm_accel_c_test;
     wire [127:0] icache_mem_read_data;
     wire icache_mem_ready;
 
+    // mm_accel result-DMA port, the third requester on mem_arbiter in the real
+    // SoC. Given its own mock line memory here so the C driver exercises the
+    // DMA path, not only its register-window accesses.
+    wire accel_mem_req_valid;
+    wire accel_mem_req_write;
+    wire [31:0] accel_mem_req_addr;
+    wire [127:0] accel_mem_wline;
+    wire accel_mem_ready;
+
     wire [31:0] dmem_req_addr;
     wire [31:0] store_data;
     wire [3:0] mem_write_mask;
@@ -53,6 +62,12 @@ module tb_mm_accel_c_test;
         .dcache_mem_wline(dcache_mem_wline),
         .dcache_mem_read_data_block(dcache_mem_read_data_block),
         .dcache_mem_ready(dcache_mem_ready),
+
+        .accel_mem_req_valid(accel_mem_req_valid),
+        .accel_mem_req_write(accel_mem_req_write),
+        .accel_mem_req_addr(accel_mem_req_addr),
+        .accel_mem_wline(accel_mem_wline),
+        .accel_mem_ready(accel_mem_ready),
 
         .debug_pc(debug_pc),
         .debug_instr(debug_instr),
@@ -141,6 +156,38 @@ module tb_mm_accel_c_test;
         if (DUT.UART.tx_start) begin
             $write("%c", DUT.UART.tx_data);
             char_count = char_count + 1;
+        end
+    end
+
+    // Mock line memory for the accelerator DMA. Deliberately not zero-latency:
+    // the DMA line mux is registered, and a zero-wait responder is what exposed
+    // the settle-cycle bug where dim>=8 published the previous group at the new
+    // address.
+    reg [2:0] a_lat_cnt;
+    reg a_busy;
+    reg [31:0] a_addr_latched;
+    reg [127:0] a_wline_latched;
+    always @(posedge clk) begin
+        if (rst) begin
+            a_busy <= 1'b0;
+            a_lat_cnt <= 0;
+        end else if (!a_busy && accel_mem_req_valid) begin
+            a_busy <= 1'b1;
+            a_lat_cnt <= 3;
+            a_addr_latched <= accel_mem_req_addr;
+            a_wline_latched <= accel_mem_wline;
+        end else if (a_busy) begin
+            if (a_lat_cnt == 0) a_busy <= 1'b0;
+            else a_lat_cnt <= a_lat_cnt - 1;
+        end
+    end
+    assign accel_mem_ready = a_busy && (a_lat_cnt == 0);
+    always @(posedge clk) begin
+        if (accel_mem_ready) begin
+            ddr_mem[{a_addr_latched[28:4], 2'b00}] <= a_wline_latched[31:0];
+            ddr_mem[{a_addr_latched[28:4], 2'b01}] <= a_wline_latched[63:32];
+            ddr_mem[{a_addr_latched[28:4], 2'b10}] <= a_wline_latched[95:64];
+            ddr_mem[{a_addr_latched[28:4], 2'b11}] <= a_wline_latched[127:96];
         end
     end
 

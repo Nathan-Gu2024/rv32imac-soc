@@ -64,6 +64,14 @@ module fpga_top #(
     wire dcache_ready;
     wire [127:0] dcache_rline;
 
+    // mm_accel result DMA -> mem_arbiter third port
+    wire accel_req_valid;
+    wire accel_req_write;
+    wire [31:0] accel_req_addr;
+    wire [127:0] accel_wline;
+    wire accel_ready;
+    wire [127:0] accel_rline;
+
     // Arbiter <-> AXI adapter shared line interface
     wire mem_req_valid;
     wire mem_req_write;
@@ -127,7 +135,13 @@ module fpga_top #(
         .dcache_mem_req_write(dcache_req_write),
         .dcache_mem_wline(dcache_wline),
         .dcache_mem_read_data_block(dcache_rline),
-        .dcache_mem_ready(dcache_ready)
+        .dcache_mem_ready(dcache_ready),
+
+        .accel_mem_req_valid(accel_req_valid),
+        .accel_mem_req_write(accel_req_write),
+        .accel_mem_req_addr(accel_req_addr),
+        .accel_mem_wline(accel_wline),
+        .accel_mem_ready(accel_ready)
     );
 
     mem_arbiter ARBITER (
@@ -145,6 +159,14 @@ module fpga_top #(
         .dcache_wline(dcache_wline),
         .dcache_ready(dcache_ready),
         .dcache_rline(dcache_rline),
+
+        // Accelerator result-DMA port, now driven by mm_accel through cpu.
+        .accel_req_valid(accel_req_valid),
+        .accel_req_write(accel_req_write),
+        .accel_req_addr(accel_req_addr),
+        .accel_wline(accel_wline),
+        .accel_ready(accel_ready),
+        .accel_rline(accel_rline),
 
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),

@@ -17,6 +17,15 @@ module tb_mm_accel_cpu;
     wire [127:0] icache_mem_read_data;
     wire icache_mem_ready;
 
+    // mm_accel result-DMA port. In the real SoC this is mem_arbiter's third
+    // requester; here it gets its own mock so the DMA can be exercised through
+    // the CPU rather than only against tb_mm_accel_dma.v's standalone harness.
+    wire accel_mem_req_valid;
+    wire accel_mem_req_write;
+    wire [31:0] accel_mem_req_addr;
+    wire [127:0] accel_mem_wline;
+    wire accel_mem_ready;
+
     wire [31:0] dmem_req_addr;
     wire [31:0] store_data;
     wire [3:0] mem_write_mask;
@@ -54,6 +63,12 @@ module tb_mm_accel_cpu;
         .dcache_mem_wline(dcache_mem_wline),
         .dcache_mem_read_data_block(dcache_mem_read_data_block),
         .dcache_mem_ready(dcache_mem_ready),
+
+        .accel_mem_req_valid(accel_mem_req_valid),
+        .accel_mem_req_write(accel_mem_req_write),
+        .accel_mem_req_addr(accel_mem_req_addr),
+        .accel_mem_wline(accel_mem_wline),
+        .accel_mem_ready(accel_mem_ready),
 
         .debug_pc(debug_pc),
         .debug_instr(debug_instr),
@@ -137,6 +152,41 @@ module tb_mm_accel_cpu;
         end
     end
 
+    // Mock line memory for the accelerator DMA, same shape as the cache mocks
+    // above. Non-zero latency on purpose: the DMA's line mux is registered, and
+    // a zero-latency responder is what exposed the settle-cycle bug that made
+    // dim>=8 publish the previous group's data at the new address.
+    reg [2:0] a_lat_cnt;
+    reg a_busy;
+    reg [31:0] a_addr_latched;
+    reg [127:0] a_wline_latched;
+    always @(posedge clk) begin
+        if (rst) begin
+            a_busy <= 1'b0;
+            a_lat_cnt <= 0;
+        end else if (!a_busy && accel_mem_req_valid) begin
+            a_busy <= 1'b1;
+            a_lat_cnt <= 3;
+            a_addr_latched <= accel_mem_req_addr;
+            a_wline_latched <= accel_mem_wline;
+        end else if (a_busy) begin
+            if (a_lat_cnt == 0) a_busy <= 1'b0;
+            else a_lat_cnt <= a_lat_cnt - 1;
+        end
+    end
+    assign accel_mem_ready = a_busy && (a_lat_cnt == 0);
+
+    integer accel_lines_written = 0;
+    always @(posedge clk) begin
+        if (accel_mem_ready) begin
+            ddr_mem[{a_addr_latched[28:4], 2'b00}] <= a_wline_latched[31:0];
+            ddr_mem[{a_addr_latched[28:4], 2'b01}] <= a_wline_latched[63:32];
+            ddr_mem[{a_addr_latched[28:4], 2'b10}] <= a_wline_latched[95:64];
+            ddr_mem[{a_addr_latched[28:4], 2'b11}] <= a_wline_latched[127:96];
+            accel_lines_written <= accel_lines_written + 1;
+        end
+    end
+
     initial clk = 0;
     always #5 clk = ~clk;
 
@@ -160,14 +210,52 @@ module tb_mm_accel_cpu;
         end
     endtask
 
+    // DIM=8 with A[i][k]=i+1, B[j][k]=j+1, K=4  ->  C[i][j] = 4*(i+1)*(j+1).
+    // Every expected value depends on BOTH indices, so a transposed array or a
+    // collapsed row cannot pass by coincidence.
+    integer ei, ej, dma_errors, widx;
+    reg signed [31:0] dgot, dexp;
+
     initial begin
         wait (DUT.RF.regs[1] === 32'hA5A5A5A5);
         $display("Sentinel reached, checking results...");
 
-        check("C00", 20, 18);
-        check("C01", 21, -9);
-        check("C10", 22, -1);
-        check("C11", 23, 47);
+        // geometry first: a wrong-DIM build invalidates every other check
+        check("INFO", 24, 32'h00001008);   // maxK=16, dim=8
+
+        check("C00", 20, 4);     // 4*1*1
+        check("C12", 21, 24);    // 4*2*3
+        check("C35", 22, 96);    // 4*4*6
+        check("C77", 23, 256);   // 4*8*8
+
+        check("DMADONE", 25, 1);
+
+        // ---- the DMA'd copy in memory must match, at DEST + row*STRIDE ----
+        // This is the part the register window cannot verify: it checks that
+        // the accumulators actually left over the 128-bit line port, in the
+        // right order, at the right addresses.
+        dma_errors = 0;
+        for (ei = 0; ei < 8; ei = ei + 1)
+            for (ej = 0; ej < 8; ej = ej + 1) begin
+                widx = (32'h00180000 + ei*32 + ej*4) >> 2;
+                dgot = ddr_mem[widx];
+                dexp = 4 * (ei+1) * (ej+1);
+                if (dgot !== dexp) begin
+                    if (dma_errors < 5)
+                        $display("FAIL: DMA C[%0d][%0d] = %0d, expected %0d",
+                                 ei, ej, dgot, dexp);
+                    dma_errors = dma_errors + 1;
+                end
+            end
+        if (dma_errors == 0)
+            $display("PASS: all 64 results DMA'd correctly to 0x00180000");
+        else
+            $display("FAIL: %0d DMA result mismatches", dma_errors);
+
+        if (accel_lines_written === 16)
+            $display("PASS: DMA issued 16 line writes (64 words / 4)");
+        else
+            $display("FAIL: DMA issued %0d line writes, expected 16", accel_lines_written);
 
         $display("DONE");
         $finish;

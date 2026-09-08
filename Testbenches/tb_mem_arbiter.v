@@ -20,7 +20,15 @@ module tb_mem_arbiter;
     wire dcache_ready;
     wire [127:0] dcache_rline;
 
-    // DDR / fake line-memory 
+    // accelerator result DMA (third requester)
+    reg accel_req_valid;
+    reg accel_req_write;
+    reg [31:0] accel_req_addr;
+    reg [127:0] accel_wline;
+    wire accel_ready;
+    wire [127:0] accel_rline;
+
+    // DDR / fake line-memory
     wire mem_req_valid;
     wire mem_req_write;
     wire [31:0] mem_req_addr;
@@ -45,6 +53,13 @@ module tb_mem_arbiter;
         .dcache_wline(dcache_wline),
         .dcache_ready(dcache_ready),
         .dcache_rline(dcache_rline),
+
+        .accel_req_valid(accel_req_valid),
+        .accel_req_write(accel_req_write),
+        .accel_req_addr(accel_req_addr),
+        .accel_wline(accel_wline),
+        .accel_ready(accel_ready),
+        .accel_rline(accel_rline),
 
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),
@@ -81,6 +96,11 @@ module tb_mem_arbiter;
             dcache_req_write = 1'b0;
             dcache_req_addr = 32'h0;
             dcache_wline = 128'h0;
+
+            accel_req_valid = 1'b0;
+            accel_req_write = 1'b0;
+            accel_req_addr = 32'h0;
+            accel_wline = 128'h0;
 
             mem_ready = 1'b0;
             mem_rline = 128'h0;
@@ -237,8 +257,16 @@ module tb_mem_arbiter;
         @(posedge clk);
         #1;
 
-        // Test 4: Simultaneous requests; D-cache priority
-        $display("--- Test 4: Simultaneous Requests (D-Cache Priority) ---");
+        // Test 4: Simultaneous requests. The arbiter is ROUND-ROBIN, not
+        // D-cache priority.
+        //
+        // This test used to assert "D-cache was served first" and had been
+        // failing since mem_arbiter moved to round-robin fairness - the
+        // expectation encoded the OLD policy, where dcache always won outright
+        // and could starve the I-cache. Test 3 served the D-cache, so
+        // last_granted == 0 and grant_i wins this tie by design. Asserting
+        // D-first here would be asserting the starvation bug.
+        $display("--- Test 4: Simultaneous Requests (round-robin) ---");
 
         @(negedge clk);
         icache_req_valid = 1'b1;
@@ -251,9 +279,22 @@ module tb_mem_arbiter;
 
         @(posedge clk);
         #1;
+        expect_mem_read(32'h4000_0000,
+                        "I-cache won the tie (D-cache went last)");
+
+        complete_i_read(128'h0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+
+        @(negedge clk);
+        icache_req_valid = 1'b0;
+        icache_req_addr = 32'h0;
+
+        // Arbiter returns to IDLE on the I-cache completion edge and grants the
+        // still-pending D-cache request on the next clock edge.
+        @(posedge clk);
+        #1;
         expect_mem_write(32'h5000_0000,
                          128'hCAFE_BAFE_CAFE_BAFE_CAFE_BAFE_CAFE_BAFE,
-                         "D-cache was served first");
+                         "D-cache served after I-cache finished");
 
         complete_d_write();
 
@@ -262,19 +303,6 @@ module tb_mem_arbiter;
         dcache_req_write = 1'b0;
         dcache_req_addr = 32'h0;
         dcache_wline = 128'h0;
-
-        // Arbiter returns to IDLE on the D-cache completion edge. It grants
-        // the still-pending I-cache request on the next clock edge.
-        @(posedge clk);
-        #1;
-        expect_mem_read(32'h4000_0000,
-                        "I-cache served after D-cache finished");
-
-        complete_i_read(128'h0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
-
-        @(negedge clk);
-        icache_req_valid = 1'b0;
-        icache_req_addr = 32'h0;
 
         @(posedge clk);
         #1;
@@ -301,6 +329,96 @@ module tb_mem_arbiter;
                         "Arbiter holds latched I-cache request stable");
 
         complete_i_read(128'hAAAA_AAAA_BBBB_BBBB_CCCC_CCCC_DDDD_DDDD);
+
+        @(negedge clk);
+        icache_req_valid = 1'b0;
+        icache_req_addr = 32'h0;
+        @(posedge clk);
+        #1;
+
+        // ---- Test 6: accelerator result-DMA port on its own ----
+        $display("--- Test 6: Accelerator DMA Port ---");
+
+        @(negedge clk);
+        accel_req_valid = 1'b1;
+        accel_req_write = 1'b1;
+        accel_req_addr  = 32'h2100_0000;
+        accel_wline     = 128'h1111_2222_3333_4444_5555_6666_7777_8888;
+
+        @(posedge clk);
+        #1;
+        expect_mem_write(32'h2100_0000,
+                         128'h1111_2222_3333_4444_5555_6666_7777_8888,
+                         "Accelerator DMA line reaches memory");
+
+        @(negedge clk);
+        mem_ready = 1'b1;
+        #1;
+        check(accel_ready, "Accelerator sees ready during mem_ready cycle");
+        check(!icache_ready && !dcache_ready,
+              "Caches do NOT see ready on an accelerator grant");
+        @(posedge clk);
+        @(negedge clk);
+        mem_ready = 1'b0;
+        accel_req_valid = 1'b0;
+        accel_req_write = 1'b0;
+        accel_req_addr  = 32'h0;
+        accel_wline     = 128'h0;
+        @(posedge clk);
+        #1;
+
+        // ---- Test 7: three-way contention must not starve anyone ----
+        //
+        // The point of rotating priority. With all three requesters holding
+        // their requests high, a fixed priority order would let the top two
+        // alternate forever and never serve the third. Each of the three must
+        // be granted exactly once across three consecutive grants - the order
+        // depends on who went last, so this checks COVERAGE, not sequence.
+        $display("--- Test 7: Three-way contention, no starvation ---");
+
+        begin : three_way
+            integer n;
+            integer saw_i, saw_d, saw_a;
+            saw_i = 0; saw_d = 0; saw_a = 0;
+
+            @(negedge clk);
+            icache_req_valid = 1'b1; icache_req_addr = 32'h4000_0000;
+            dcache_req_valid = 1'b1; dcache_req_write = 1'b1;
+            dcache_req_addr  = 32'h5000_0000;
+            dcache_wline     = 128'hCAFE_BAFE_CAFE_BAFE_CAFE_BAFE_CAFE_BAFE;
+            accel_req_valid  = 1'b1; accel_req_write = 1'b1;
+            accel_req_addr   = 32'h2100_0010;
+            accel_wline      = 128'hDEAD_BEEF_DEAD_BEEF_DEAD_BEEF_DEAD_BEEF;
+
+            for (n = 0; n < 3; n = n + 1) begin
+                @(posedge clk);
+                #1;
+                check(mem_req_valid, "A requester is granted each round");
+
+                @(negedge clk);
+                mem_ready = 1'b1;
+                #1;
+                if (icache_ready) begin
+                    saw_i = saw_i + 1;
+                    icache_req_valid = 1'b0;
+                end
+                if (dcache_ready) begin
+                    saw_d = saw_d + 1;
+                    dcache_req_valid = 1'b0;
+                end
+                if (accel_ready) begin
+                    saw_a = saw_a + 1;
+                    accel_req_valid = 1'b0;
+                end
+                @(posedge clk);
+                @(negedge clk);
+                mem_ready = 1'b0;
+            end
+
+            check(saw_i == 1, "I-cache served exactly once in three rounds");
+            check(saw_d == 1, "D-cache served exactly once in three rounds");
+            check(saw_a == 1, "Accelerator served exactly once in three rounds");
+        end
 
         if (errors == 0)
             $display("ALL MEM_ARBITER TESTS PASSED");

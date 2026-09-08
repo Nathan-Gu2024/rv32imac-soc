@@ -9,7 +9,17 @@
 // 2345000 ps - before its map was deliberately changed to the INDEXED form so
 // the array could scale past DIM=7. See Testbenches/tb_mm_accel_gen.v, which
 // drives that map and validates every size the generator emits.
-`include "../src/mm_accel.v"
+// Points at the LEGACY core, not src/mm_accel.v. The SoC now instantiates the
+// Chisel-generated DIM=8 accelerator, whose register map is indexed rather
+// than fixed-word and which takes no parameters (dim/maxK are baked in at
+// elaboration), so this bench cannot drive it - it would not even elaborate,
+// because of the #(.MAX_K(16)) below.
+//
+// Kept pointed at the 2x2 original because it is the reference the Chisel port
+// was validated against: 8/8 checks, cycle-identical at 2345000 ps. Retiring it
+// would throw away the evidence that the port started out bit-exact.
+// Testbenches/tb_mm_accel_gen.v is the equivalent for the generated core.
+`include "../src/mm_accel_v2x2_legacy.v"
 
 // Standalone bridge+accelerator test, bypassing cpu.v entirely: drives the
 // same d_req/d_we/d_addr/d_wdata handshake cpu.v would, straight into the
@@ -46,7 +56,7 @@ module tb_mm_accel;
         .m_axi_rdata(m_rdata), .m_axi_rresp(m_rresp), .m_axi_rvalid(m_rvalid), .m_axi_rready(m_rready)
     );
 
-    mm_accel #(.MAX_K(16)) ACCEL (
+    mm_accel_v2x2_legacy #(.MAX_K(16)) ACCEL (
         .clk(clk), .rst(rst),
         .s_axi_awaddr(m_awaddr), .s_axi_awvalid(m_awvalid), .s_axi_awready(m_awready),
         .s_axi_wdata(m_wdata), .s_axi_wstrb(m_wstrb), .s_axi_wvalid(m_wvalid), .s_axi_wready(m_wready),

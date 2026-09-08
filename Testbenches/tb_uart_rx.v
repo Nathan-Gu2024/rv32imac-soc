@@ -89,7 +89,22 @@ module tb_uart_rx;
         rst = 1;
         for (i = 0; i < 16384; i = i + 1)
             temp_mem[i] = 32'h00000013;
-        $readmemh("../fpga/zephyr_isr_test.mem", temp_mem);
+        // STALE TEST - the echo check below does not reflect working hardware.
+        //
+        // This bench dates from just after the 5-stage pipeline was finished and
+        // was never updated. It loads zephyr_isr_test (a 108-byte ISR test) but
+        // then checks for ECHO behaviour, which lives in echo_bot.bin - a
+        // different image entirely. Expect the 0x5A check to fail.
+        //
+        // The UART itself is fine and was verified the way it is actually used:
+        // a .mem image booted on real hardware, printing to and echoing back
+        // through a PuTTY terminal. Do not go looking for a UART bug here.
+        //
+        // The path was also stale: the image moved into fpga/zephyr/ in commit
+        // c654676. $readmemh on a missing file is SILENT, so the TCM stayed
+        // empty, the CPU fetched NOPs, and the run died at the 200 ms watchdog
+        // with no hint of the real cause - which hid the staleness above.
+        $readmemh("../fpga/zephyr/zephyr_isr_test.mem", temp_mem);
         for (i = 0; i < 16384; i = i + 1) begin
             DUT.TCM.mem_even[i] = temp_mem[i][15:0];
             DUT.TCM.mem_odd[i]  = temp_mem[i][31:16];

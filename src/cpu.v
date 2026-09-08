@@ -79,6 +79,16 @@ module cpu_pipelined #(
     input wire [127:0] dcache_mem_read_data_block,
     input wire dcache_mem_ready,
 
+    // mm_accel result-DMA port, third requester on mem_arbiter alongside the
+    // two caches. The accelerator drains its accumulators here as 128-bit
+    // lines rather than through its 32-bit AXI4-Lite register window, which
+    // measured 70% of GEMM runtime at DIM=16.
+    output wire accel_mem_req_valid,
+    output wire accel_mem_req_write,
+    output wire [31:0] accel_mem_req_addr,
+    output wire [127:0] accel_mem_wline,
+    input wire accel_mem_ready,
+
     // debug (ILA probes; debug_pc/debug_instr are the ID-stage pc/inst,
     // debug_raw_pc is one stage earlier - the raw IF-stage fetch)
     output wire [31:0] debug_pc,
@@ -1262,7 +1272,14 @@ module cpu_pipelined #(
         .s_axi_rdata(accel_axi_rdata),
         .s_axi_rresp(accel_axi_rresp),
         .s_axi_rvalid(accel_axi_rvalid),
-        .s_axi_rready(accel_axi_rready)
+        .s_axi_rready(accel_axi_rready),
+
+        // result DMA out to mem_arbiter's third port
+        .mem_req_valid(accel_mem_req_valid),
+        .mem_req_write(accel_mem_req_write),
+        .mem_req_addr(accel_mem_req_addr),
+        .mem_wline(accel_mem_wline),
+        .mem_ready(accel_mem_ready)
     );
 
     // MEM

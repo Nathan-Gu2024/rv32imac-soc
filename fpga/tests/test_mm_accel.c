@@ -1,11 +1,16 @@
-/* Standalone hardware test for the 2x2 output-stationary systolic
- * matmul accelerator (src/mm_accel.v, driven over a real AXI4-Lite link via
- * src/axi_lite_bridge.v). Computes C = A*B for A=[[3,-2],[5,7]],
- * B=[[4,1],[-3,6]] -> C=[[18,-9],[-1,47]] (same operands as
- * Testbenches/tb_mm_accel.v and test_mm_accel.S), then a second run with
- * A=[[1,2],[3,4]], B=[[5,6],[7,8]] -> C=[[19,22],[43,50]] to exercise the
- * "START must clear stale DONE" fix. Reports PASS/FAIL per check over UART,
- * mirroring fpga/tests/test_amo.c's style.
+/* Hardware test for the Chisel-generated systolic matmul accelerator
+ * (src/mm_accel.v, driven over a real AXI4-Lite link via src/axi_lite_bridge.v),
+ * including the result DMA that leaves over mem_arbiter's 128-bit line port.
+ *
+ * REWRITTEN for the indexed register map. The previous version drove the
+ * hand-written 2x2 core's fixed-word map - a separate MMIO word per operand
+ * lane and per accumulator, which is 2*DIM + DIM*DIM words and stops fitting a
+ * 64-word window well before DIM=16. The map below is CONSTANT SIZE in DIM.
+ *
+ * The array size is DISCOVERED from the INFO register rather than hardcoded,
+ * so this same binary drives any build the generator emits. That matters here
+ * because dim is fixed at Chisel elaboration, not by a Verilog parameter - a
+ * driver that assumed 2x2 would silently compute garbage on a DIM=8 build.
  */
 #include <stdint.h>
 
@@ -13,18 +18,32 @@
 #define UART_TX_STATUS *((volatile uint32_t*)0x40001004)
 
 #define ACCEL_BASE 0x00005000
-#define ACCEL_CTRL      *((volatile uint32_t*)(ACCEL_BASE + 0x00))
-#define ACCEL_STATUS    *((volatile uint32_t*)(ACCEL_BASE + 0x04))
-#define ACCEL_KLEN      *((volatile uint32_t*)(ACCEL_BASE + 0x08))
-#define ACCEL_LOAD_IDX  *((volatile uint32_t*)(ACCEL_BASE + 0x0C))
-#define ACCEL_A_ROW0    *((volatile uint32_t*)(ACCEL_BASE + 0x10))
-#define ACCEL_A_ROW1    *((volatile uint32_t*)(ACCEL_BASE + 0x14))
-#define ACCEL_B_COL0    *((volatile uint32_t*)(ACCEL_BASE + 0x18))
-#define ACCEL_B_COL1    *((volatile uint32_t*)(ACCEL_BASE + 0x1C))
-#define ACCEL_RESULT00  *((volatile uint32_t*)(ACCEL_BASE + 0x20))
-#define ACCEL_RESULT01  *((volatile uint32_t*)(ACCEL_BASE + 0x24))
-#define ACCEL_RESULT10  *((volatile uint32_t*)(ACCEL_BASE + 0x28))
-#define ACCEL_RESULT11  *((volatile uint32_t*)(ACCEL_BASE + 0x2C))
+#define ACCEL_REG(w) (*((volatile uint32_t*)(ACCEL_BASE + 4*(w))))
+
+#define ACCEL_CTRL        ACCEL_REG(0)
+#define ACCEL_STATUS      ACCEL_REG(1)
+#define ACCEL_KLEN        ACCEL_REG(2)
+#define ACCEL_LOAD_K      ACCEL_REG(3)
+#define ACCEL_LOAD_LANE   ACCEL_REG(4)
+#define ACCEL_A_PUSH      ACCEL_REG(5)
+#define ACCEL_B_PUSH      ACCEL_REG(6)
+#define ACCEL_RESULT_IDX  ACCEL_REG(7)
+#define ACCEL_RESULT      ACCEL_REG(8)
+#define ACCEL_INFO        ACCEL_REG(9)
+#define ACCEL_DEST_ADDR   ACCEL_REG(10)
+#define ACCEL_DEST_STRIDE ACCEL_REG(11)
+
+#define CTRL_START     0x1
+#define CTRL_SOFT_RST  0x2
+#define CTRL_START_DMA 0x4
+
+#define ST_BUSY     0x1
+#define ST_DONE     0x2
+#define ST_DMA_BUSY 0x4
+#define ST_DMA_DONE 0x8
+
+/* Where the DMA drops results. Must be 16-byte aligned. */
+#define RESULT_BUF 0x00180000
 
 static void uart_putchar(char c) {
     while (UART_TX_STATUS == 0) {}
@@ -54,7 +73,7 @@ static void uart_print_int32(int32_t v) {
         buf[i++] = '0' + (u % 10);
         u /= 10;
     }
-    while (i > 0) uart_putchar(buf[--i]);
+    while (i) uart_putchar(buf[--i]);
 }
 
 static int fail_count = 0;
@@ -78,55 +97,124 @@ static void check(const char *name, int32_t actual, int32_t expected) {
     }
 }
 
-/* Loads A/B into the accelerator, runs a K_LEN=2 matmul, and blocks (polling
- * STATUS) until DONE - a real system would do other work while polling, but
- * this test just wants the result. */
-static void run_matmul(int8_t a_row0[2], int8_t a_row1[2],
-                        int8_t b_col0[2], int8_t b_col1[2]) {
-    ACCEL_KLEN = 2;
-    for (int k = 0; k < 2; k++) {
-        ACCEL_LOAD_IDX = k;
-        ACCEL_A_ROW0 = (uint32_t)(uint8_t)a_row0[k];
-        ACCEL_A_ROW1 = (uint32_t)(uint8_t)a_row1[k];
-        ACCEL_B_COL0 = (uint32_t)(uint8_t)b_col0[k];
-        ACCEL_B_COL1 = (uint32_t)(uint8_t)b_col1[k];
+/* Load one panel. LOAD_LANE is written once: LOAD_K auto-increments per push
+ * and LOAD_LANE auto-advances when a lane's k-groups are exhausted, so a whole
+ * dim x klen panel is one index write plus dim*(klen/4) pushes. Per-lane index
+ * writes used to be a third of operand traffic at klen=8.
+ *
+ * val[lane] is replicated across all klen entries of that lane, which keeps
+ * this driver short while still giving results that depend on both indices.
+ */
+static void push_panel(volatile uint32_t *port, const uint8_t *val,
+                       int dim, int klen) {
+    ACCEL_LOAD_LANE = 0;
+    for (int lane = 0; lane < dim; lane++) {
+        uint32_t w = ((uint32_t)val[lane]) * 0x01010101u;
+        for (int g = 0; g < klen / 4; g++) *port = w;
     }
-    ACCEL_CTRL = 1; // START
-    while (!(ACCEL_STATUS & 0x2)) {} // poll DONE
 }
 
 int main() {
     uart_print("=== matmul accelerator test start ===\r\n");
 
-    {
-        int8_t a_row0[2] = {3, -2};
-        int8_t a_row1[2] = {5, 7};
-        int8_t b_col0[2] = {4, -3};
-        int8_t b_col1[2] = {1, 6};
-        run_matmul(a_row0, a_row1, b_col0, b_col1);
-        check("C00", (int32_t)ACCEL_RESULT00, 18);
-        check("C01", (int32_t)ACCEL_RESULT01, -9);
-        check("C10", (int32_t)ACCEL_RESULT10, -1);
-        check("C11", (int32_t)ACCEL_RESULT11, 47);
+    uint32_t info = ACCEL_INFO;
+    int dim  = info & 0xFF;
+    int maxk = (info >> 8) & 0xFF;
+
+    uart_print("geometry: dim=");
+    uart_print_int32(dim);
+    uart_print(" maxK=");
+    uart_print_int32(maxk);
+    uart_print("\r\n");
+
+    if (dim < 2 || dim > 16 || (dim & (dim - 1)) != 0) {
+        uart_print("=== BAD GEOMETRY, ABORTING ===\r\n");
+        while (1) {}
     }
 
-    {
-        int8_t a_row0[2] = {1, 2};
-        int8_t a_row1[2] = {3, 4};
-        int8_t b_col0[2] = {5, 7};
-        int8_t b_col1[2] = {6, 8};
-        run_matmul(a_row0, a_row1, b_col0, b_col1);
-        check("run2_C00", (int32_t)ACCEL_RESULT00, 19);
-        check("run2_C01", (int32_t)ACCEL_RESULT01, 22);
-        check("run2_C10", (int32_t)ACCEL_RESULT10, 43);
-        check("run2_C11", (int32_t)ACCEL_RESULT11, 50);
+    /* A[i][k] = i+1, B[j][k] = j+1, klen = 4  ->  C[i][j] = 4*(i+1)*(j+1).
+     * Every expected value depends on both indices, so a transposed array or
+     * a collapsed row cannot pass by accident. */
+    const int klen = 4;
+    uint8_t va[16], vb[16];
+    for (int i = 0; i < dim; i++) { va[i] = (uint8_t)(i + 1); vb[i] = (uint8_t)(i + 1); }
+
+    ACCEL_KLEN = klen;
+    push_panel(&ACCEL_A_PUSH, va, dim, klen);
+    push_panel(&ACCEL_B_PUSH, vb, dim, klen);
+
+    ACCEL_CTRL = CTRL_START;
+    while (!(ACCEL_STATUS & ST_DONE)) {}
+
+    /* Spot-check through the register window. RESULT_IDX auto-increments on
+     * each RESULT read, so a full sweep is one index write plus dim*dim reads
+     * rather than two transactions per element. */
+    ACCEL_RESULT_IDX = 0;
+    int32_t c00 = (int32_t)ACCEL_RESULT;         /* idx 0 */
+    ACCEL_RESULT_IDX = dim + 1;                  /* C[1][1] */
+    int32_t c11 = (int32_t)ACCEL_RESULT;
+    ACCEL_RESULT_IDX = dim * dim - 1;            /* C[dim-1][dim-1] */
+    int32_t clast = (int32_t)ACCEL_RESULT;
+
+    check("C00",   c00,   4 * 1 * 1);
+    check("C11",   c11,   4 * 2 * 2);
+    check("Clast", clast, 4 * dim * dim);
+
+    /* ---- result DMA ----
+     * STRIDE = one tile row (dim*4 bytes) writes the tile contiguously. Set it
+     * to a larger matrix's row pitch instead and the tile lands directly in
+     * place inside that matrix, with no software copy - which is the whole
+     * reason the stride is programmable.
+     */
+    /* COHERENCE: the DMA writes DRAM through mem_arbiter, BEHIND the D-cache.
+     * This SoC has no cache flush or invalidate, and no uncached DRAM window -
+     * the MMIO decodes are device windows only. So any line of RESULT_BUF that
+     * is already in the D-cache when the DMA runs will be read back STALE.
+     *
+     * This is not hypothetical: pre-zeroing this buffer (the obvious way to
+     * prove the DMA really wrote it) put 64 zeroed lines in the cache and made
+     * every single result read back as 0, while the accumulators themselves
+     * were provably correct through the register window.
+     *
+     * RESULT_BUF is therefore left untouched before the DMA, so the reads below
+     * miss and fetch the DMA-written data from DRAM. That is a real constraint
+     * on this hardware, not a trick to make the test pass: software must treat
+     * a DMA destination as untouched-then-read, and anything more general needs
+     * either cache maintenance or an uncached window. Note that OpenGeMM sidesteps
+     * this entirely by having the accelerator write a tightly-coupled scratchpad
+     * the core reads directly, rather than cacheable DRAM.
+     *
+     * The expected values (4*(i+1)*(j+1), ranging 4..256) are distinctive
+     * enough that uninitialised or stale memory cannot match by chance.
+     */
+    volatile int32_t *buf = (volatile int32_t *)RESULT_BUF;
+
+    ACCEL_DEST_ADDR   = RESULT_BUF;
+    ACCEL_DEST_STRIDE = dim * 4;
+    ACCEL_CTRL        = CTRL_START_DMA;
+    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+
+    int dma_bad = 0;
+    for (int i = 0; i < dim; i++)
+        for (int j = 0; j < dim; j++)
+            if (buf[i * dim + j] != 4 * (i + 1) * (j + 1)) dma_bad++;
+
+    if (dma_bad == 0) {
+        uart_print("PASS: DMA wrote all ");
+        uart_print_int32(dim * dim);
+        uart_print(" results\r\n");
+    } else {
+        fail_count++;
+        uart_print("FAIL: DMA mismatches=");
+        uart_print_int32(dma_bad);
+        uart_print("\r\n");
     }
 
     if (fail_count == 0) {
         uart_print("=== ALL MATMUL CHECKS PASSED ===\r\n");
     } else {
         uart_print("=== MATMUL FAILURES: ");
-        uart_putchar('0' + (fail_count > 9 ? 9 : fail_count));
+        uart_print_int32(fail_count);
         uart_print(" ===\r\n");
     }
 

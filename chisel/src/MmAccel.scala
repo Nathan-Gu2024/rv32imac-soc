@@ -17,7 +17,7 @@
 // accumulator are addressed by index rather than by address:
 //
 //   word 0  CTRL       (W)  bit0=START (ignored while BUSY), bit1=SOFT_RST
-//   word 1  STATUS     (R)  bit0=BUSY, bit1=DONE
+//   word 1  STATUS     (R)  bit0=BUSY, bit1=DONE, bit2=DMA_BUSY, bit3=DMA_DONE
 //   word 2  K_LEN      (RW) reduction depth for the next run, <= maxK
 //   word 3  LOAD_K     (RW) k-GROUP index; each group is 4 packed INT8
 //   word 4  LOAD_LANE  (RW) which row (A) or column (B) to push into.
@@ -26,9 +26,25 @@
 //                           then LOAD_K auto-increments
 //   word 6  B_PUSH     (W)  same for bCol[LOAD_LANE]
 //   word 7  RESULT_IDX (RW) accumulator to read, = row*DIM + col
-//   word 8  RESULT     (R)  accumulator[RESULT_IDX]
+//   word 8  RESULT     (R)  accumulator[RESULT_IDX], then RESULT_IDX
+//                           auto-increments - so a whole tile reads back with
+//                           one transaction per element instead of two
 //   word 9  INFO       (R)  {maxK[15:8], dim[7:0]} - geometry discovery, so
 //                           software need not hardcode the array size
+//   word 10 DEST_ADDR  (RW) byte address the result DMA writes to. Must be
+//                           16-byte aligned; the burst is dim*dim/4 lines of
+//                           128 bits, written in row-major accumulator order.
+//   word 11 DEST_STRIDE(RW) byte distance between consecutive RESULT ROWS.
+//                           0 = contiguous (stride = dim*4). Set this to the
+//                           full matrix row pitch (N*4) to have a tile land
+//                           directly in its place inside a larger C, with no
+//                           software copy. Ignored at dim=2, where one
+//                           128-bit line spans both rows.
+//
+// CTRL bit2 kicks the result DMA, which drains the accumulators over the
+// mem_arbiter line port instead of through this 32-bit register window. That
+// is the whole point of it: readback measured 70% of GEMM runtime at dim=16
+// because each result cost ~5 cycles of AXI4-Lite protocol for 4 bytes.
 //
 // Packing 4 INT8 per 32-bit write plus auto-increment cuts the operand traffic
 // for DIM=16,K=16 from 512 writes to ~160. It does NOT make the accelerator
@@ -116,6 +132,16 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
   val s_axi_rvalid  = IO(Output(Bool()))
   val s_axi_rready  = IO(Input(Bool()))
 
+  // Result-DMA master port. Deliberately the mem_arbiter LINE protocol, not
+  // AXI4 - the SoC already arbitrates two 128-bit cache ports into
+  // axi_cache_adapter, so becoming a third requester reuses proven plumbing
+  // and gets 16 bytes per transaction instead of AXI4-Lite's 4.
+  val mem_req_valid = IO(Output(Bool()))
+  val mem_req_write = IO(Output(Bool()))
+  val mem_req_addr  = IO(Output(UInt(32.W)))
+  val mem_wline     = IO(Output(UInt(128.W)))
+  val mem_ready     = IO(Input(Bool()))
+
   withClockAndReset(clk, rst) {
 
     val busy      = RegInit(false.B)
@@ -125,6 +151,31 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
     val loadLane  = RegInit(0.U(laneBits.W))
     val resultIdx = RegInit(0.U(accBits.W))
     val t         = RegInit(0.U(8.W))
+
+    // Result-DMA state. Declared here with the rest of the register file so the
+    // write-decode block below can reach it; the datapath and burst sequencer
+    // live further down with the accumulator selection they depend on.
+    // destAddr is what software programs; dmaAddr is the working cursor that
+    // walks it, so a re-kick does not need the address rewritten.
+    val destAddr = RegInit(0.U(32.W))
+    val dmaAddr  = RegInit(0.U(32.W))
+    val dmaBusy  = RegInit(false.B)
+    val dmaDone  = RegInit(false.B)
+
+    // Byte distance between consecutive RESULT ROWS in memory - OpenGeMM's
+    // "programmable strided memory access", and the thing that decides whether
+    // this DMA is useful at all.
+    //
+    // A tile computes C[ti*dim+i][tj*dim+j] of a bigger M x N matrix. Each tile
+    // row is contiguous (dim words), but the next row starts N*4 bytes later.
+    // Writing dim*dim words contiguously would land the tile in a scratch
+    // buffer that software then has to copy into place - which is exactly the
+    // CPU-mediated movement the DMA exists to eliminate.
+    //
+    // 0 means "rows are contiguous", i.e. stride = dim*4, which is the correct
+    // behaviour when the destination really is a dim x dim buffer.
+    val destStride = RegInit(0.U(32.W))
+    val dmaRowBase = RegInit(0.U(32.W))
 
     val aRowBuf = Seq.fill(dim)(Mem(maxK, SInt(8.W)))
     val bColBuf = Seq.fill(dim)(Mem(maxK, SInt(8.W)))
@@ -184,7 +235,28 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
       }
       is(rResp) {
         arreadyReg := false.B
-        when(s_axi_rready) { rvalidReg := false.B; rState := rIdle }
+        when(s_axi_rready) {
+          rvalidReg := false.B
+          rState    := rIdle
+          // Auto-increment RESULT_IDX on a RESULT read, mirroring what LOAD_K
+          // already does for operand pushes.
+          //
+          // This is the single biggest throughput fix in the register map, and
+          // it came out of measurement rather than inspection. Benchmarking a
+          // real tiled GEMM (Testbenches/tb_mm_accel_bench.v) put readback at
+          // 54-60% of total runtime, ahead of operand load at 33-40%, because
+          // every result cost TWO AXI transactions - set RESULT_IDX, then read
+          // RESULT - while a packed operand push moves 4 bytes in ONE. Per byte
+          // moved, readback was 8x less efficient than load.
+          //
+          // With this, sweeping the accumulators costs one transaction each.
+          // accBits is exactly log2(dim*dim) for every power-of-two dim, so the
+          // counter wraps cleanly at the end of the array with no compare.
+          //
+          // Precedence: this sits BEFORE the register-write block, so an
+          // explicit write to RESULT_IDX still overrides the auto-increment.
+          when(raddrWord === 8.U) { resultIdx := resultIdx + 1.U }
+        }
       }
     }
 
@@ -195,12 +267,17 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
     // ---- register writes (ignored while BUSY so an in-flight run is safe) ----
     val startPulse   = doWrite && (waddrWord === 0.U) && s_axi_wdata(0) && !busy
     val softRstPulse = doWrite && (waddrWord === 0.U) && s_axi_wdata(1)
+    // CTRL bit2 kicks the result DMA. Gated on !dmaBusy so a second write
+    // during a burst cannot restart it mid-flight and corrupt the cursor.
+    val dmaStart     = doWrite && (waddrWord === 0.U) && s_axi_wdata(2) && !dmaBusy
 
     val pushA = doWrite && !busy && (waddrWord === 5.U)
     val pushB = doWrite && !busy && (waddrWord === 6.U)
 
     when(doWrite && !busy) {
-      when(waddrWord === 2.U) { kLen := s_axi_wdata(7, 0) }
+      when(waddrWord === 2.U)  { kLen := s_axi_wdata(7, 0) }
+      when(waddrWord === 10.U) { destAddr   := s_axi_wdata } // DEST_ADDR
+      when(waddrWord === 11.U) { destStride := s_axi_wdata } // DEST_STRIDE
       when(waddrWord === 3.U) { loadK := s_axi_wdata(kGrpBits - 1, 0) }
       when(waddrWord === 4.U) {
         loadLane := s_axi_wdata(laneBits - 1, 0)
@@ -221,7 +298,26 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
           }
         }
       }
-      when(pushA || pushB) { loadK := loadK + 1.U }
+      // When a lane's k-groups are exhausted, advance to the next lane and wrap
+      // k back to 0. Same motivation as the RESULT_IDX auto-increment: at
+      // kLen=8 a lane cost one LOAD_LANE write plus only two pushes, so a THIRD
+      // of operand traffic was index bookkeeping rather than data. A whole
+      // matrix now loads as one LOAD_LANE write followed by dim*(kLen/4)
+      // back-to-back pushes.
+      //
+      // laneBits is exactly log2(dim) for power-of-two dim, so the lane counter
+      // wraps at the end of the array on its own. Software may still write
+      // LOAD_LANE explicitly to seek to a lane: that is waddrWord 4 while a
+      // push is 5 or 6, so the two are mutually exclusive and never race.
+      when(pushA || pushB) {
+        val lastGrp = (kLen >> 2) - 1.U
+        when(loadK === lastGrp) {
+          loadK    := 0.U
+          loadLane := loadLane + 1.U
+        }.otherwise {
+          loadK := loadK + 1.U
+        }
+      }
     }
 
     // ---- run sequencer ----
@@ -258,6 +354,124 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
       pe.io.bIn      := (if (i == 0) bEdge(j) else pes(i - 1)(j).io.bOut)
     }
 
+    // ---- result DMA: drain the accumulators to memory as 128-bit lines ----
+    //
+    // Why this exists. Benchmarking a real tiled GEMM put RESULT readback at
+    // 70% of runtime at dim=16: every accumulator left through a 32-bit
+    // AXI4-Lite register window costing ~5 cycles of protocol per 4 bytes, so
+    // 256 results cost ~1800 cycles against 46 cycles of actual compute. No
+    // register-map trick fixes that - the window itself has to get wider.
+    //
+    // The SoC already has a wide path: mem_arbiter carries 128-bit LINES to
+    // axi_cache_adapter for the two caches. Rather than build a private AXI4
+    // master, this port speaks that same line protocol and becomes a third
+    // requester. 16 bytes per transaction instead of 4, over proven plumbing.
+    //
+    // Draining 4 accumulators per cycle keeps the line format natural and
+    // matches the arbiter's width exactly. The selection mirrors the two-stage
+    // structure that fixed routing at dim=16 - group muxes local to a row, a
+    // register, then a mux across rows - because a flat dim*dim:1 mux over
+    // 32-bit accumulators is what made global routing fail in the first place.
+    val lineWords = 4
+    val nGroups   = (dim * dim) / lineWords            // 128-bit lines per tile
+    val grpBits   = log2Ceil(nGroups) max 1
+
+    val dmaGrp   = RegInit(0.U(grpBits.W))
+
+    // Group g holds flattened accumulators 4g .. 4g+3. For dim >= 4 an aligned
+    // group of four never straddles a row, so the first stage stays row-local.
+    // dim = 2 is the degenerate case: the whole array is a single line, so
+    // there is no selection to make and no mux to build.
+    val lineData = Wire(UInt(128.W))
+    if (nGroups == 1) {
+      lineData := Cat(pes.flatten.map(_.io.acc.asUInt).reverse)
+    } else {
+      val perRow    = nGroups / dim                    // groups per row, >= 1
+      val rowLines  = VecInit(pes.map { row =>
+        val groups = VecInit((0 until perRow).map { g =>
+          Cat((0 until lineWords).map(w => row(g * lineWords + w).io.acc.asUInt).reverse)
+        })
+        if (perRow == 1) groups(0) else groups(dmaGrp(log2Ceil(perRow) - 1, 0))
+      })
+      val rowLineReg = RegNext(rowLines)
+      val rowSelDma  = if (perRow == 1) dmaGrp else dmaGrp >> log2Ceil(perRow)
+      lineData := rowLineReg(rowSelDma)
+    }
+
+    // One outstanding line request at a time, exactly like each cache port on
+    // mem_arbiter - so this needs no reordering and no tags.
+    //
+    // dmaSettle exists because lineData is REGISTERED (rowLineReg). For dim >= 8
+    // there is more than one group per row, so the group mux is driven by dmaGrp
+    // and its output is therefore one cycle behind a change of dmaGrp. Asserting
+    // the request in that cycle publishes the PREVIOUS group's data at the new
+    // address.
+    //
+    // This was a real bug and it only appeared against ZERO-LATENCY memory: with
+    // any wait states the register had already settled before mem_ready came
+    // back, so dim=8 and dim=16 passed at lat>=3 and corrupted line 1 onward at
+    // lat=0. Testing the DMA only against slow memory would have shipped it.
+    //
+    // One settle cycle per line costs nothing whenever memory has any latency at
+    // all, which on a port shared with two caches is the normal case.
+    val memReqValid = RegInit(false.B)
+    val dmaSettle   = RegInit(false.B)
+    // Groups per result row, and whether this group ends one. Both are
+    // compile-time constants, so the row test is a bit-compare, not a divide.
+    //
+    // dim = 2 is excluded: the whole 2x2 tile is a single 128-bit line spanning
+    // BOTH rows, so there is no row boundary to stride at. Stride is ignored
+    // there and the tile is written contiguously - correct for a 2x2 scratch
+    // destination, which is the only sensible target at that size anyway.
+    val perRowGrp = if (nGroups >= dim) nGroups / dim else 0
+    val strideOK  = perRowGrp >= 1
+    val atRowEnd: Bool =
+      if (!strideOK || perRowGrp == 1) true.B
+      else dmaGrp(log2Ceil(perRowGrp) - 1, 0) === (perRowGrp - 1).U
+
+    // stride 0 = contiguous rows, i.e. exactly one tile row of dim words
+    val effStride = Mux(destStride === 0.U, (dim * 4).U, destStride)
+
+    when(dmaStart) {
+      dmaBusy    := true.B
+      dmaDone    := false.B
+      dmaGrp     := 0.U
+      dmaAddr    := destAddr
+      dmaRowBase := destAddr
+      dmaSettle  := true.B
+    }.elsewhen(dmaBusy) {
+      when(dmaSettle) {
+        dmaSettle   := false.B          // let rowLineReg catch up to dmaGrp
+        memReqValid := true.B
+      }.elsewhen(mem_ready) {
+        when(dmaGrp === (nGroups - 1).U) {
+          dmaBusy     := false.B
+          dmaDone     := true.B
+          memReqValid := false.B
+        }.otherwise {
+          dmaGrp := dmaGrp + 1.U
+          if (strideOK) {
+            when(atRowEnd) {
+              dmaAddr    := dmaRowBase + effStride
+              dmaRowBase := dmaRowBase + effStride
+            }.otherwise {
+              dmaAddr := dmaAddr + (lineWords * 4).U
+            }
+          } else {
+            dmaAddr := dmaAddr + (lineWords * 4).U
+          }
+          dmaSettle   := true.B
+          memReqValid := false.B
+        }
+      }
+    }
+
+    mem_req_valid := memReqValid && dmaBusy && !dmaSettle
+    mem_req_write := true.B                            // Phase 1 is write-only
+    mem_req_addr  := dmaAddr
+    mem_wline     := lineData
+
+
     // ---- read mux ----
     // Two-stage, and it has to be. The obvious version,
     //     val results = VecInit(pes.flatten.map(_.io.acc.asUInt))
@@ -289,7 +503,9 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16) extends RawModule {
     val results   = rowSelReg(resRow)
     val rdata     = WireDefault(0.U(32.W))
     switch(raddrWord) {
-      is(1.U) { rdata := Cat(0.U(30.W), done, busy) }
+      is(1.U)  { rdata := Cat(0.U(28.W), dmaDone, dmaBusy, done, busy) }
+      is(10.U) { rdata := destAddr }
+      is(11.U) { rdata := destStride }
       is(2.U) { rdata := kLen }
       is(3.U) { rdata := loadK }
       is(4.U) { rdata := loadLane }
@@ -318,7 +534,13 @@ object EmitMmAccel extends App {
     firtoolOpts = Array(
       "-disable-all-randomization",
       "-strip-debug-info",
-      "--lowering-options=disallowPackedArrays,disallowLocalVariables"
+      // noAlwaysComb emits `always @(*)` instead of `always_comb`. cpu.v pulls
+      // this file in with `include and the rest of the SoC is Verilog-2001, so
+      // a SystemVerilog-only keyword here fails Vivado's parser on the parent
+      // file. This keeps ONE artifact that drops into the SoC, iverilog and
+      // OpenLane alike, rather than a .sv for synthesis and a converted .v for
+      // the CPU that could silently drift apart.
+      "--lowering-options=disallowPackedArrays,disallowLocalVariables,noAlwaysComb"
     )
   )
   println(s"[EmitMmAccel] wrote $out/mm_accel.sv for dim=$dim maxK=$maxK")
