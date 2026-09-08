@@ -32,20 +32,31 @@ GDSII** with eleven SRAM macros, LVS-clean and XOR-clean.
 | Memory | **11 OpenRAM SRAM macros** — 8 KB I-cache (6), 8 KB D-cache (5) |
 | Cells | 88,932 synthesized → 109,133 placed |
 | Timing | **WNS/TNS 0.0** — no setup or hold violations |
-| Clock | 27 ns (**37 MHz**) chip-level; core logic closes at **17.34 ns (57.7 MHz)** |
-| LVS | **Clean** — 110,178 nets, both sides |
+| Clock | 25 ns (**40 MHz**) chip-level; core logic closes at **19.82 ns (50.5 MHz)** |
+| LVS | **Clean** — 110,523 nets, both sides |
 | KLayout XOR | **0 differences** |
+| Antenna | 45 pin / 42 net |
 | CoreMark/MHz | **3.16** (see below) |
 
-The 37 MHz figure is I/O-bound, not core-bound: at a 20 ns constraint every
-setup violation was an output port (`store_data[*]`, crossing a 4900 µm die to
-a perimeter pin) and **zero** register-to-register paths failed. The worst of
-958 reg-to-reg paths has 2.66 ns of slack at 20 ns, putting the core's own
-limit at **17.34 ns / 57.7 MHz**; that path is the IF-stage next-PC mux chain
-(gshare / RAS / branch target) feeding the I-cache address. Closing the gap
-means constraining I/O pin placement or registering the memory-side outputs,
-not faster tooling. Notably the SRAM macros are **not** on any critical path —
-0.53 ns clock-to-out against a 27 ns period.
+The clock is I/O-bound, not core-bound: **every** setup violation is an output
+port and **zero** register-to-register paths fail. `openlane/cpu/pin_order.cfg`
+groups the pins by function so the timing-critical ones sit on the east and
+west edges, against the logic channel — the macro rows wall off north and
+south. That moved `store_data`'s arrival from 20.30 ns to 19.09 ns and the
+minimum legal period from 25.69 ns to 24.17 ns, and shortened total wire
+length 5.3% while cutting antenna violations ~25%.
+
+What remains is **logic depth, not placement**: the `store_data` path traverses
+roughly 58 gates through the AMO sequencer and partial-store alignment, so no
+further pin work touches it. Registering the memory-side outputs would reach
+the core's own limit of 19.82 ns / 50.5 MHz, at the cost of a cycle on the
+store path.
+
+Two notes for anyone reproducing this. `base.sdc` sets
+`output_delay = CLOCK_PERIOD × IO_PCT`, so the output budget **scales with the
+clock** and OpenLane's `suggested_clock_period` is wrong whenever outputs are
+critical — solve `P − 0.2P − 0.25 > arrival` instead. And the SRAM macros are
+**not** on any critical path: 0.53 ns clock-to-out against a 25 ns period.
 
 ### Figure of merit
 
@@ -58,20 +69,21 @@ included — a fixed overhead that slightly favours the slower build).
 | Build | f_max | Cycles | Area | **FOM** | |
 |---|---|---|---|---|---|
 | Flip-flop, 256 B/256 B | 50.0 MHz | 16,648,911 | 3.328 mm² | **1.65 × 10¹⁰** | — |
-| SRAM macro, 8 KB/8 KB | 37.0 MHz | 8,975,373 | 10.584 mm² | **1.27 × 10¹⁰** | 0.77× |
-| SRAM macro, I/O fixed | 57.7 MHz | 8,975,373 | 10.584 mm² | **1.98 × 10¹⁰** | 1.20× |
+| SRAM macro, default pin placement | 37.0 MHz | 8,975,373 | 10.584 mm² | **1.27 × 10¹⁰** | 0.77× |
+| **SRAM macro, pins grouped** | **40.0 MHz** | 8,975,373 | 10.584 mm² | **1.37 × 10¹⁰** | **0.83×** |
 
-**The macro build trails on this metric as built, and that is worth stating
+**The macro build still trails on this metric, and that is worth stating
 plainly:** it buys 1.37× the performance (3.00 → 4.13 benchmark runs/sec) for
 3.2× the area, and √area charges 1.78× for that. CoreMark/MHz alone (1.70 →
 3.16) hides the trade; this does not.
 
-Two independent routes close it. The die is only **13.6% utilized** — roughly
-3.1 mm² of macros plus ~2.8 mm² of logic inside 10.58 mm², because the routing
-channels were sized for convergence rather than area — so break-even at the
-current clock is **6.28 mm²**. Alternatively, fixing the I/O paths raises
-break-even to **15.23 mm²**, which the design already clears. The I/O fix is
-the cheaper of the two: it is an SDC and pin-placement change, not silicon.
+The remaining gap is **area, not speed**. The die is only **13.6% utilized** —
+roughly 3.1 mm² of macros plus ~2.8 mm² of logic inside 10.58 mm², because the
+routing channels were sized for convergence after six failed attempts rather
+than for area. Break-even at the current clock is **6.28 mm²**, and shrinking
+toward that is pure floorplan work: no RTL risk, no cycle cost. Registering the
+memory-side outputs would add ~10.5 MHz on top, but trades cycles for
+frequency, which partly self-cancels in this metric.
 
 ## Architecture
 
@@ -142,7 +154,7 @@ FPGA configuration, which is what makes its CoreMark/MHz directly comparable:
 | Build | Caches | CoreMark/MHz | Die | Clock |
 |---|---|---|---|---|
 | Flip-flop arrays | 256 B / 256 B | 1.70 | 3.328 mm² | 50 MHz |
-| **SRAM macros** | **8 KB / 8 KB** | **3.16** | 10.584 mm² | 37 MHz |
+| **SRAM macros** | **8 KB / 8 KB** | **3.16** | 10.584 mm² | 40 MHz |
 
 The macro's `1RW+1R` ports map onto the existing design without restructuring:
 both caches already read at a speculated address and write at a different one

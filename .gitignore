@@ -35,3 +35,12 @@ Testbenches/sim
 fpga/coremark/build/
 fpga/coremark/build_sim/
 fpga/tests/build_*/
+
+# Chisel / Scala build artifacts - regenerate with:
+#   cd chisel && scala-cli run src/MmAccel.scala
+chisel/.scala-build/
+chisel/generated/
+chisel/out/
+.bloop/
+.metals/
+.bsp/

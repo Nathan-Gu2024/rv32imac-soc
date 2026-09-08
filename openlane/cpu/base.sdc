@@ -71,3 +71,31 @@ set_timing_derate -late [expr {1+$::env(SYNTH_TIMING_DERATE)}]
 # If these are ever wired to a real debug block with a timing budget, delete
 # this and constrain them properly instead of leaving them unconstrained.
 set_false_path -to [get_ports {debug_*}]
+
+# store_data and mem_write_mask are DEAD OUTPUTS, and were the dominant
+# timing problem in the design until this was added.
+#
+# Evidence, not assumption:
+#   fpga/rtl/fpga_top.v   .store_data(),  .mem_write_mask(),   <- unconnected
+#   Testbenches/tb_coremark_sim.v         declares a wire for store_data and
+#                                         never reads it
+#
+# They are leftovers from an earlier revision where the core drove a simple
+# word-granular fpga/rtl/dmem.v. The real lower-memory interface is the
+# 128-bit dcache_mem_wline / dcache_mem_read_data_block pair, which IS
+# constrained normally.
+#
+# store_data is still a live INTERNAL signal - cpu.v:564 feeds it to the
+# D-cache as cpu_wdata - so this excludes only the path to the unused output
+# pin, not the cache write path.
+#
+# Why it mattered: of 41 output-port timing paths in the signoff_io run, 37
+# were on these two ports, and store_data held every one of the worst
+# violations. They forced the clock to 25 ns while the core itself closes at
+# 19.82 ns.
+#
+# The cleaner fix is to delete these ports from cpu.v and their consumers
+# entirely - they cost 36 pins and the buffers driving them. Until then this
+# stops STA reporting the timing of logic nothing reads.
+set_false_path -to [get_ports {store_data[*]}]
+set_false_path -to [get_ports {mem_write_mask[*]}]

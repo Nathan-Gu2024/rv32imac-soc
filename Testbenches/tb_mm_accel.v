@@ -1,5 +1,14 @@
 `timescale 1ns/1ps
 `include "../src/axi_lite_bridge.v"
+
+// This bench is hardwired to the 2x2 register map of src/mm_accel.v: fixed
+// push words 4..7 and fixed result words 8..11.
+//
+// The Chisel generator (chisel/src/MmAccel.scala) reproduced this map exactly
+// and passed these checks cycle-for-cycle - 8/8, finishing at the same
+// 2345000 ps - before its map was deliberately changed to the INDEXED form so
+// the array could scale past DIM=7. See Testbenches/tb_mm_accel_gen.v, which
+// drives that map and validates every size the generator emits.
 `include "../src/mm_accel.v"
 
 // Standalone bridge+accelerator test, bypassing cpu.v entirely: drives the

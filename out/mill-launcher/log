@@ -1,0 +1,214 @@
+2026-09-07T08:07:15Z launchOrConnectToServer: mill.client.lock.Locks@21f73444
+2026-09-07T08:07:15Z Acquiring the launcher lock: PidLock{@1164e25a, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/launcherLock'}
+2026-09-07T08:07:15Z launchOrConnectToServer attempt
+2026-09-07T08:07:15Z Checking if the daemon lock is available: PidLock{@6699ee4d, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/daemonLock'}
+2026-09-07T08:07:15Z The daemon lock is available, starting the server.
+2026-09-07T08:07:15Z The server has started: OsProcess(62913)
+2026-09-07T08:07:15Z Waiting for the server to take the daemon lock: PidLock{@6699ee4d, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/daemonLock'}
+2026-09-07T08:07:16Z The server OsProcess(62913) has taken the daemon lock: PidLock{@6699ee4d, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/daemonLock'}
+2026-09-07T08:07:16Z Reading server port: /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon
+2026-09-07T08:07:16Z launchOrConnectToServer attempt
+2026-09-07T08:07:16Z Checking if the daemon lock is available: PidLock{@6699ee4d, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/daemonLock'}
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID exception
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID: 62913
+2026-09-07T08:07:16Z Reading server port: /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon
+2026-09-07T08:07:16Z launchOrConnectToServer attempt
+2026-09-07T08:07:16Z Checking if the daemon lock is available: PidLock{@6699ee4d, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/daemonLock'}
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID: 62913
+2026-09-07T08:07:16Z Reading server port: /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon
+2026-09-07T08:07:16Z launchOrConnectToServer attempt
+2026-09-07T08:07:16Z Checking if the daemon lock is available: PidLock{@6699ee4d, path='/home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/daemonLock'}
+2026-09-07T08:07:16Z The daemon lock is not available, there is already a server running.
+2026-09-07T08:07:16Z Trying to read the process ID of a running daemon from /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon/processId
+2026-09-07T08:07:16Z Read PID: 62913
+2026-09-07T08:07:16Z Reading server port: /home/nathangu/OpenLane/designs/RV32-5-stage-processor/out/mill-daemon
+2026-09-07T08:07:16Z Read server port
+2026-09-07T08:07:16Z Connecting: 37787
+2026-09-07T08:07:16Z runWithConnection (RPC): Launched(37787,Some(Socket[addr=localhost/127.0.0.1,port=37787,localport=33318]),OsProcess(62913))
+2026-09-07T08:07:16Z runWithConnection exit code: 0
