@@ -86,8 +86,11 @@ module cpu_pipelined #(
     output wire accel_mem_req_valid,
     output wire accel_mem_req_write,
     output wire [31:0] accel_mem_req_addr,
+    output wire [7:0] accel_mem_req_lines,
     output wire [127:0] accel_mem_wline,
     input wire accel_mem_ready,
+    input wire accel_mem_wnext,
+    input wire [127:0] accel_mem_rline,
 
     // debug (ILA probes; debug_pc/debug_instr are the ID-stage pc/inst,
     // debug_raw_pc is one stage earlier - the raw IF-stage fetch)
@@ -1278,7 +1281,10 @@ module cpu_pipelined #(
         .mem_req_valid(accel_mem_req_valid),
         .mem_req_write(accel_mem_req_write),
         .mem_req_addr(accel_mem_req_addr),
+        .mem_req_lines(accel_mem_req_lines),
         .mem_wline(accel_mem_wline),
+        .mem_rline(accel_mem_rline),
+        .mem_wnext(accel_mem_wnext),
         .mem_ready(accel_mem_ready)
     );
 

@@ -61,6 +61,8 @@ module tb_mm_accel_dma;
 
     // ---- accelerator master port -> fake line memory ----
     wire         mem_req_valid, mem_req_write;
+    wire [7:0]   mem_req_lines;
+    reg          mem_wnext = 1'b0;
     wire [31:0]  mem_req_addr;
     wire [127:0] mem_wline;
     reg          mem_ready = 1'b0;
@@ -72,21 +74,52 @@ module tb_mm_accel_dma;
 
     // Fake mem_arbiter: hold ready low for MEM_LATENCY cycles, then accept one
     // line. Mirrors a port that must wait its turn behind the caches.
+    integer burst_left;
+    reg [31:0] burst_addr;
+    reg        in_burst;
+    reg        beat_phase;
+
     always @(posedge clk) begin
         if (rst) begin
             mem_ready <= 1'b0; lat <= 0; nlines_seen <= 0;
+            in_burst <= 1'b0; burst_left <= 0; mem_wnext <= 1'b0;
+            beat_phase <= 1'b0;
+        end else if (in_burst) begin
+            mem_wnext <= 1'b0;
+            mem_ready <= 1'b0;
+            // Two cycles per line, as the adapter takes (BEATS_PER_LINE = 2).
+            // beat_phase 0 captures the line and asks for the next; phase 1 is
+            // the second beat, during which the requester's FIFO advances.
+            if (burst_left > 0) begin
+                if (beat_phase == 1'b0) begin
+                    MEM [(burst_addr - DEST) >> 4] <= mem_wline;
+                    WRIT[(burst_addr - DEST) >> 4] <= 1'b1;
+                    nlines_seen <= nlines_seen + 1;
+                    if (burst_left > 1) mem_wnext <= 1'b1;
+                    beat_phase <= 1'b1;
+                end else begin
+                    beat_phase <= 1'b0;
+                    burst_addr <= burst_addr + 32'd16;
+                    burst_left <= burst_left - 1;
+                    if (burst_left == 1) begin
+                        in_burst  <= 1'b0;
+                        mem_ready <= 1'b1;      // whole burst complete
+                    end
+                end
+            end
         end else if (mem_req_valid && !mem_ready) begin
             if (lat >= `MEM_LATENCY) begin
-                mem_ready <= 1'b1;
-                MEM [(mem_req_addr - DEST) >> 4] <= mem_wline;
-                WRIT[(mem_req_addr - DEST) >> 4] <= 1'b1;
-                nlines_seen <= nlines_seen + 1;
-                lat <= 0;
+                burst_addr <= mem_req_addr;
+                burst_left <= (mem_req_lines == 8'd0) ? 1 : mem_req_lines;
+                in_burst   <= 1'b1;
+                beat_phase <= 1'b0;
+                lat        <= 0;
             end else begin
                 lat <= lat + 1;
             end
         end else begin
             mem_ready <= 1'b0;
+            mem_wnext <= 1'b0;
         end
     end
 
@@ -109,7 +142,10 @@ module tb_mm_accel_dma;
         .s_axi_araddr(m_araddr), .s_axi_arvalid(m_arvalid), .s_axi_arready(m_arready),
         .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready),
         .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
-        .mem_req_addr(mem_req_addr), .mem_wline(mem_wline), .mem_ready(mem_ready)
+        .mem_req_addr(mem_req_addr), .mem_wline(mem_wline),
+        .mem_req_lines(mem_req_lines),
+        .mem_wnext(mem_wnext),
+        .mem_rline(128'b0), .mem_ready(mem_ready)
     );
 
     task do_write(input [31:0] addr, input [31:0] data);

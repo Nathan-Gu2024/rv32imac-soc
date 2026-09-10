@@ -60,6 +60,39 @@ module tb_mm_accel_bench;
         d_req_prev <= d_req;
     end
 
+    // ---- accelerator result-DMA port + mock line memory ----
+    // Stands in for mem_arbiter. MEM_LATENCY is non-zero because the real port
+    // shares the arbiter with two caches; a zero-wait responder would also
+    // flatter the DMA and hide the settle cycle it needs per line.
+    wire         a_req_valid, a_req_write;
+    wire [31:0]  a_req_addr;
+    wire [127:0] a_wline;
+    reg          a_ready = 1'b0;
+
+    localparam DMA_BASE    = 32'h0010_0000;
+    localparam MEM_LATENCY = 3;
+
+    reg [31:0] DMEM [0:4*1024-1];       // word-addressed, base DMA_BASE
+    integer    a_lat, dma_lines;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            a_ready <= 1'b0; a_lat <= 0; dma_lines <= 0;
+        end else if (a_req_valid && !a_ready) begin
+            if (a_lat >= MEM_LATENCY) begin
+                a_ready <= 1'b1;
+                DMEM[((a_req_addr - DMA_BASE) >> 2) + 0] <= a_wline[31:0];
+                DMEM[((a_req_addr - DMA_BASE) >> 2) + 1] <= a_wline[63:32];
+                DMEM[((a_req_addr - DMA_BASE) >> 2) + 2] <= a_wline[95:64];
+                DMEM[((a_req_addr - DMA_BASE) >> 2) + 3] <= a_wline[127:96];
+                dma_lines <= dma_lines + 1;
+                a_lat <= 0;
+            end else a_lat <= a_lat + 1;
+        end else begin
+            a_ready <= 1'b0;
+        end
+    end
+
     reg         d_req = 1'b0, d_we = 1'b0;
     reg  [31:0] d_addr = 32'b0, d_wdata = 32'b0;
     wire [31:0] d_rdata;
@@ -88,7 +121,11 @@ module tb_mm_accel_bench;
         .s_axi_wdata(m_wdata), .s_axi_wstrb(m_wstrb), .s_axi_wvalid(m_wvalid), .s_axi_wready(m_wready),
         .s_axi_bresp(m_bresp), .s_axi_bvalid(m_bvalid), .s_axi_bready(m_bready),
         .s_axi_araddr(m_araddr), .s_axi_arvalid(m_arvalid), .s_axi_arready(m_arready),
-        .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready)
+        .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready),
+        .mem_req_valid(a_req_valid), .mem_req_write(a_req_write),
+        .mem_req_addr(a_req_addr), .mem_wline(a_wline),
+        .mem_req_lines(),
+        .mem_rline(128'b0), .mem_ready(a_ready)
     );
 
     task do_write(input [31:0] addr, input [31:0] data);
@@ -177,6 +214,52 @@ module tb_mm_accel_bench;
         end
     endtask
 
+    // Result readback over the DMA instead of the register window. The tile
+    // lands directly in its place inside the full M x N C: DEST is the tile
+    // corner and STRIDE is the whole matrix row pitch, so no software copy is
+    // needed afterwards. That is what makes this a fair comparison against the
+    // register-window path, which also leaves results in their final position.
+    task read_tile_dma(input integer ti_, input integer tj_);
+        begin
+            do_write(wr(10), DMA_BASE + (ti_*DIM)*N*4 + (tj_*DIM)*4);  // DEST_ADDR
+            do_write(wr(11), N*4);                                     // DEST_STRIDE
+            do_write(wr(0), 32'd4);                                    // START_DMA
+            rd = 0;
+            while (!rd[3]) do_read(wr(1), rd);                         // DMA_DONE
+        end
+    endtask
+
+    // Pull the DMA-written results back out of the mock memory for checking.
+    task harvest_dma;
+        begin
+            for (i = 0; i < M; i = i + 1)
+                for (j = 0; j < N; j = j + 1)
+                    CDUT[i][j] = $signed(DMEM[i*N + j]);
+        end
+    endtask
+
+    // ---- schedule 2: tiled operands + DMA readback ----
+    task sched_tiled_dma;
+        begin
+            c_load = 0; c_comp = 0; c_read = 0;
+            for (ti = 0; ti < TILES; ti = ti + 1) begin
+                t0 = cyc;
+                push_a_panel(ti);
+                c_load = c_load + (cyc - t0);
+
+                for (tj = 0; tj < TILES; tj = tj + 1) begin
+                    t0 = cyc;
+                    push_b_panel(tj);
+                    c_load = c_load + (cyc - t0);
+
+                    t0 = cyc; run_tile();            c_comp = c_comp + (cyc - t0);
+                    t0 = cyc; read_tile_dma(ti,tj);  c_read = c_read + (cyc - t0);
+                end
+            end
+            harvest_dma();
+        end
+    endtask
+
     // ---- schedule 0: reload both panels every tile ----
     task sched_naive;
         begin
@@ -240,7 +323,7 @@ module tb_mm_accel_bench;
         end
     endtask
 
-    integer naive_total;
+    integer naive_total, tiled_total;
 
     initial begin
         // operands: small signed values, deterministic but not trivial
@@ -280,8 +363,22 @@ module tb_mm_accel_bench;
         sched_tiled();
         check_and_report("TILED (A hoisted out of inner loop)");
 
+        tiled_total = c_total;
+
         $display("");
-        $display("  tiling speedup: %0d.%02dx",
+        sched_tiled_dma();
+        check_and_report("TILED + RESULT DMA (128-bit line port)");
+        $display("    %0d DMA line writes", dma_lines);
+
+        $display("");
+        // c_total is the DMA run at this point, so the tiling comparison must
+        // use tiled_total explicitly - using c_total here reported the
+        // end-to-end figure under the "tiling" label.
+        $display("  tiling alone (naive -> tiled, both MMIO): %0d.%02dx",
+                 naive_total/tiled_total, ((100*naive_total)/tiled_total)%100);
+        $display("  DMA vs MMIO readback, same schedule:      %0d.%02dx",
+                 tiled_total/c_total, ((100*tiled_total)/c_total)%100);
+        $display("  end-to-end vs naive baseline:             %0d.%02dx",
                  naive_total/c_total, ((100*naive_total)/c_total)%100);
         $display("");
         $display("  transactions %0d, cycles held by bridge+accel %0d",

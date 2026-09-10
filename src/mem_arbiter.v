@@ -24,15 +24,24 @@ module mem_arbiter (
     // Tie accel_req_valid low to get exactly the previous two-port behaviour.
     input wire accel_req_valid, accel_req_write,
     input wire [31:0] accel_req_addr,
+    // Consecutive LINES this accelerator request covers. Only the accelerator
+    // bursts; both caches are inherently single-line and are pinned to 1 below,
+    // so their timing through the adapter is bit-for-bit what it was.
+    input wire [7:0] accel_req_lines,
     input wire [127:0] accel_wline,
     output wire accel_ready,
+    // Per-line write handshake for burst writes: the adapter asks for the next
+    // line, and only the accelerator can answer (the caches are single-line).
+    output wire accel_wnext,
     output wire [127:0] accel_rline,
 
     // main mem / DDR
     output wire mem_req_valid, mem_req_write,
     output wire [31:0] mem_req_addr,
+    output wire [7:0] mem_req_lines,
     output wire [127:0] mem_wline,
     input wire mem_ready,
+    input wire mem_wnext,
     input wire [127:0] mem_rline
 );
 
@@ -48,6 +57,8 @@ module mem_arbiter (
     (* mark_debug = "true" *) reg [1:0] state;
 
     reg saved_req_write;
+    reg [7:0] saved_req_lines;
+    (* mark_debug = "true" *) reg [7:0] line_count;
     reg [31:0] saved_req_addr;
     reg [127:0] saved_wline;
 
@@ -116,6 +127,8 @@ module mem_arbiter (
             state <= IDLE;
             saved_req_write <= 1'b0;
             saved_req_addr <= 32'b0;
+            saved_req_lines <= 8'd1;
+            line_count <= 8'd0;
             saved_wline <= 128'b0;
             last_granted <= LAST_D;
         end else begin
@@ -126,18 +139,22 @@ module mem_arbiter (
                             state <= SVC_D;
                             saved_req_write <= dcache_req_write;
                             saved_req_addr <= dcache_req_addr;
+                            saved_req_lines <= 8'd1;
                             saved_wline <= dcache_wline;
                             last_granted <= LAST_D;
                         end else if (grant_i) begin
                             state <= SVC_I;
                             saved_req_write <= 1'b0;
                             saved_req_addr <= icache_req_addr;
+                            saved_req_lines <= 8'd1;
                             saved_wline <= 128'b0;
                             last_granted <= LAST_I;
                         end else if (grant_a) begin
                             state <= SVC_A;
                             saved_req_write <= accel_req_write;
                             saved_req_addr <= accel_req_addr;
+                            saved_req_lines <= accel_req_lines;
+                            line_count <= 8'd0;
                             saved_wline <= accel_wline;
                             last_granted <= LAST_A;
                         end
@@ -156,8 +173,26 @@ module mem_arbiter (
                     end
                 SVC_A:
                     begin
+                        // A burst delivers saved_req_lines lines, and the
+                        // adapter pulses mem_ready ONCE PER LINE. Releasing on
+                        // the first pulse (as the caches do, being single-line)
+                        // would drop the port mid-burst and let another
+                        // requester be granted while lines were still arriving.
                         if (mem_ready) begin
-                            state <= IDLE;
+                            // Direction decides what a mem_ready MEANS:
+                            //   read  - one pulse per line, so count them
+                            //   write - one pulse for the whole transaction
+                            // Counting on a write left the arbiter waiting for
+                            // pulses that never arrive, holding the request
+                            // asserted, which made the adapter repeat the
+                            // entire transfer.
+                            if (saved_req_write ||
+                                (line_count + 8'd1 >= saved_req_lines)) begin
+                                state <= IDLE;
+                                line_count <= 8'd0;
+                            end else begin
+                                line_count <= line_count + 8'd1;
+                            end
                         end
                     end
                 default: state <= IDLE;
@@ -172,12 +207,19 @@ module mem_arbiter (
     assign mem_req_valid = (state == SVC_D) || (state == SVC_I) || (state == SVC_A);
     assign mem_req_write = ((state == SVC_D) || (state == SVC_A)) ? saved_req_write : 1'b0;
     assign mem_req_addr = (state != IDLE) ? saved_req_addr : 32'b0;
-    assign mem_wline = ((state == SVC_D) || (state == SVC_A)) ? saved_wline : 128'b0;
+    assign mem_req_lines = (state != IDLE) ? saved_req_lines : 8'd1;
+    // Multi-line accelerator writes take the LIVE accel_wline: the requester
+    // advances it per mem_wnext, so latching would repeat line 0 for the whole
+    // burst. Everything else keeps the latched copy.
+    assign mem_wline =
+        ((state == SVC_A) && (saved_req_lines > 8'd1)) ? accel_wline :
+        (((state == SVC_D) || (state == SVC_A)) ? saved_wline : 128'b0);
 
     // signals back to the requesters
     assign dcache_ready = (state == SVC_D) & mem_ready;
     assign icache_ready = (state == SVC_I) & mem_ready;
     assign accel_ready  = (state == SVC_A) & mem_ready;
+    assign accel_wnext  = (state == SVC_A) & mem_wnext;
 
     // safe to broadcast read data; ready signals gate actual latching
     assign dcache_rline = mem_rline;

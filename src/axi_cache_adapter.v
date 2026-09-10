@@ -10,6 +10,12 @@ module axi_cache_adapter #(
     input wire mem_req_valid,
     input wire mem_req_write,
     input wire [ADDR_WIDTH-1:0] mem_req_addr,
+    // Number of consecutive LINES this request covers. 1 is the historical
+    // behaviour and what both caches drive. Reads only; writes ignore it.
+    input wire [7:0] mem_req_lines,
+    // Pulses when a WRITE burst has consumed one line and needs the next.
+    // Unused by single-line requesters (both caches).
+    output reg mem_wnext,
     input wire [LINE_BITS-1:0] mem_wline,
     output reg [LINE_BITS-1:0] mem_rline,
     output reg mem_ready,
@@ -77,6 +83,14 @@ module axi_cache_adapter #(
     (* mark_debug = "true" *) reg [ADDR_WIDTH-1:0] saved_addr;
     reg [LINE_BITS-1:0] saved_wline;
     (* mark_debug = "true" *) reg saved_write;
+    (* mark_debug = "true" *) reg [7:0] saved_lines;
+    // Registered per-line completion pulse. mem_rline is written on the beat
+    // itself, so a combinational pulse on the last beat would publish a line
+    // that is still one beat short. Registering it lands the pulse exactly one
+    // cycle later - the same relative timing the old DONE-state pulse had.
+    reg line_ready;
+    // Lines already handed to AXI in the current write burst.
+    reg [7:0] line_sent;
 
     // Debug-only mirror of the input port so it can be probed directly
     // alongside mem_arbiter's own state, in the same ILA capture, to
@@ -131,6 +145,10 @@ module axi_cache_adapter #(
         if (rst) begin
             state <= IDLE;
             beat_count <= 8'd0;
+            saved_lines <= 8'd1;
+            line_ready <= 1'b0;
+            line_sent <= 8'd0;
+            mem_wnext <= 1'b0;
             saved_addr <= {ADDR_WIDTH{1'b0}};
             saved_wline <= {LINE_BITS{1'b0}};
             saved_write <= 1'b0;
@@ -152,18 +170,42 @@ module axi_cache_adapter #(
                 saved_addr <= mem_req_addr;
                 saved_wline <= mem_wline;
                 saved_write <= mem_req_write;
+                line_sent <= 8'd0;
+                saved_lines <= (mem_req_lines == 8'd0) ? 8'd1 : mem_req_lines;
                 beat_count <= 8'd0;
             end
 
-            // Pack AXI read beats into the 128-bit cache line.
+            // Pack AXI read beats into the 128-bit cache line. beat_count is
+            // the index WITHIN the current line, so it wraps every
+            // BEATS_PER_LINE and a multi-line burst reuses the same packing.
+            line_ready <= 1'b0;
             if (state == READ_DATA && m_axi_rvalid && m_axi_rready) begin
                 mem_rline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH] <= m_axi_rdata;
-                beat_count <= beat_count + 8'd1;
+                if (beat_count == BEATS_PER_LINE - 1) begin
+                    beat_count <= 8'd0;
+                    line_ready <= 1'b1;   // one line complete, publish next cycle
+                end else begin
+                    beat_count <= beat_count + 8'd1;
+                end
             end
 
-            // Advance write beat counter only when a W beat is accepted.
+            // Advance the write beat counter, wrapping per LINE so a burst
+            // reuses the same slicing. mem_wnext pulses on each wrap so the
+            // requester can present the next line.
+            mem_wnext <= 1'b0;
             if (state == WRITE_DATA && m_axi_wvalid && m_axi_wready) begin
-                beat_count <= beat_count + 8'd1;
+                if (beat_count == BEATS_PER_LINE - 1) begin
+                    beat_count <= 8'd0;
+                    line_sent  <= line_sent + 8'd1;
+                end else begin
+                    beat_count <= beat_count + 8'd1;
+                end
+                // One beat EARLY: the requester's FIFO needs a cycle to present
+                // the next line, and the next line's first beat follows
+                // immediately after this line's last one.
+                if ((beat_count == BEATS_PER_LINE - 2) &&
+                    (line_sent + 8'd1 < saved_lines))
+                    mem_wnext <= 1'b1;
             end
 
             if (state == DONE) begin
@@ -226,7 +268,10 @@ module axi_cache_adapter #(
 
     always @(*) begin
         m_axi_araddr = saved_line_addr;
-        m_axi_arlen = AXI_LEN;
+        // Span every line of the request in ONE transaction: that is the
+        // point of the burst, since the ~30-cycle round trip is paid per
+        // transaction rather than per beat.
+        m_axi_arlen = (saved_lines * BEATS_PER_LINE) - 8'd1;
         m_axi_arsize = AXI_SIZE;
         m_axi_arburst = 2'b01; // INCR
         m_axi_arvalid = 1'b0;
@@ -234,7 +279,7 @@ module axi_cache_adapter #(
         m_axi_rready = 1'b0;
 
         m_axi_awaddr = saved_line_addr;
-        m_axi_awlen = AXI_LEN;
+        m_axi_awlen = (saved_lines * BEATS_PER_LINE) - 8'd1;
         m_axi_awsize = AXI_SIZE;
         m_axi_awburst = 2'b01; // INCR
         m_axi_awvalid = 1'b0;
@@ -246,7 +291,11 @@ module axi_cache_adapter #(
 
         m_axi_bready = 1'b0;
 
-        mem_ready = 1'b0;
+        // Reads complete a line at a time, so they pulse from line_ready.
+        // Writes still pulse once in DONE. Splitting these keeps a single-line
+        // read at exactly one pulse with unchanged timing rather than firing
+        // from both sources.
+        mem_ready = line_ready;
         case (state)
             READ_ADDR: 
                 begin
@@ -265,8 +314,15 @@ module axi_cache_adapter #(
             WRITE_DATA: 
                 begin
                     m_axi_wvalid = 1'b1;
-                    m_axi_wdata = saved_wline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH];
-                    m_axi_wlast = (beat_count == AXI_LEN);
+                    // Single-line writes slice the latched copy, keeping the
+                    // cache path bit-identical. Multi-line bursts read mem_wline
+                    // live, which the requester advances on each mem_wnext.
+                    m_axi_wdata = (saved_lines == 8'd1)
+                        ? saved_wline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH]
+                        : mem_wline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH];
+                    // WLAST marks the end of the whole burst, not of a line.
+                    m_axi_wlast = (beat_count == AXI_LEN) &&
+                                  (line_sent == saved_lines - 8'd1);
                 end
             WRITE_RESP: 
                 begin
@@ -274,8 +330,8 @@ module axi_cache_adapter #(
                 end
             DONE: 
                 begin
-                    // Pulse complete only after full read line is received or write response completes
-                    mem_ready = 1'b1;
+                    // Writes only: reads already pulsed per line above.
+                    if (saved_write) mem_ready = 1'b1;
                 end
         endcase
     end

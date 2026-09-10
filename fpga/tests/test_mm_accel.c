@@ -32,18 +32,31 @@
 #define ACCEL_INFO        ACCEL_REG(9)
 #define ACCEL_DEST_ADDR   ACCEL_REG(10)
 #define ACCEL_DEST_STRIDE ACCEL_REG(11)
+#define ACCEL_A_SRC       ACCEL_REG(12)
+#define ACCEL_B_SRC       ACCEL_REG(13)
+#define ACCEL_SRC_STRIDE  ACCEL_REG(14)
+#define ACCEL_B_PANEL_USE  ACCEL_REG(15)
+#define ACCEL_B_PANEL_LOAD ACCEL_REG(16)
 
 #define CTRL_START     0x1
 #define CTRL_SOFT_RST  0x2
 #define CTRL_START_DMA 0x4
+#define CTRL_START_LOAD   0x8    /* fetch A and B panels over the line port */
+#define CTRL_START_LOAD_B 0x10   /* B panel only - safe during compute */
 
 #define ST_BUSY     0x1
 #define ST_DONE     0x2
 #define ST_DMA_BUSY 0x4
 #define ST_DMA_DONE 0x8
+#define ST_LOAD_BUSY 0x10
+#define ST_LOAD_DONE 0x20
 
 /* Where the DMA drops results. Must be 16-byte aligned. */
 #define RESULT_BUF 0x00180000
+
+/* CLINT mtime, low word. clint_timer.v increments this unconditionally every
+ * cycle, so it is a cycle counter usable for on-hardware timing. */
+#define CLINT_MTIME (*((volatile uint32_t*)0x02000000))
 
 static void uart_putchar(char c) {
     while (UART_TX_STATUS == 0) {}
@@ -112,6 +125,58 @@ static void push_panel(volatile uint32_t *port, const uint8_t *val,
         uint32_t w = ((uint32_t)val[lane]) * 0x01010101u;
         for (int g = 0; g < klen / 4; g++) *port = w;
     }
+}
+
+/* Scalar INT8 GEMM on the host core - the baseline the accelerator is measured
+ * against. B is column-major (B[j][k] is column j) to match how bColBuf is fed,
+ * so the two paths see the same layout and neither gets a friendlier stride.
+ *
+ * int32 accumulator, same as the PE, so the arithmetic is equivalent and not
+ * merely similar. Kept in .bss (DDR) rather than on the stack so operands start
+ * where a real workload would keep them.
+ */
+static int8_t  gemm_a[16 * 16];
+static int8_t  gemm_b[16 * 16];
+static int32_t gemm_c[16 * 16];
+
+static void scalar_gemm(const int8_t *A, const int8_t *B, int32_t *C,
+                        int dim, int klen) {
+    for (int i = 0; i < dim; i++) {
+        for (int j = 0; j < dim; j++) {
+            int32_t acc = 0;
+            for (int k = 0; k < klen; k++)
+                acc += (int32_t)A[i * klen + k] * (int32_t)B[j * klen + k];
+            C[i * dim + j] = acc;
+        }
+    }
+}
+
+/* Operand panels staged for the DMA: one lane per 16-byte line, packed, so
+ * the fetch covers a whole panel in a single INCR burst. 16-byte aligned
+ * because the line port addresses lines, not bytes. */
+static int8_t dma_a[16 * 16] __attribute__((aligned(16)));
+static int8_t dma_b[16 * 16] __attribute__((aligned(16)));
+
+/* Eviction buffer: one line per set of the direct-mapped D-cache
+ * (1024 sets x 16 B = 16 KB). */
+#define DC_SETS  1024
+#define DC_LINE  16
+static volatile uint8_t evict_buf[DC_SETS * DC_LINE] __attribute__((aligned(16)));
+
+/* Force dirty lines back to DRAM by displacing them.
+ *
+ * The D-cache is write-back and this SoC has no flush instruction, no cache
+ * maintenance CSR and no uncached DRAM window - the MMIO decodes are device
+ * windows only. Touching one address in every set of a direct-mapped cache
+ * evicts whatever occupied it, writing back anything dirty. That is the only
+ * mechanism available here, and it is why operands must be flushed before the
+ * accelerator reads them from DRAM.
+ */
+static void dcache_evict(void) {
+    volatile uint8_t sink = 0;
+    for (int i = 0; i < DC_SETS * DC_LINE; i += DC_LINE)
+        sink ^= evict_buf[i];
+    (void)sink;
 }
 
 int main() {
@@ -194,6 +259,28 @@ int main() {
     ACCEL_CTRL        = CTRL_START_DMA;
     while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
 
+    /* Memory provably holds the right values here (dumped from ddr_mem in the
+     * bench). Print what the CPU sees for the same words: a difference means
+     * the read side is serving stale cache lines, not that the DMA misbehaved. */
+    /* Force any lines covering RESULT_BUF out before reading it. The DMA wrote
+     * DRAM behind the cache, so whatever the cache holds for those addresses is
+     * stale by construction - and "untouched therefore uncached" stopped being
+     * true once a cache-sized buffer joined .bss. */
+    dcache_evict();
+
+    uart_print("buf ptr = ");
+    uart_print_int32((int32_t)(uintptr_t)buf);
+    uart_print("  RESULT_BUF = ");
+    uart_print_int32((int32_t)RESULT_BUF);
+    uart_print("\r\n");
+
+    uart_print("cpu reads buf[0..3]:");
+    for (int q = 0; q < 4; q++) {
+        uart_print(" ");
+        uart_print_int32(buf[q]);
+    }
+    uart_print("\r\n");
+
     int dma_bad = 0;
     for (int i = 0; i < dim; i++)
         for (int j = 0; j < dim; j++)
@@ -207,6 +294,308 @@ int main() {
         fail_count++;
         uart_print("FAIL: DMA mismatches=");
         uart_print_int32(dma_bad);
+        uart_print("\r\n");
+    }
+
+    /* ============ performance, measured on real hardware ============
+     *
+     * Everything the operand-path plan rests on - the load/compute/readback
+     * split, the per-transaction cost, the DMA speedup - came from a SIMULATION
+     * whose memory was a fixed 3-cycle mock with the arbiter port entirely to
+     * itself. Real DDR behind axi_cache_adapter, contending with a live I-cache
+     * and D-cache, is a different machine. These numbers replace those
+     * estimates with measurements from the design that actually exists.
+     *
+     * CLINT mtime increments unconditionally every cycle (clint_timer.v:30), so
+     * it is a true cycle counter, not a divided tick. It is read over MMIO,
+     * which costs about as much as one of the transactions being measured, so
+     * the probe overhead is measured first and SUBTRACTED from each phase - and
+     * printed too, so every number below can be read with its instrument in
+     * view rather than silently absorbing it.
+     */
+    uart_print("\r\n--- performance (cycles, measured on hardware) ---\r\n");
+
+    uint32_t t0, t1;
+
+    /* Two back-to-back reads: the gap is one probe's worth of MMIO latency. */
+    t0 = CLINT_MTIME;
+    t1 = CLINT_MTIME;
+    uint32_t probe = t1 - t0;
+    uart_print("probe overhead      "); uart_print_int32(probe); uart_print("\r\n");
+
+    /* klen=4 above keeps the correctness check readable; a representative
+     * operand load needs the full depth the array supports. */
+    const int kperf = (maxk < 16) ? maxk : 16;
+    ACCEL_KLEN = kperf;
+
+    t0 = CLINT_MTIME;
+    push_panel(&ACCEL_A_PUSH, va, dim, kperf);
+    push_panel(&ACCEL_B_PUSH, vb, dim, kperf);
+    t1 = CLINT_MTIME;
+    uint32_t c_load = t1 - t0 - probe;
+
+    t0 = CLINT_MTIME;
+    ACCEL_CTRL = CTRL_START;
+    while (!(ACCEL_STATUS & ST_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_comp = t1 - t0 - probe;
+
+    /* Readback through the 32-bit AXI4-Lite register window. */
+    t0 = CLINT_MTIME;
+    ACCEL_RESULT_IDX = 0;
+    for (int n = 0; n < dim * dim; n++) { (void)ACCEL_RESULT; }
+    t1 = CLINT_MTIME;
+    uint32_t c_mmio = t1 - t0 - probe;
+
+    /* Readback through the 128-bit DMA line port.
+     *
+     * Timed WITHOUT reading the destination back. The transfer time is what is
+     * being measured, and reading would pull 64 lines into the D-cache, which
+     * both perturbs a repeat measurement and runs into the coherence
+     * constraint documented above. Correctness was already proven earlier. */
+    t0 = CLINT_MTIME;
+    ACCEL_DEST_ADDR   = RESULT_BUF;
+    ACCEL_DEST_STRIDE = dim * 4;
+    ACCEL_CTRL        = CTRL_START_DMA;
+    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_dma = t1 - t0 - probe;
+
+    uart_print("operand load        "); uart_print_int32((int32_t)c_load); uart_print("\r\n");
+    uart_print("compute             "); uart_print_int32((int32_t)c_comp); uart_print("\r\n");
+    uart_print("readback (MMIO)     "); uart_print_int32((int32_t)c_mmio); uart_print("\r\n");
+    uart_print("readback (DMA)      "); uart_print_int32((int32_t)c_dma);  uart_print("\r\n");
+
+    /* Derived costs. These are the figures the simulation put at ~5.0 cycles
+     * per AXI4-Lite beat and ~7.4 per 128-bit line, and from which the
+     * 2.16 B/cycle operand-bandwidth estimate was computed. */
+    int ld_txn   = 2 * (1 + dim * (kperf / 4));   /* 2 panels: index + pushes */
+    int rd_txn   = 1 + dim * dim;                 /* index write + reads      */
+    int dma_line = (dim * dim) / 4;               /* 4 results per 128b line  */
+
+    uart_print("\r\nper-transaction (cycles x100)\r\n");
+    uart_print("  AXI4-Lite write   "); uart_print_int32((int32_t)((c_load * 100) / ld_txn));   uart_print("\r\n");
+    uart_print("  AXI4-Lite read    "); uart_print_int32((int32_t)((c_mmio * 100) / rd_txn));   uart_print("\r\n");
+    uart_print("  DMA 128-bit line  "); uart_print_int32((int32_t)((c_dma  * 100) / dma_line)); uart_print("\r\n");
+
+    if (c_dma > 0) {
+        uart_print("\r\nDMA vs MMIO readback (x100)  ");
+        uart_print_int32((int32_t)((c_mmio * 100) / c_dma));
+        uart_print("\r\n");
+    }
+
+    /* Whole-tile totals, so the split can be compared against simulation
+     * directly. MACs/cycle is scaled x100 because there is no float here. */
+    uint32_t c_total_mmio = c_load + c_comp + c_mmio;
+    uint32_t c_total_dma  = c_load + c_comp + c_dma;
+    uint32_t macs         = (uint32_t)(dim * dim * kperf);
+
+    uart_print("\r\ntile total (MMIO)   "); uart_print_int32((int32_t)c_total_mmio); uart_print("\r\n");
+    uart_print("tile total (DMA)    ");     uart_print_int32((int32_t)c_total_dma);  uart_print("\r\n");
+    uart_print("MACs                ");     uart_print_int32((int32_t)macs);         uart_print("\r\n");
+    uart_print("MACs/cycle x100     ");     uart_print_int32((int32_t)((macs * 100) / c_total_dma)); uart_print("\r\n");
+    uart_print("utilisation % x100  ");     uart_print_int32((int32_t)((macs * 10000) / (c_total_dma * (uint32_t)(dim * dim)))); uart_print("\r\n");
+
+    /* ============ scalar RV32 baseline ============
+     *
+     * The same GEMM the accelerator just did, in C on the host core, timed the
+     * same way. This is the number that says whether the accelerator is worth
+     * its area - every "Nx over scalar" figure quoted before this point was an
+     * ESTIMATE from an assumed instruction mix, never a measurement.
+     *
+     * Fairness, deliberately:
+     *   - identical dimensions (dim x dim x kperf) and identical operand values
+     *   - identical memory layout: B is column-major here because that is how
+     *     bColBuf is fed, so neither side gets a friendlier access pattern
+     *   - same -O2 build as everything else; the scalar loop is not hobbled
+     *   - both results are checked against the same closed form, so a wrong
+     *     answer cannot look fast
+     *   - operands start in DDR for both: the accelerator pays to push them
+     *     over MMIO, the CPU pays to load them through the D-cache
+     *
+     * The accelerator figure it is compared against (c_total_dma) includes its
+     * operand load and its DMA readback, not just the compute window. Comparing
+     * against the 61-cycle compute phase alone would flatter it by ~17x.
+     */
+    uart_print("\r\n--- scalar RV32 baseline (same GEMM) ---\r\n");
+
+    for (int i = 0; i < dim; i++)
+        for (int k = 0; k < kperf; k++) {
+            gemm_a[i * kperf + k] = (int8_t)(i + 1);
+            gemm_b[i * kperf + k] = (int8_t)(i + 1);
+        }
+
+    t0 = CLINT_MTIME;
+    scalar_gemm(gemm_a, gemm_b, gemm_c, dim, kperf);
+    t1 = CLINT_MTIME;
+    uint32_t c_scalar = t1 - t0 - probe;
+
+    /* A[i][k]=i+1 and B[j][k]=j+1 for every k, so C[i][j] = kperf*(i+1)*(j+1).
+     * Checking this stops a mis-indexed or partially-eliminated loop from
+     * posting a fast time for the wrong work. */
+    int scalar_bad = 0;
+    for (int i = 0; i < dim; i++)
+        for (int j = 0; j < dim; j++)
+            if (gemm_c[i * dim + j] != (int32_t)kperf * (i + 1) * (j + 1)) scalar_bad++;
+
+    if (scalar_bad) {
+        fail_count++;
+        uart_print("FAIL: scalar GEMM mismatches=");
+        uart_print_int32(scalar_bad);
+        uart_print("\r\n");
+    } else {
+        uart_print("PASS: scalar GEMM correct\r\n");
+    }
+
+    uart_print("scalar cycles       "); uart_print_int32((int32_t)c_scalar); uart_print("\r\n");
+    uart_print("accel cycles (DMA)  "); uart_print_int32((int32_t)c_total_dma); uart_print("\r\n");
+
+    if (c_total_dma > 0) {
+        uart_print("SPEEDUP x100        ");
+        uart_print_int32((int32_t)((c_scalar * 100) / c_total_dma));
+        uart_print("\r\n");
+    }
+    if (c_scalar > 0) {
+        uart_print("scalar MACs/cyc x100 ");
+        uart_print_int32((int32_t)((macs * 100) / c_scalar));
+        uart_print("\r\n");
+    }
+
+    /* Compute-only comparison, reported separately and labelled as such. This
+     * is the array's raw advantage once operands are already resident - the
+     * ceiling the operand-DMA work is aiming at, not a number to quote as the
+     * end-to-end speedup. */
+    if (c_comp > 0) {
+        uart_print("(compute-only x100  ");
+        uart_print_int32((int32_t)((c_scalar * 100) / c_comp));
+        uart_print(")\r\n");
+    }
+
+    /* ============ operand DMA, scratchpad, double buffering ============
+     *
+     * Everything above pushes operands through the 32-bit register window and
+     * pulls results back the same way. This section exercises the paths that
+     * replace both: the accelerator fetching its own operands over the 128-bit
+     * line port, holding several B panels locally, and prefetching the next
+     * panel while the array computes from the current one.
+     *
+     * COHERENCE. The D-cache is WRITE-BACK and the DMA reads DRAM behind it,
+     * so operand bytes the CPU just wrote are still sitting dirty in the cache
+     * and the fetch would read stale DRAM. This SoC has no flush instruction
+     * and no uncached window, so the panels are forced out by eviction: the
+     * cache is direct-mapped, and touching one line in each of its 1024 sets
+     * displaces everything, writing dirty lines back on the way out.
+     *
+     * That costs ~1024 accesses, but it happens ONCE per operand upload rather
+     * than per tile, so it does not sit in the steady-state path. It is also
+     * exactly the case a tightly-coupled scratchpad removes - and note that an
+     * accelerator-to-accelerator chain (this tile's results feeding the next
+     * layer) needs no flush at all, since both directions bypass the cache.
+     *
+     * PACKED LAYOUT. SRC_STRIDE is set to one lane (16 B) so the panel is
+     * contiguous and the fetch covers it in a single INCR burst. A wider
+     * stride is still correct but falls back to one transaction per line,
+     * which measured ~3x slower - so the packing here is load-bearing, not
+     * incidental.
+     */
+    uart_print("\r\n--- operand DMA / scratchpad / double buffering ---\r\n");
+
+    /* Panels are staged with one lane per 16-byte line, which is what makes
+     * the burst possible. maxK is 16, so a lane is exactly one line. */
+    for (int lane = 0; lane < dim; lane++)
+        for (int k = 0; k < 16; k++) {
+            dma_a[lane * 16 + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
+            dma_b[lane * 16 + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
+        }
+
+    t0 = CLINT_MTIME;
+    dcache_evict();
+    t1 = CLINT_MTIME;
+    uint32_t c_evict = t1 - t0 - probe;
+
+    ACCEL_A_SRC      = (uint32_t)(uintptr_t)dma_a;
+    ACCEL_B_SRC      = (uint32_t)(uintptr_t)dma_b;
+    ACCEL_SRC_STRIDE = 16;              /* packed -> single burst per panel */
+    ACCEL_B_PANEL_LOAD = 0;
+    ACCEL_B_PANEL_USE  = 0;
+
+    t0 = CLINT_MTIME;
+    ACCEL_CTRL = CTRL_START_LOAD;
+    while (!(ACCEL_STATUS & ST_LOAD_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_opdma = t1 - t0 - probe;
+
+    /* Same GEMM as before, so the same closed form applies. If the fetch read
+     * the wrong addresses, or read stale DRAM because the eviction did not
+     * work, these values are wrong rather than merely slow. */
+    ACCEL_CTRL = CTRL_START;
+    while (!(ACCEL_STATUS & ST_DONE)) {}
+
+    int dma_ops_bad = 0;
+    ACCEL_RESULT_IDX = 0;
+    for (int i = 0; i < dim; i++)
+        for (int j = 0; j < dim; j++)
+            if ((int32_t)ACCEL_RESULT != (int32_t)kperf * (i + 1) * (j + 1))
+                dma_ops_bad++;
+
+    if (dma_ops_bad) {
+        fail_count++;
+        uart_print("FAIL: operand DMA mismatches=");
+        uart_print_int32(dma_ops_bad);
+        uart_print("\r\n");
+    } else {
+        uart_print("PASS: operand DMA fetched correct operands\r\n");
+    }
+
+    uart_print("operand push (MMIO) "); uart_print_int32((int32_t)c_load);  uart_print("\r\n");
+    uart_print("operand DMA (burst) "); uart_print_int32((int32_t)c_opdma); uart_print("\r\n");
+    if (c_opdma > 0) {
+        uart_print("  speedup x100      ");
+        uart_print_int32((int32_t)((c_load * 100) / c_opdma));
+        uart_print("\r\n");
+    }
+    uart_print("cache evict (once)  "); uart_print_int32((int32_t)c_evict); uart_print("\r\n");
+
+    /* ---- double buffering: prefetch panel 1 while computing from panel 0 ----
+     * B-only load (CTRL bit4) leaves aRowBuf alone, which is what makes it safe
+     * to issue mid-compute. Panels must differ: loading the panel currently
+     * feeding the array would corrupt the run in flight. */
+    ACCEL_B_PANEL_USE = 0;
+    t0 = CLINT_MTIME;
+    ACCEL_CTRL = CTRL_START;            /* compute from panel 0 ... */
+    ACCEL_B_PANEL_LOAD = 1;
+    ACCEL_CTRL = CTRL_START_LOAD_B;     /* ... while panel 1 fills */
+    while (!(ACCEL_STATUS & ST_DONE)) {}
+    while (!(ACCEL_STATUS & ST_LOAD_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_overlap = t1 - t0 - probe;
+
+    /* The overlapped run must still be right for the panel it was using. */
+    int ov_bad = 0;
+    ACCEL_RESULT_IDX = 0;
+    for (int i = 0; i < dim; i++)
+        for (int j = 0; j < dim; j++)
+            if ((int32_t)ACCEL_RESULT != (int32_t)kperf * (i + 1) * (j + 1))
+                ov_bad++;
+
+    if (ov_bad) {
+        fail_count++;
+        uart_print("FAIL: overlapped run corrupted, mismatches=");
+        uart_print_int32(ov_bad);
+        uart_print("\r\n");
+    } else {
+        uart_print("PASS: prefetch during compute did not corrupt the run\r\n");
+    }
+    uart_print("compute+prefetch    "); uart_print_int32((int32_t)c_overlap); uart_print("\r\n");
+
+    /* Whole-tile total on the fast path, for comparison with the MMIO tile. */
+    uint32_t c_tile_fast = c_opdma + c_comp + c_dma;
+    uart_print("\r\ntile (MMIO push + MMIO readback) "); uart_print_int32((int32_t)c_total_mmio); uart_print("\r\n");
+    uart_print("tile (MMIO push + result DMA)    ");     uart_print_int32((int32_t)c_total_dma);  uart_print("\r\n");
+    uart_print("tile (operand DMA + result DMA)  ");     uart_print_int32((int32_t)c_tile_fast);  uart_print("\r\n");
+    if (c_tile_fast > 0) {
+        uart_print("vs scalar x100                   ");
+        uart_print_int32((int32_t)((c_scalar * 100) / c_tile_fast));
         uart_print("\r\n");
     }
 

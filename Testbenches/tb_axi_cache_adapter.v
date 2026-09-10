@@ -65,6 +65,8 @@ module tb_axi_cache_adapter;
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),
         .mem_req_addr(mem_req_addr),
+        .mem_wnext(),
+        .mem_req_lines(8'd1),   // single line: the historical behaviour
         .mem_wline(mem_wline),
         .mem_rline(mem_rline),
         .mem_ready(mem_ready),

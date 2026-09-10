@@ -22,6 +22,12 @@ module tb_mem_arbiter;
 
     // accelerator result DMA (third requester)
     reg accel_req_valid;
+    // Burst length for the accelerator port. Left undriven it is X, which
+    // makes the arbiter's end-of-burst compare undefined and strands SVC_A,
+    // so every round-robin fairness check fails for a reason that has
+    // nothing to do with fairness.
+    reg [7:0] accel_req_lines;
+    reg       mem_wnext;
     reg accel_req_write;
     reg [31:0] accel_req_addr;
     reg [127:0] accel_wline;
@@ -32,6 +38,8 @@ module tb_mem_arbiter;
     wire mem_req_valid;
     wire mem_req_write;
     wire [31:0] mem_req_addr;
+    wire [7:0]  mem_req_lines;
+    wire        accel_wnext;
     wire [127:0] mem_wline;
     reg mem_ready;
     reg [127:0] mem_rline;
@@ -55,17 +63,21 @@ module tb_mem_arbiter;
         .dcache_rline(dcache_rline),
 
         .accel_req_valid(accel_req_valid),
+        .accel_req_lines(accel_req_lines),
         .accel_req_write(accel_req_write),
         .accel_req_addr(accel_req_addr),
         .accel_wline(accel_wline),
         .accel_ready(accel_ready),
+        .accel_wnext(accel_wnext),
         .accel_rline(accel_rline),
 
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),
         .mem_req_addr(mem_req_addr),
+        .mem_req_lines(mem_req_lines),
         .mem_wline(mem_wline),
         .mem_ready(mem_ready),
+        .mem_wnext(mem_wnext),
         .mem_rline(mem_rline)
     );
 
@@ -98,6 +110,8 @@ module tb_mem_arbiter;
             dcache_wline = 128'h0;
 
             accel_req_valid = 1'b0;
+            accel_req_lines = 8'd1;
+            mem_wnext = 1'b0;
             accel_req_write = 1'b0;
             accel_req_addr = 32'h0;
             accel_wline = 128'h0;
@@ -366,6 +380,89 @@ module tb_mem_arbiter;
         accel_wline     = 128'h0;
         @(posedge clk);
         #1;
+
+        // ---- Test 8: multi-line accelerator burst ----
+        //
+        // The adapter answers a burst with ONE mem_ready per line and holds the
+        // transaction open in between. The arbiter must stay in SVC_A for the
+        // whole run: releasing on the first pulse (correct for the single-line
+        // caches) would drop the port with lines still in flight.
+        $display("--- Test 8: Multi-line accelerator burst ---");
+
+        begin : burst_test
+            integer b;
+            integer stayed;
+            stayed = 1;
+
+            @(negedge clk);
+            accel_req_valid = 1'b1;
+            accel_req_write = 1'b1;
+            accel_req_lines = 8'd4;              // four lines in one transaction
+            accel_req_addr  = 32'h2200_0000;
+            accel_wline     = 128'hAAAA_0000_BBBB_1111_CCCC_2222_DDDD_3333;
+
+            @(posedge clk);
+            #1;
+            check(mem_req_valid && mem_req_write && mem_req_addr == 32'h2200_0000,
+                  "Burst request reaches memory");
+            check(mem_req_lines == 8'd4,
+                  "Burst length is passed through to the adapter");
+
+            // Four ready pulses, one per line. The port must remain granted to
+            // the accelerator for all of them.
+            for (b = 0; b < 4; b = b + 1) begin
+                @(negedge clk);
+                // Drop the request before the LAST line completes. The arbiter
+                // latched saved_* at grant so this is safe mid-burst, and it
+                // stops the arbiter re-granting the moment it retires - which
+                // would open a second transaction with no mem_ready behind it
+                // and strand the port in SVC_A.
+                if (b == 3) begin
+                    accel_req_valid = 1'b0;
+                    accel_req_write = 1'b0;
+                end
+                mem_ready = 1'b1;
+                #1;
+                if (b < 3) begin
+                    if (!mem_req_valid) stayed = 0;      // released too early
+                    if (icache_ready || dcache_ready) stayed = 0;
+                end
+                check(accel_ready, "Accelerator sees ready for each burst line");
+                @(posedge clk);
+                @(negedge clk);
+                mem_ready = 1'b0;
+                #1;
+            end
+
+            check(stayed,
+                  "Arbiter held the port for the whole burst");
+
+            // Drop the request so the arbiter can retire to IDLE. Leaving it
+            // asserted makes the arbiter re-grant immediately - correct
+            // behaviour, but it means the release check below would be testing
+            // the next transaction rather than the end of this one.
+            @(negedge clk);
+            accel_req_lines = 8'd1;
+            accel_req_addr  = 32'h0;
+            accel_wline     = 128'h0;
+            @(posedge clk);
+            #1;
+            check(!mem_req_valid,
+                  "Port released after the final burst line");
+
+            // wnext must be gated by ownership: with the accelerator idle, a
+            // pulse from the adapter must not reach it.
+            @(negedge clk);
+            mem_wnext = 1'b1;
+            #1;
+            check(!accel_wnext,
+                  "wnext is gated off when the accelerator does not own the port");
+            @(posedge clk);
+            @(negedge clk);
+            mem_wnext = 1'b0;
+            @(posedge clk);
+            #1;
+        end
 
         // ---- Test 7: three-way contention must not starve anyone ----
         //

@@ -67,6 +67,8 @@ module tb_mm_accel_cpu;
         .accel_mem_req_valid(accel_mem_req_valid),
         .accel_mem_req_write(accel_mem_req_write),
         .accel_mem_req_addr(accel_mem_req_addr),
+        .accel_mem_req_lines(),
+        .accel_mem_wnext(1'b0),
         .accel_mem_wline(accel_mem_wline),
         .accel_mem_ready(accel_mem_ready),
 

@@ -71,6 +71,10 @@ module fpga_top #(
     wire [127:0] accel_wline;
     wire accel_ready;
     wire [127:0] accel_rline;
+    wire [7:0]  accel_req_lines;
+    wire [7:0]  mem_req_lines;
+    wire        accel_wnext;
+    wire        mem_wnext;
 
     // Arbiter <-> AXI adapter shared line interface
     wire mem_req_valid;
@@ -140,8 +144,11 @@ module fpga_top #(
         .accel_mem_req_valid(accel_req_valid),
         .accel_mem_req_write(accel_req_write),
         .accel_mem_req_addr(accel_req_addr),
+        .accel_mem_req_lines(accel_req_lines),
         .accel_mem_wline(accel_wline),
-        .accel_mem_ready(accel_ready)
+        .accel_mem_ready(accel_ready),
+        .accel_mem_wnext(accel_wnext),
+        .accel_mem_rline(accel_rline)
     );
 
     mem_arbiter ARBITER (
@@ -164,15 +171,19 @@ module fpga_top #(
         .accel_req_valid(accel_req_valid),
         .accel_req_write(accel_req_write),
         .accel_req_addr(accel_req_addr),
+        .accel_req_lines(accel_req_lines),
         .accel_wline(accel_wline),
         .accel_ready(accel_ready),
+        .accel_wnext(accel_wnext),
         .accel_rline(accel_rline),
 
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),
         .mem_req_addr(mem_req_addr),
+        .mem_req_lines(mem_req_lines),
         .mem_wline(mem_wline),
         .mem_ready(mem_ready),
+        .mem_wnext(mem_wnext),
         .mem_rline(mem_rline)
     );
 
@@ -187,6 +198,8 @@ module fpga_top #(
         .mem_req_valid(mem_req_valid),
         .mem_req_write(mem_req_write),
         .mem_req_addr(mem_req_addr),
+        .mem_req_lines(mem_req_lines),
+        .mem_wnext(mem_wnext),
         .mem_wline(mem_wline),
         .mem_rline(mem_rline),
         .mem_ready(mem_ready),

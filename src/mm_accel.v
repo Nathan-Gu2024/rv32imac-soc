@@ -37,41 +37,72 @@ module SystolicPE(
 endmodule
 
 // VCS coverage exclude_file
-module mem_16x8(
-  input  [3:0] R0_addr,
-  input        R0_en,
-               R0_clk,
-  output [7:0] R0_data,
-  input  [3:0] W0_addr,
-  input        W0_en,
-               W0_clk,
-  input  [7:0] W0_data,
-  input  [3:0] W1_addr,
-  input        W1_en,
-               W1_clk,
-  input  [7:0] W1_data,
-  input  [3:0] W2_addr,
-  input        W2_en,
-               W2_clk,
-  input  [7:0] W2_data,
-  input  [3:0] W3_addr,
-  input        W3_en,
-               W3_clk,
-  input  [7:0] W3_data
+module ram_8x128(
+  input  [2:0]   R0_addr,
+  input          R0_en,
+                 R0_clk,
+  output [127:0] R0_data,
+  input  [2:0]   W0_addr,
+  input          W0_en,
+                 W0_clk,
+  input  [127:0] W0_data
 );
 
-  reg [7:0] Memory[0:15];
+  reg [127:0] Memory[0:7];
   always @(posedge W0_clk) begin
     if (W0_en & 1'h1)
       Memory[W0_addr] <= W0_data;
-    if (W1_en & 1'h1)
-      Memory[W1_addr] <= W1_data;
-    if (W2_en & 1'h1)
-      Memory[W2_addr] <= W2_data;
-    if (W3_en & 1'h1)
-      Memory[W3_addr] <= W3_data;
   end // always @(posedge)
-  assign R0_data = R0_en ? Memory[R0_addr] : 8'bx;
+  assign R0_data = R0_en ? Memory[R0_addr] : 128'bx;
+endmodule
+
+module Queue8_UInt128(
+  input          clock,
+                 reset,
+                 io_enq_valid,
+  input  [127:0] io_enq_bits,
+  input          io_deq_ready,
+  output         io_deq_valid,
+  output [127:0] io_deq_bits,
+  output [3:0]   io_count
+);
+
+  wire       io_enq_ready;
+  reg  [2:0] enq_ptr_value;
+  reg  [2:0] deq_ptr_value;
+  reg        maybe_full;
+  wire       ptr_match = enq_ptr_value == deq_ptr_value;
+  wire       empty = ptr_match & ~maybe_full;
+  wire       do_enq = io_enq_ready & io_enq_valid;
+  assign io_enq_ready = ~(ptr_match & maybe_full);
+  wire       do_deq = io_deq_ready & ~empty;
+  always @(posedge clock) begin
+    if (reset) begin
+      enq_ptr_value <= 3'h0;
+      deq_ptr_value <= 3'h0;
+      maybe_full <= 1'h0;
+    end
+    else begin
+      if (do_enq)
+        enq_ptr_value <= enq_ptr_value + 3'h1;
+      if (do_deq)
+        deq_ptr_value <= deq_ptr_value + 3'h1;
+      if (~(do_enq == do_deq))
+        maybe_full <= do_enq;
+    end
+  end // always @(posedge)
+  ram_8x128 ram_ext (
+    .R0_addr (deq_ptr_value),
+    .R0_en   (1'h1),
+    .R0_clk  (clock),
+    .R0_data (io_deq_bits),
+    .W0_addr (enq_ptr_value),
+    .W0_en   (do_enq),
+    .W0_clk  (clock),
+    .W0_data (io_enq_bits)
+  );
+  assign io_deq_valid = ~empty;
+  assign io_count = {maybe_full & ptr_match, enq_ptr_value - deq_ptr_value};
 endmodule
 
 module mm_accel(
@@ -98,9 +129,14 @@ module mm_accel(
                  mem_req_write,
   output [31:0]  mem_req_addr,
   output [127:0] mem_wline,
+  output [7:0]   mem_req_lines,
+  input          mem_wnext,
+  input  [127:0] mem_rline,
   input          mem_ready
 );
 
+  wire         _lineFifo_io_deq_valid;
+  wire [3:0]   _lineFifo_io_count;
   wire [31:0]  _pes_7_7_io_acc;
   wire [7:0]   _pes_7_6_io_aOut;
   wire [31:0]  _pes_7_6_io_acc;
@@ -277,22 +313,6 @@ module mm_accel(
   wire [7:0]   _pes_0_0_io_aOut;
   wire [7:0]   _pes_0_0_io_bOut;
   wire [31:0]  _pes_0_0_io_acc;
-  wire [7:0]   _bColBuf_7_ext_R0_data;
-  wire [7:0]   _bColBuf_6_ext_R0_data;
-  wire [7:0]   _bColBuf_5_ext_R0_data;
-  wire [7:0]   _bColBuf_4_ext_R0_data;
-  wire [7:0]   _bColBuf_3_ext_R0_data;
-  wire [7:0]   _bColBuf_2_ext_R0_data;
-  wire [7:0]   _bColBuf_1_ext_R0_data;
-  wire [7:0]   _bColBuf_0_ext_R0_data;
-  wire [7:0]   _aRowBuf_7_ext_R0_data;
-  wire [7:0]   _aRowBuf_6_ext_R0_data;
-  wire [7:0]   _aRowBuf_5_ext_R0_data;
-  wire [7:0]   _aRowBuf_4_ext_R0_data;
-  wire [7:0]   _aRowBuf_3_ext_R0_data;
-  wire [7:0]   _aRowBuf_2_ext_R0_data;
-  wire [7:0]   _aRowBuf_1_ext_R0_data;
-  wire [7:0]   _aRowBuf_0_ext_R0_data;
   reg          busy;
   reg          done;
   reg  [7:0]   kLen;
@@ -300,14 +320,662 @@ module mm_accel(
   reg  [2:0]   loadLane;
   reg  [5:0]   resultIdx;
   reg  [7:0]   t;
+  reg  [3:0]   fillGrp;
+  reg  [8:0]   fillLeft;
   reg  [31:0]  destAddr;
   reg  [31:0]  dmaAddr;
   reg          dmaBusy;
   reg          dmaDone;
   reg  [31:0]  destStride;
   reg  [31:0]  dmaRowBase;
+  reg  [31:0]  aSrcAddr;
+  reg  [31:0]  bSrcAddr;
+  reg  [31:0]  srcStride;
+  reg          ldBusy;
+  reg          ldDone;
+  reg  [7:0]   aRowBuf_0_0;
+  reg  [7:0]   aRowBuf_0_1;
+  reg  [7:0]   aRowBuf_0_2;
+  reg  [7:0]   aRowBuf_0_3;
+  reg  [7:0]   aRowBuf_0_4;
+  reg  [7:0]   aRowBuf_0_5;
+  reg  [7:0]   aRowBuf_0_6;
+  reg  [7:0]   aRowBuf_0_7;
+  reg  [7:0]   aRowBuf_0_8;
+  reg  [7:0]   aRowBuf_0_9;
+  reg  [7:0]   aRowBuf_0_10;
+  reg  [7:0]   aRowBuf_0_11;
+  reg  [7:0]   aRowBuf_0_12;
+  reg  [7:0]   aRowBuf_0_13;
+  reg  [7:0]   aRowBuf_0_14;
+  reg  [7:0]   aRowBuf_0_15;
+  reg  [7:0]   aRowBuf_1_0;
+  reg  [7:0]   aRowBuf_1_1;
+  reg  [7:0]   aRowBuf_1_2;
+  reg  [7:0]   aRowBuf_1_3;
+  reg  [7:0]   aRowBuf_1_4;
+  reg  [7:0]   aRowBuf_1_5;
+  reg  [7:0]   aRowBuf_1_6;
+  reg  [7:0]   aRowBuf_1_7;
+  reg  [7:0]   aRowBuf_1_8;
+  reg  [7:0]   aRowBuf_1_9;
+  reg  [7:0]   aRowBuf_1_10;
+  reg  [7:0]   aRowBuf_1_11;
+  reg  [7:0]   aRowBuf_1_12;
+  reg  [7:0]   aRowBuf_1_13;
+  reg  [7:0]   aRowBuf_1_14;
+  reg  [7:0]   aRowBuf_1_15;
+  reg  [7:0]   aRowBuf_2_0;
+  reg  [7:0]   aRowBuf_2_1;
+  reg  [7:0]   aRowBuf_2_2;
+  reg  [7:0]   aRowBuf_2_3;
+  reg  [7:0]   aRowBuf_2_4;
+  reg  [7:0]   aRowBuf_2_5;
+  reg  [7:0]   aRowBuf_2_6;
+  reg  [7:0]   aRowBuf_2_7;
+  reg  [7:0]   aRowBuf_2_8;
+  reg  [7:0]   aRowBuf_2_9;
+  reg  [7:0]   aRowBuf_2_10;
+  reg  [7:0]   aRowBuf_2_11;
+  reg  [7:0]   aRowBuf_2_12;
+  reg  [7:0]   aRowBuf_2_13;
+  reg  [7:0]   aRowBuf_2_14;
+  reg  [7:0]   aRowBuf_2_15;
+  reg  [7:0]   aRowBuf_3_0;
+  reg  [7:0]   aRowBuf_3_1;
+  reg  [7:0]   aRowBuf_3_2;
+  reg  [7:0]   aRowBuf_3_3;
+  reg  [7:0]   aRowBuf_3_4;
+  reg  [7:0]   aRowBuf_3_5;
+  reg  [7:0]   aRowBuf_3_6;
+  reg  [7:0]   aRowBuf_3_7;
+  reg  [7:0]   aRowBuf_3_8;
+  reg  [7:0]   aRowBuf_3_9;
+  reg  [7:0]   aRowBuf_3_10;
+  reg  [7:0]   aRowBuf_3_11;
+  reg  [7:0]   aRowBuf_3_12;
+  reg  [7:0]   aRowBuf_3_13;
+  reg  [7:0]   aRowBuf_3_14;
+  reg  [7:0]   aRowBuf_3_15;
+  reg  [7:0]   aRowBuf_4_0;
+  reg  [7:0]   aRowBuf_4_1;
+  reg  [7:0]   aRowBuf_4_2;
+  reg  [7:0]   aRowBuf_4_3;
+  reg  [7:0]   aRowBuf_4_4;
+  reg  [7:0]   aRowBuf_4_5;
+  reg  [7:0]   aRowBuf_4_6;
+  reg  [7:0]   aRowBuf_4_7;
+  reg  [7:0]   aRowBuf_4_8;
+  reg  [7:0]   aRowBuf_4_9;
+  reg  [7:0]   aRowBuf_4_10;
+  reg  [7:0]   aRowBuf_4_11;
+  reg  [7:0]   aRowBuf_4_12;
+  reg  [7:0]   aRowBuf_4_13;
+  reg  [7:0]   aRowBuf_4_14;
+  reg  [7:0]   aRowBuf_4_15;
+  reg  [7:0]   aRowBuf_5_0;
+  reg  [7:0]   aRowBuf_5_1;
+  reg  [7:0]   aRowBuf_5_2;
+  reg  [7:0]   aRowBuf_5_3;
+  reg  [7:0]   aRowBuf_5_4;
+  reg  [7:0]   aRowBuf_5_5;
+  reg  [7:0]   aRowBuf_5_6;
+  reg  [7:0]   aRowBuf_5_7;
+  reg  [7:0]   aRowBuf_5_8;
+  reg  [7:0]   aRowBuf_5_9;
+  reg  [7:0]   aRowBuf_5_10;
+  reg  [7:0]   aRowBuf_5_11;
+  reg  [7:0]   aRowBuf_5_12;
+  reg  [7:0]   aRowBuf_5_13;
+  reg  [7:0]   aRowBuf_5_14;
+  reg  [7:0]   aRowBuf_5_15;
+  reg  [7:0]   aRowBuf_6_0;
+  reg  [7:0]   aRowBuf_6_1;
+  reg  [7:0]   aRowBuf_6_2;
+  reg  [7:0]   aRowBuf_6_3;
+  reg  [7:0]   aRowBuf_6_4;
+  reg  [7:0]   aRowBuf_6_5;
+  reg  [7:0]   aRowBuf_6_6;
+  reg  [7:0]   aRowBuf_6_7;
+  reg  [7:0]   aRowBuf_6_8;
+  reg  [7:0]   aRowBuf_6_9;
+  reg  [7:0]   aRowBuf_6_10;
+  reg  [7:0]   aRowBuf_6_11;
+  reg  [7:0]   aRowBuf_6_12;
+  reg  [7:0]   aRowBuf_6_13;
+  reg  [7:0]   aRowBuf_6_14;
+  reg  [7:0]   aRowBuf_6_15;
+  reg  [7:0]   aRowBuf_7_0;
+  reg  [7:0]   aRowBuf_7_1;
+  reg  [7:0]   aRowBuf_7_2;
+  reg  [7:0]   aRowBuf_7_3;
+  reg  [7:0]   aRowBuf_7_4;
+  reg  [7:0]   aRowBuf_7_5;
+  reg  [7:0]   aRowBuf_7_6;
+  reg  [7:0]   aRowBuf_7_7;
+  reg  [7:0]   aRowBuf_7_8;
+  reg  [7:0]   aRowBuf_7_9;
+  reg  [7:0]   aRowBuf_7_10;
+  reg  [7:0]   aRowBuf_7_11;
+  reg  [7:0]   aRowBuf_7_12;
+  reg  [7:0]   aRowBuf_7_13;
+  reg  [7:0]   aRowBuf_7_14;
+  reg  [7:0]   aRowBuf_7_15;
+  reg  [7:0]   bColBuf_0_0_0;
+  reg  [7:0]   bColBuf_0_0_1;
+  reg  [7:0]   bColBuf_0_0_2;
+  reg  [7:0]   bColBuf_0_0_3;
+  reg  [7:0]   bColBuf_0_0_4;
+  reg  [7:0]   bColBuf_0_0_5;
+  reg  [7:0]   bColBuf_0_0_6;
+  reg  [7:0]   bColBuf_0_0_7;
+  reg  [7:0]   bColBuf_0_0_8;
+  reg  [7:0]   bColBuf_0_0_9;
+  reg  [7:0]   bColBuf_0_0_10;
+  reg  [7:0]   bColBuf_0_0_11;
+  reg  [7:0]   bColBuf_0_0_12;
+  reg  [7:0]   bColBuf_0_0_13;
+  reg  [7:0]   bColBuf_0_0_14;
+  reg  [7:0]   bColBuf_0_0_15;
+  reg  [7:0]   bColBuf_0_1_0;
+  reg  [7:0]   bColBuf_0_1_1;
+  reg  [7:0]   bColBuf_0_1_2;
+  reg  [7:0]   bColBuf_0_1_3;
+  reg  [7:0]   bColBuf_0_1_4;
+  reg  [7:0]   bColBuf_0_1_5;
+  reg  [7:0]   bColBuf_0_1_6;
+  reg  [7:0]   bColBuf_0_1_7;
+  reg  [7:0]   bColBuf_0_1_8;
+  reg  [7:0]   bColBuf_0_1_9;
+  reg  [7:0]   bColBuf_0_1_10;
+  reg  [7:0]   bColBuf_0_1_11;
+  reg  [7:0]   bColBuf_0_1_12;
+  reg  [7:0]   bColBuf_0_1_13;
+  reg  [7:0]   bColBuf_0_1_14;
+  reg  [7:0]   bColBuf_0_1_15;
+  reg  [7:0]   bColBuf_0_2_0;
+  reg  [7:0]   bColBuf_0_2_1;
+  reg  [7:0]   bColBuf_0_2_2;
+  reg  [7:0]   bColBuf_0_2_3;
+  reg  [7:0]   bColBuf_0_2_4;
+  reg  [7:0]   bColBuf_0_2_5;
+  reg  [7:0]   bColBuf_0_2_6;
+  reg  [7:0]   bColBuf_0_2_7;
+  reg  [7:0]   bColBuf_0_2_8;
+  reg  [7:0]   bColBuf_0_2_9;
+  reg  [7:0]   bColBuf_0_2_10;
+  reg  [7:0]   bColBuf_0_2_11;
+  reg  [7:0]   bColBuf_0_2_12;
+  reg  [7:0]   bColBuf_0_2_13;
+  reg  [7:0]   bColBuf_0_2_14;
+  reg  [7:0]   bColBuf_0_2_15;
+  reg  [7:0]   bColBuf_0_3_0;
+  reg  [7:0]   bColBuf_0_3_1;
+  reg  [7:0]   bColBuf_0_3_2;
+  reg  [7:0]   bColBuf_0_3_3;
+  reg  [7:0]   bColBuf_0_3_4;
+  reg  [7:0]   bColBuf_0_3_5;
+  reg  [7:0]   bColBuf_0_3_6;
+  reg  [7:0]   bColBuf_0_3_7;
+  reg  [7:0]   bColBuf_0_3_8;
+  reg  [7:0]   bColBuf_0_3_9;
+  reg  [7:0]   bColBuf_0_3_10;
+  reg  [7:0]   bColBuf_0_3_11;
+  reg  [7:0]   bColBuf_0_3_12;
+  reg  [7:0]   bColBuf_0_3_13;
+  reg  [7:0]   bColBuf_0_3_14;
+  reg  [7:0]   bColBuf_0_3_15;
+  reg  [7:0]   bColBuf_0_4_0;
+  reg  [7:0]   bColBuf_0_4_1;
+  reg  [7:0]   bColBuf_0_4_2;
+  reg  [7:0]   bColBuf_0_4_3;
+  reg  [7:0]   bColBuf_0_4_4;
+  reg  [7:0]   bColBuf_0_4_5;
+  reg  [7:0]   bColBuf_0_4_6;
+  reg  [7:0]   bColBuf_0_4_7;
+  reg  [7:0]   bColBuf_0_4_8;
+  reg  [7:0]   bColBuf_0_4_9;
+  reg  [7:0]   bColBuf_0_4_10;
+  reg  [7:0]   bColBuf_0_4_11;
+  reg  [7:0]   bColBuf_0_4_12;
+  reg  [7:0]   bColBuf_0_4_13;
+  reg  [7:0]   bColBuf_0_4_14;
+  reg  [7:0]   bColBuf_0_4_15;
+  reg  [7:0]   bColBuf_0_5_0;
+  reg  [7:0]   bColBuf_0_5_1;
+  reg  [7:0]   bColBuf_0_5_2;
+  reg  [7:0]   bColBuf_0_5_3;
+  reg  [7:0]   bColBuf_0_5_4;
+  reg  [7:0]   bColBuf_0_5_5;
+  reg  [7:0]   bColBuf_0_5_6;
+  reg  [7:0]   bColBuf_0_5_7;
+  reg  [7:0]   bColBuf_0_5_8;
+  reg  [7:0]   bColBuf_0_5_9;
+  reg  [7:0]   bColBuf_0_5_10;
+  reg  [7:0]   bColBuf_0_5_11;
+  reg  [7:0]   bColBuf_0_5_12;
+  reg  [7:0]   bColBuf_0_5_13;
+  reg  [7:0]   bColBuf_0_5_14;
+  reg  [7:0]   bColBuf_0_5_15;
+  reg  [7:0]   bColBuf_0_6_0;
+  reg  [7:0]   bColBuf_0_6_1;
+  reg  [7:0]   bColBuf_0_6_2;
+  reg  [7:0]   bColBuf_0_6_3;
+  reg  [7:0]   bColBuf_0_6_4;
+  reg  [7:0]   bColBuf_0_6_5;
+  reg  [7:0]   bColBuf_0_6_6;
+  reg  [7:0]   bColBuf_0_6_7;
+  reg  [7:0]   bColBuf_0_6_8;
+  reg  [7:0]   bColBuf_0_6_9;
+  reg  [7:0]   bColBuf_0_6_10;
+  reg  [7:0]   bColBuf_0_6_11;
+  reg  [7:0]   bColBuf_0_6_12;
+  reg  [7:0]   bColBuf_0_6_13;
+  reg  [7:0]   bColBuf_0_6_14;
+  reg  [7:0]   bColBuf_0_6_15;
+  reg  [7:0]   bColBuf_0_7_0;
+  reg  [7:0]   bColBuf_0_7_1;
+  reg  [7:0]   bColBuf_0_7_2;
+  reg  [7:0]   bColBuf_0_7_3;
+  reg  [7:0]   bColBuf_0_7_4;
+  reg  [7:0]   bColBuf_0_7_5;
+  reg  [7:0]   bColBuf_0_7_6;
+  reg  [7:0]   bColBuf_0_7_7;
+  reg  [7:0]   bColBuf_0_7_8;
+  reg  [7:0]   bColBuf_0_7_9;
+  reg  [7:0]   bColBuf_0_7_10;
+  reg  [7:0]   bColBuf_0_7_11;
+  reg  [7:0]   bColBuf_0_7_12;
+  reg  [7:0]   bColBuf_0_7_13;
+  reg  [7:0]   bColBuf_0_7_14;
+  reg  [7:0]   bColBuf_0_7_15;
+  reg  [7:0]   bColBuf_1_0_0;
+  reg  [7:0]   bColBuf_1_0_1;
+  reg  [7:0]   bColBuf_1_0_2;
+  reg  [7:0]   bColBuf_1_0_3;
+  reg  [7:0]   bColBuf_1_0_4;
+  reg  [7:0]   bColBuf_1_0_5;
+  reg  [7:0]   bColBuf_1_0_6;
+  reg  [7:0]   bColBuf_1_0_7;
+  reg  [7:0]   bColBuf_1_0_8;
+  reg  [7:0]   bColBuf_1_0_9;
+  reg  [7:0]   bColBuf_1_0_10;
+  reg  [7:0]   bColBuf_1_0_11;
+  reg  [7:0]   bColBuf_1_0_12;
+  reg  [7:0]   bColBuf_1_0_13;
+  reg  [7:0]   bColBuf_1_0_14;
+  reg  [7:0]   bColBuf_1_0_15;
+  reg  [7:0]   bColBuf_1_1_0;
+  reg  [7:0]   bColBuf_1_1_1;
+  reg  [7:0]   bColBuf_1_1_2;
+  reg  [7:0]   bColBuf_1_1_3;
+  reg  [7:0]   bColBuf_1_1_4;
+  reg  [7:0]   bColBuf_1_1_5;
+  reg  [7:0]   bColBuf_1_1_6;
+  reg  [7:0]   bColBuf_1_1_7;
+  reg  [7:0]   bColBuf_1_1_8;
+  reg  [7:0]   bColBuf_1_1_9;
+  reg  [7:0]   bColBuf_1_1_10;
+  reg  [7:0]   bColBuf_1_1_11;
+  reg  [7:0]   bColBuf_1_1_12;
+  reg  [7:0]   bColBuf_1_1_13;
+  reg  [7:0]   bColBuf_1_1_14;
+  reg  [7:0]   bColBuf_1_1_15;
+  reg  [7:0]   bColBuf_1_2_0;
+  reg  [7:0]   bColBuf_1_2_1;
+  reg  [7:0]   bColBuf_1_2_2;
+  reg  [7:0]   bColBuf_1_2_3;
+  reg  [7:0]   bColBuf_1_2_4;
+  reg  [7:0]   bColBuf_1_2_5;
+  reg  [7:0]   bColBuf_1_2_6;
+  reg  [7:0]   bColBuf_1_2_7;
+  reg  [7:0]   bColBuf_1_2_8;
+  reg  [7:0]   bColBuf_1_2_9;
+  reg  [7:0]   bColBuf_1_2_10;
+  reg  [7:0]   bColBuf_1_2_11;
+  reg  [7:0]   bColBuf_1_2_12;
+  reg  [7:0]   bColBuf_1_2_13;
+  reg  [7:0]   bColBuf_1_2_14;
+  reg  [7:0]   bColBuf_1_2_15;
+  reg  [7:0]   bColBuf_1_3_0;
+  reg  [7:0]   bColBuf_1_3_1;
+  reg  [7:0]   bColBuf_1_3_2;
+  reg  [7:0]   bColBuf_1_3_3;
+  reg  [7:0]   bColBuf_1_3_4;
+  reg  [7:0]   bColBuf_1_3_5;
+  reg  [7:0]   bColBuf_1_3_6;
+  reg  [7:0]   bColBuf_1_3_7;
+  reg  [7:0]   bColBuf_1_3_8;
+  reg  [7:0]   bColBuf_1_3_9;
+  reg  [7:0]   bColBuf_1_3_10;
+  reg  [7:0]   bColBuf_1_3_11;
+  reg  [7:0]   bColBuf_1_3_12;
+  reg  [7:0]   bColBuf_1_3_13;
+  reg  [7:0]   bColBuf_1_3_14;
+  reg  [7:0]   bColBuf_1_3_15;
+  reg  [7:0]   bColBuf_1_4_0;
+  reg  [7:0]   bColBuf_1_4_1;
+  reg  [7:0]   bColBuf_1_4_2;
+  reg  [7:0]   bColBuf_1_4_3;
+  reg  [7:0]   bColBuf_1_4_4;
+  reg  [7:0]   bColBuf_1_4_5;
+  reg  [7:0]   bColBuf_1_4_6;
+  reg  [7:0]   bColBuf_1_4_7;
+  reg  [7:0]   bColBuf_1_4_8;
+  reg  [7:0]   bColBuf_1_4_9;
+  reg  [7:0]   bColBuf_1_4_10;
+  reg  [7:0]   bColBuf_1_4_11;
+  reg  [7:0]   bColBuf_1_4_12;
+  reg  [7:0]   bColBuf_1_4_13;
+  reg  [7:0]   bColBuf_1_4_14;
+  reg  [7:0]   bColBuf_1_4_15;
+  reg  [7:0]   bColBuf_1_5_0;
+  reg  [7:0]   bColBuf_1_5_1;
+  reg  [7:0]   bColBuf_1_5_2;
+  reg  [7:0]   bColBuf_1_5_3;
+  reg  [7:0]   bColBuf_1_5_4;
+  reg  [7:0]   bColBuf_1_5_5;
+  reg  [7:0]   bColBuf_1_5_6;
+  reg  [7:0]   bColBuf_1_5_7;
+  reg  [7:0]   bColBuf_1_5_8;
+  reg  [7:0]   bColBuf_1_5_9;
+  reg  [7:0]   bColBuf_1_5_10;
+  reg  [7:0]   bColBuf_1_5_11;
+  reg  [7:0]   bColBuf_1_5_12;
+  reg  [7:0]   bColBuf_1_5_13;
+  reg  [7:0]   bColBuf_1_5_14;
+  reg  [7:0]   bColBuf_1_5_15;
+  reg  [7:0]   bColBuf_1_6_0;
+  reg  [7:0]   bColBuf_1_6_1;
+  reg  [7:0]   bColBuf_1_6_2;
+  reg  [7:0]   bColBuf_1_6_3;
+  reg  [7:0]   bColBuf_1_6_4;
+  reg  [7:0]   bColBuf_1_6_5;
+  reg  [7:0]   bColBuf_1_6_6;
+  reg  [7:0]   bColBuf_1_6_7;
+  reg  [7:0]   bColBuf_1_6_8;
+  reg  [7:0]   bColBuf_1_6_9;
+  reg  [7:0]   bColBuf_1_6_10;
+  reg  [7:0]   bColBuf_1_6_11;
+  reg  [7:0]   bColBuf_1_6_12;
+  reg  [7:0]   bColBuf_1_6_13;
+  reg  [7:0]   bColBuf_1_6_14;
+  reg  [7:0]   bColBuf_1_6_15;
+  reg  [7:0]   bColBuf_1_7_0;
+  reg  [7:0]   bColBuf_1_7_1;
+  reg  [7:0]   bColBuf_1_7_2;
+  reg  [7:0]   bColBuf_1_7_3;
+  reg  [7:0]   bColBuf_1_7_4;
+  reg  [7:0]   bColBuf_1_7_5;
+  reg  [7:0]   bColBuf_1_7_6;
+  reg  [7:0]   bColBuf_1_7_7;
+  reg  [7:0]   bColBuf_1_7_8;
+  reg  [7:0]   bColBuf_1_7_9;
+  reg  [7:0]   bColBuf_1_7_10;
+  reg  [7:0]   bColBuf_1_7_11;
+  reg  [7:0]   bColBuf_1_7_12;
+  reg  [7:0]   bColBuf_1_7_13;
+  reg  [7:0]   bColBuf_1_7_14;
+  reg  [7:0]   bColBuf_1_7_15;
+  reg  [7:0]   bColBuf_2_0_0;
+  reg  [7:0]   bColBuf_2_0_1;
+  reg  [7:0]   bColBuf_2_0_2;
+  reg  [7:0]   bColBuf_2_0_3;
+  reg  [7:0]   bColBuf_2_0_4;
+  reg  [7:0]   bColBuf_2_0_5;
+  reg  [7:0]   bColBuf_2_0_6;
+  reg  [7:0]   bColBuf_2_0_7;
+  reg  [7:0]   bColBuf_2_0_8;
+  reg  [7:0]   bColBuf_2_0_9;
+  reg  [7:0]   bColBuf_2_0_10;
+  reg  [7:0]   bColBuf_2_0_11;
+  reg  [7:0]   bColBuf_2_0_12;
+  reg  [7:0]   bColBuf_2_0_13;
+  reg  [7:0]   bColBuf_2_0_14;
+  reg  [7:0]   bColBuf_2_0_15;
+  reg  [7:0]   bColBuf_2_1_0;
+  reg  [7:0]   bColBuf_2_1_1;
+  reg  [7:0]   bColBuf_2_1_2;
+  reg  [7:0]   bColBuf_2_1_3;
+  reg  [7:0]   bColBuf_2_1_4;
+  reg  [7:0]   bColBuf_2_1_5;
+  reg  [7:0]   bColBuf_2_1_6;
+  reg  [7:0]   bColBuf_2_1_7;
+  reg  [7:0]   bColBuf_2_1_8;
+  reg  [7:0]   bColBuf_2_1_9;
+  reg  [7:0]   bColBuf_2_1_10;
+  reg  [7:0]   bColBuf_2_1_11;
+  reg  [7:0]   bColBuf_2_1_12;
+  reg  [7:0]   bColBuf_2_1_13;
+  reg  [7:0]   bColBuf_2_1_14;
+  reg  [7:0]   bColBuf_2_1_15;
+  reg  [7:0]   bColBuf_2_2_0;
+  reg  [7:0]   bColBuf_2_2_1;
+  reg  [7:0]   bColBuf_2_2_2;
+  reg  [7:0]   bColBuf_2_2_3;
+  reg  [7:0]   bColBuf_2_2_4;
+  reg  [7:0]   bColBuf_2_2_5;
+  reg  [7:0]   bColBuf_2_2_6;
+  reg  [7:0]   bColBuf_2_2_7;
+  reg  [7:0]   bColBuf_2_2_8;
+  reg  [7:0]   bColBuf_2_2_9;
+  reg  [7:0]   bColBuf_2_2_10;
+  reg  [7:0]   bColBuf_2_2_11;
+  reg  [7:0]   bColBuf_2_2_12;
+  reg  [7:0]   bColBuf_2_2_13;
+  reg  [7:0]   bColBuf_2_2_14;
+  reg  [7:0]   bColBuf_2_2_15;
+  reg  [7:0]   bColBuf_2_3_0;
+  reg  [7:0]   bColBuf_2_3_1;
+  reg  [7:0]   bColBuf_2_3_2;
+  reg  [7:0]   bColBuf_2_3_3;
+  reg  [7:0]   bColBuf_2_3_4;
+  reg  [7:0]   bColBuf_2_3_5;
+  reg  [7:0]   bColBuf_2_3_6;
+  reg  [7:0]   bColBuf_2_3_7;
+  reg  [7:0]   bColBuf_2_3_8;
+  reg  [7:0]   bColBuf_2_3_9;
+  reg  [7:0]   bColBuf_2_3_10;
+  reg  [7:0]   bColBuf_2_3_11;
+  reg  [7:0]   bColBuf_2_3_12;
+  reg  [7:0]   bColBuf_2_3_13;
+  reg  [7:0]   bColBuf_2_3_14;
+  reg  [7:0]   bColBuf_2_3_15;
+  reg  [7:0]   bColBuf_2_4_0;
+  reg  [7:0]   bColBuf_2_4_1;
+  reg  [7:0]   bColBuf_2_4_2;
+  reg  [7:0]   bColBuf_2_4_3;
+  reg  [7:0]   bColBuf_2_4_4;
+  reg  [7:0]   bColBuf_2_4_5;
+  reg  [7:0]   bColBuf_2_4_6;
+  reg  [7:0]   bColBuf_2_4_7;
+  reg  [7:0]   bColBuf_2_4_8;
+  reg  [7:0]   bColBuf_2_4_9;
+  reg  [7:0]   bColBuf_2_4_10;
+  reg  [7:0]   bColBuf_2_4_11;
+  reg  [7:0]   bColBuf_2_4_12;
+  reg  [7:0]   bColBuf_2_4_13;
+  reg  [7:0]   bColBuf_2_4_14;
+  reg  [7:0]   bColBuf_2_4_15;
+  reg  [7:0]   bColBuf_2_5_0;
+  reg  [7:0]   bColBuf_2_5_1;
+  reg  [7:0]   bColBuf_2_5_2;
+  reg  [7:0]   bColBuf_2_5_3;
+  reg  [7:0]   bColBuf_2_5_4;
+  reg  [7:0]   bColBuf_2_5_5;
+  reg  [7:0]   bColBuf_2_5_6;
+  reg  [7:0]   bColBuf_2_5_7;
+  reg  [7:0]   bColBuf_2_5_8;
+  reg  [7:0]   bColBuf_2_5_9;
+  reg  [7:0]   bColBuf_2_5_10;
+  reg  [7:0]   bColBuf_2_5_11;
+  reg  [7:0]   bColBuf_2_5_12;
+  reg  [7:0]   bColBuf_2_5_13;
+  reg  [7:0]   bColBuf_2_5_14;
+  reg  [7:0]   bColBuf_2_5_15;
+  reg  [7:0]   bColBuf_2_6_0;
+  reg  [7:0]   bColBuf_2_6_1;
+  reg  [7:0]   bColBuf_2_6_2;
+  reg  [7:0]   bColBuf_2_6_3;
+  reg  [7:0]   bColBuf_2_6_4;
+  reg  [7:0]   bColBuf_2_6_5;
+  reg  [7:0]   bColBuf_2_6_6;
+  reg  [7:0]   bColBuf_2_6_7;
+  reg  [7:0]   bColBuf_2_6_8;
+  reg  [7:0]   bColBuf_2_6_9;
+  reg  [7:0]   bColBuf_2_6_10;
+  reg  [7:0]   bColBuf_2_6_11;
+  reg  [7:0]   bColBuf_2_6_12;
+  reg  [7:0]   bColBuf_2_6_13;
+  reg  [7:0]   bColBuf_2_6_14;
+  reg  [7:0]   bColBuf_2_6_15;
+  reg  [7:0]   bColBuf_2_7_0;
+  reg  [7:0]   bColBuf_2_7_1;
+  reg  [7:0]   bColBuf_2_7_2;
+  reg  [7:0]   bColBuf_2_7_3;
+  reg  [7:0]   bColBuf_2_7_4;
+  reg  [7:0]   bColBuf_2_7_5;
+  reg  [7:0]   bColBuf_2_7_6;
+  reg  [7:0]   bColBuf_2_7_7;
+  reg  [7:0]   bColBuf_2_7_8;
+  reg  [7:0]   bColBuf_2_7_9;
+  reg  [7:0]   bColBuf_2_7_10;
+  reg  [7:0]   bColBuf_2_7_11;
+  reg  [7:0]   bColBuf_2_7_12;
+  reg  [7:0]   bColBuf_2_7_13;
+  reg  [7:0]   bColBuf_2_7_14;
+  reg  [7:0]   bColBuf_2_7_15;
+  reg  [7:0]   bColBuf_3_0_0;
+  reg  [7:0]   bColBuf_3_0_1;
+  reg  [7:0]   bColBuf_3_0_2;
+  reg  [7:0]   bColBuf_3_0_3;
+  reg  [7:0]   bColBuf_3_0_4;
+  reg  [7:0]   bColBuf_3_0_5;
+  reg  [7:0]   bColBuf_3_0_6;
+  reg  [7:0]   bColBuf_3_0_7;
+  reg  [7:0]   bColBuf_3_0_8;
+  reg  [7:0]   bColBuf_3_0_9;
+  reg  [7:0]   bColBuf_3_0_10;
+  reg  [7:0]   bColBuf_3_0_11;
+  reg  [7:0]   bColBuf_3_0_12;
+  reg  [7:0]   bColBuf_3_0_13;
+  reg  [7:0]   bColBuf_3_0_14;
+  reg  [7:0]   bColBuf_3_0_15;
+  reg  [7:0]   bColBuf_3_1_0;
+  reg  [7:0]   bColBuf_3_1_1;
+  reg  [7:0]   bColBuf_3_1_2;
+  reg  [7:0]   bColBuf_3_1_3;
+  reg  [7:0]   bColBuf_3_1_4;
+  reg  [7:0]   bColBuf_3_1_5;
+  reg  [7:0]   bColBuf_3_1_6;
+  reg  [7:0]   bColBuf_3_1_7;
+  reg  [7:0]   bColBuf_3_1_8;
+  reg  [7:0]   bColBuf_3_1_9;
+  reg  [7:0]   bColBuf_3_1_10;
+  reg  [7:0]   bColBuf_3_1_11;
+  reg  [7:0]   bColBuf_3_1_12;
+  reg  [7:0]   bColBuf_3_1_13;
+  reg  [7:0]   bColBuf_3_1_14;
+  reg  [7:0]   bColBuf_3_1_15;
+  reg  [7:0]   bColBuf_3_2_0;
+  reg  [7:0]   bColBuf_3_2_1;
+  reg  [7:0]   bColBuf_3_2_2;
+  reg  [7:0]   bColBuf_3_2_3;
+  reg  [7:0]   bColBuf_3_2_4;
+  reg  [7:0]   bColBuf_3_2_5;
+  reg  [7:0]   bColBuf_3_2_6;
+  reg  [7:0]   bColBuf_3_2_7;
+  reg  [7:0]   bColBuf_3_2_8;
+  reg  [7:0]   bColBuf_3_2_9;
+  reg  [7:0]   bColBuf_3_2_10;
+  reg  [7:0]   bColBuf_3_2_11;
+  reg  [7:0]   bColBuf_3_2_12;
+  reg  [7:0]   bColBuf_3_2_13;
+  reg  [7:0]   bColBuf_3_2_14;
+  reg  [7:0]   bColBuf_3_2_15;
+  reg  [7:0]   bColBuf_3_3_0;
+  reg  [7:0]   bColBuf_3_3_1;
+  reg  [7:0]   bColBuf_3_3_2;
+  reg  [7:0]   bColBuf_3_3_3;
+  reg  [7:0]   bColBuf_3_3_4;
+  reg  [7:0]   bColBuf_3_3_5;
+  reg  [7:0]   bColBuf_3_3_6;
+  reg  [7:0]   bColBuf_3_3_7;
+  reg  [7:0]   bColBuf_3_3_8;
+  reg  [7:0]   bColBuf_3_3_9;
+  reg  [7:0]   bColBuf_3_3_10;
+  reg  [7:0]   bColBuf_3_3_11;
+  reg  [7:0]   bColBuf_3_3_12;
+  reg  [7:0]   bColBuf_3_3_13;
+  reg  [7:0]   bColBuf_3_3_14;
+  reg  [7:0]   bColBuf_3_3_15;
+  reg  [7:0]   bColBuf_3_4_0;
+  reg  [7:0]   bColBuf_3_4_1;
+  reg  [7:0]   bColBuf_3_4_2;
+  reg  [7:0]   bColBuf_3_4_3;
+  reg  [7:0]   bColBuf_3_4_4;
+  reg  [7:0]   bColBuf_3_4_5;
+  reg  [7:0]   bColBuf_3_4_6;
+  reg  [7:0]   bColBuf_3_4_7;
+  reg  [7:0]   bColBuf_3_4_8;
+  reg  [7:0]   bColBuf_3_4_9;
+  reg  [7:0]   bColBuf_3_4_10;
+  reg  [7:0]   bColBuf_3_4_11;
+  reg  [7:0]   bColBuf_3_4_12;
+  reg  [7:0]   bColBuf_3_4_13;
+  reg  [7:0]   bColBuf_3_4_14;
+  reg  [7:0]   bColBuf_3_4_15;
+  reg  [7:0]   bColBuf_3_5_0;
+  reg  [7:0]   bColBuf_3_5_1;
+  reg  [7:0]   bColBuf_3_5_2;
+  reg  [7:0]   bColBuf_3_5_3;
+  reg  [7:0]   bColBuf_3_5_4;
+  reg  [7:0]   bColBuf_3_5_5;
+  reg  [7:0]   bColBuf_3_5_6;
+  reg  [7:0]   bColBuf_3_5_7;
+  reg  [7:0]   bColBuf_3_5_8;
+  reg  [7:0]   bColBuf_3_5_9;
+  reg  [7:0]   bColBuf_3_5_10;
+  reg  [7:0]   bColBuf_3_5_11;
+  reg  [7:0]   bColBuf_3_5_12;
+  reg  [7:0]   bColBuf_3_5_13;
+  reg  [7:0]   bColBuf_3_5_14;
+  reg  [7:0]   bColBuf_3_5_15;
+  reg  [7:0]   bColBuf_3_6_0;
+  reg  [7:0]   bColBuf_3_6_1;
+  reg  [7:0]   bColBuf_3_6_2;
+  reg  [7:0]   bColBuf_3_6_3;
+  reg  [7:0]   bColBuf_3_6_4;
+  reg  [7:0]   bColBuf_3_6_5;
+  reg  [7:0]   bColBuf_3_6_6;
+  reg  [7:0]   bColBuf_3_6_7;
+  reg  [7:0]   bColBuf_3_6_8;
+  reg  [7:0]   bColBuf_3_6_9;
+  reg  [7:0]   bColBuf_3_6_10;
+  reg  [7:0]   bColBuf_3_6_11;
+  reg  [7:0]   bColBuf_3_6_12;
+  reg  [7:0]   bColBuf_3_6_13;
+  reg  [7:0]   bColBuf_3_6_14;
+  reg  [7:0]   bColBuf_3_6_15;
+  reg  [7:0]   bColBuf_3_7_0;
+  reg  [7:0]   bColBuf_3_7_1;
+  reg  [7:0]   bColBuf_3_7_2;
+  reg  [7:0]   bColBuf_3_7_3;
+  reg  [7:0]   bColBuf_3_7_4;
+  reg  [7:0]   bColBuf_3_7_5;
+  reg  [7:0]   bColBuf_3_7_6;
+  reg  [7:0]   bColBuf_3_7_7;
+  reg  [7:0]   bColBuf_3_7_8;
+  reg  [7:0]   bColBuf_3_7_9;
+  reg  [7:0]   bColBuf_3_7_10;
+  reg  [7:0]   bColBuf_3_7_11;
+  reg  [7:0]   bColBuf_3_7_12;
+  reg  [7:0]   bColBuf_3_7_13;
+  reg  [7:0]   bColBuf_3_7_14;
+  reg  [7:0]   bColBuf_3_7_15;
+  reg  [1:0]   bPanelUse;
+  reg  [1:0]   bPanelLoad;
   reg          wState;
-  wire         doWrite = s_axi_awvalid & s_axi_wvalid & ~wState;
   reg          awreadyReg;
   reg          wreadyReg;
   reg          bvalidReg;
@@ -316,89 +984,1614 @@ module mm_accel(
   reg          arreadyReg;
   reg          rvalidReg;
   wire         _GEN = raddrWord == 6'h8;
-  wire         pushA = doWrite & ~busy & s_axi_awaddr[7:2] == 6'h5;
-  wire         pushB = doWrite & ~busy & s_axi_awaddr[7:2] == 6'h6;
-  wire         _GEN_0 = doWrite & ~busy;
-  wire [3:0]   addr = {loadK, 2'h0};
-  wire         _GEN_1 = _GEN_0 & loadLane == 3'h0;
-  wire         _GEN_2 = _GEN_1 & pushA;
-  wire         _GEN_3 = _GEN_1 & pushB;
-  wire [3:0]   addr_1 = {loadK, 2'h1};
-  wire [3:0]   addr_2 = {loadK, 2'h2};
-  wire [3:0]   addr_3 = {loadK, 2'h3};
-  wire [3:0]   addr_4 = {loadK, 2'h0};
-  wire         _GEN_4 = _GEN_0 & loadLane == 3'h1;
-  wire         _GEN_5 = _GEN_4 & pushA;
-  wire         _GEN_6 = _GEN_4 & pushB;
-  wire [3:0]   addr_5 = {loadK, 2'h1};
-  wire [3:0]   addr_6 = {loadK, 2'h2};
-  wire [3:0]   addr_7 = {loadK, 2'h3};
-  wire [3:0]   addr_8 = {loadK, 2'h0};
-  wire         _GEN_7 = _GEN_0 & loadLane == 3'h2;
-  wire         _GEN_8 = _GEN_7 & pushA;
-  wire         _GEN_9 = _GEN_7 & pushB;
-  wire [3:0]   addr_9 = {loadK, 2'h1};
-  wire [3:0]   addr_10 = {loadK, 2'h2};
-  wire [3:0]   addr_11 = {loadK, 2'h3};
-  wire [3:0]   addr_12 = {loadK, 2'h0};
-  wire         _GEN_10 = _GEN_0 & loadLane == 3'h3;
-  wire         _GEN_11 = _GEN_10 & pushA;
-  wire         _GEN_12 = _GEN_10 & pushB;
-  wire [3:0]   addr_13 = {loadK, 2'h1};
-  wire [3:0]   addr_14 = {loadK, 2'h2};
-  wire [3:0]   addr_15 = {loadK, 2'h3};
-  wire [3:0]   addr_16 = {loadK, 2'h0};
-  wire         _GEN_13 = _GEN_0 & loadLane == 3'h4;
-  wire         _GEN_14 = _GEN_13 & pushA;
-  wire         _GEN_15 = _GEN_13 & pushB;
-  wire [3:0]   addr_17 = {loadK, 2'h1};
-  wire [3:0]   addr_18 = {loadK, 2'h2};
-  wire [3:0]   addr_19 = {loadK, 2'h3};
-  wire [3:0]   addr_20 = {loadK, 2'h0};
-  wire         _GEN_16 = _GEN_0 & loadLane == 3'h5;
-  wire         _GEN_17 = _GEN_16 & pushA;
-  wire         _GEN_18 = _GEN_16 & pushB;
-  wire [3:0]   addr_21 = {loadK, 2'h1};
-  wire [3:0]   addr_22 = {loadK, 2'h2};
-  wire [3:0]   addr_23 = {loadK, 2'h3};
-  wire [3:0]   addr_24 = {loadK, 2'h0};
-  wire         _GEN_19 = _GEN_0 & loadLane == 3'h6;
-  wire         _GEN_20 = _GEN_19 & pushA;
-  wire         _GEN_21 = _GEN_19 & pushB;
-  wire [3:0]   addr_25 = {loadK, 2'h1};
-  wire [3:0]   addr_26 = {loadK, 2'h2};
-  wire [3:0]   addr_27 = {loadK, 2'h3};
-  wire [3:0]   addr_28 = {loadK, 2'h0};
-  wire         _GEN_22 = _GEN_0 & (&loadLane);
-  wire         _GEN_23 = _GEN_22 & pushA;
-  wire         _GEN_24 = _GEN_22 & pushB;
-  wire [3:0]   addr_29 = {loadK, 2'h1};
-  wire [3:0]   addr_30 = {loadK, 2'h2};
-  wire [3:0]   addr_31 = {loadK, 2'h3};
-  wire [8:0]   _GEN_25 = {1'h0, kLen};
-  wire [8:0]   _GEN_26 = {1'h0, t};
-  wire         kValid = $signed(_GEN_26) > -9'sh1 & $signed(_GEN_26) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_4 = _GEN_26 - 9'h1;
+  wire [8:0]   _GEN_0 = {1'h0, kLen};
+  wire [8:0]   _GEN_1 = {1'h0, t};
+  wire         kValid = $signed(_GEN_1) > -9'sh1 & $signed(_GEN_1) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp;
+  always @(*) begin
+    casez (t[3:0])
+      4'b0000:
+        casez_tmp = aRowBuf_0_0;
+      4'b0001:
+        casez_tmp = aRowBuf_0_1;
+      4'b0010:
+        casez_tmp = aRowBuf_0_2;
+      4'b0011:
+        casez_tmp = aRowBuf_0_3;
+      4'b0100:
+        casez_tmp = aRowBuf_0_4;
+      4'b0101:
+        casez_tmp = aRowBuf_0_5;
+      4'b0110:
+        casez_tmp = aRowBuf_0_6;
+      4'b0111:
+        casez_tmp = aRowBuf_0_7;
+      4'b1000:
+        casez_tmp = aRowBuf_0_8;
+      4'b1001:
+        casez_tmp = aRowBuf_0_9;
+      4'b1010:
+        casez_tmp = aRowBuf_0_10;
+      4'b1011:
+        casez_tmp = aRowBuf_0_11;
+      4'b1100:
+        casez_tmp = aRowBuf_0_12;
+      4'b1101:
+        casez_tmp = aRowBuf_0_13;
+      4'b1110:
+        casez_tmp = aRowBuf_0_14;
+      default:
+        casez_tmp = aRowBuf_0_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_0;
+  always @(*) begin
+    casez (t[3:0])
+      4'b0000:
+        casez_tmp_0 = bColBuf_0_0_0;
+      4'b0001:
+        casez_tmp_0 = bColBuf_0_0_1;
+      4'b0010:
+        casez_tmp_0 = bColBuf_0_0_2;
+      4'b0011:
+        casez_tmp_0 = bColBuf_0_0_3;
+      4'b0100:
+        casez_tmp_0 = bColBuf_0_0_4;
+      4'b0101:
+        casez_tmp_0 = bColBuf_0_0_5;
+      4'b0110:
+        casez_tmp_0 = bColBuf_0_0_6;
+      4'b0111:
+        casez_tmp_0 = bColBuf_0_0_7;
+      4'b1000:
+        casez_tmp_0 = bColBuf_0_0_8;
+      4'b1001:
+        casez_tmp_0 = bColBuf_0_0_9;
+      4'b1010:
+        casez_tmp_0 = bColBuf_0_0_10;
+      4'b1011:
+        casez_tmp_0 = bColBuf_0_0_11;
+      4'b1100:
+        casez_tmp_0 = bColBuf_0_0_12;
+      4'b1101:
+        casez_tmp_0 = bColBuf_0_0_13;
+      4'b1110:
+        casez_tmp_0 = bColBuf_0_0_14;
+      default:
+        casez_tmp_0 = bColBuf_0_0_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_1;
+  always @(*) begin
+    casez (t[3:0])
+      4'b0000:
+        casez_tmp_1 = bColBuf_1_0_0;
+      4'b0001:
+        casez_tmp_1 = bColBuf_1_0_1;
+      4'b0010:
+        casez_tmp_1 = bColBuf_1_0_2;
+      4'b0011:
+        casez_tmp_1 = bColBuf_1_0_3;
+      4'b0100:
+        casez_tmp_1 = bColBuf_1_0_4;
+      4'b0101:
+        casez_tmp_1 = bColBuf_1_0_5;
+      4'b0110:
+        casez_tmp_1 = bColBuf_1_0_6;
+      4'b0111:
+        casez_tmp_1 = bColBuf_1_0_7;
+      4'b1000:
+        casez_tmp_1 = bColBuf_1_0_8;
+      4'b1001:
+        casez_tmp_1 = bColBuf_1_0_9;
+      4'b1010:
+        casez_tmp_1 = bColBuf_1_0_10;
+      4'b1011:
+        casez_tmp_1 = bColBuf_1_0_11;
+      4'b1100:
+        casez_tmp_1 = bColBuf_1_0_12;
+      4'b1101:
+        casez_tmp_1 = bColBuf_1_0_13;
+      4'b1110:
+        casez_tmp_1 = bColBuf_1_0_14;
+      default:
+        casez_tmp_1 = bColBuf_1_0_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_2;
+  always @(*) begin
+    casez (t[3:0])
+      4'b0000:
+        casez_tmp_2 = bColBuf_2_0_0;
+      4'b0001:
+        casez_tmp_2 = bColBuf_2_0_1;
+      4'b0010:
+        casez_tmp_2 = bColBuf_2_0_2;
+      4'b0011:
+        casez_tmp_2 = bColBuf_2_0_3;
+      4'b0100:
+        casez_tmp_2 = bColBuf_2_0_4;
+      4'b0101:
+        casez_tmp_2 = bColBuf_2_0_5;
+      4'b0110:
+        casez_tmp_2 = bColBuf_2_0_6;
+      4'b0111:
+        casez_tmp_2 = bColBuf_2_0_7;
+      4'b1000:
+        casez_tmp_2 = bColBuf_2_0_8;
+      4'b1001:
+        casez_tmp_2 = bColBuf_2_0_9;
+      4'b1010:
+        casez_tmp_2 = bColBuf_2_0_10;
+      4'b1011:
+        casez_tmp_2 = bColBuf_2_0_11;
+      4'b1100:
+        casez_tmp_2 = bColBuf_2_0_12;
+      4'b1101:
+        casez_tmp_2 = bColBuf_2_0_13;
+      4'b1110:
+        casez_tmp_2 = bColBuf_2_0_14;
+      default:
+        casez_tmp_2 = bColBuf_2_0_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_3;
+  always @(*) begin
+    casez (t[3:0])
+      4'b0000:
+        casez_tmp_3 = bColBuf_3_0_0;
+      4'b0001:
+        casez_tmp_3 = bColBuf_3_0_1;
+      4'b0010:
+        casez_tmp_3 = bColBuf_3_0_2;
+      4'b0011:
+        casez_tmp_3 = bColBuf_3_0_3;
+      4'b0100:
+        casez_tmp_3 = bColBuf_3_0_4;
+      4'b0101:
+        casez_tmp_3 = bColBuf_3_0_5;
+      4'b0110:
+        casez_tmp_3 = bColBuf_3_0_6;
+      4'b0111:
+        casez_tmp_3 = bColBuf_3_0_7;
+      4'b1000:
+        casez_tmp_3 = bColBuf_3_0_8;
+      4'b1001:
+        casez_tmp_3 = bColBuf_3_0_9;
+      4'b1010:
+        casez_tmp_3 = bColBuf_3_0_10;
+      4'b1011:
+        casez_tmp_3 = bColBuf_3_0_11;
+      4'b1100:
+        casez_tmp_3 = bColBuf_3_0_12;
+      4'b1101:
+        casez_tmp_3 = bColBuf_3_0_13;
+      4'b1110:
+        casez_tmp_3 = bColBuf_3_0_14;
+      default:
+        casez_tmp_3 = bColBuf_3_0_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_4;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_4 = casez_tmp_0;
+      2'b01:
+        casez_tmp_4 = casez_tmp_1;
+      2'b10:
+        casez_tmp_4 = casez_tmp_2;
+      default:
+        casez_tmp_4 = casez_tmp_3;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_4 = _GEN_1 - 9'h1;
   wire         kValid_1 =
-    $signed(_kIdx_T_4) > -9'sh1 & $signed(_kIdx_T_4) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_7 = _GEN_26 - 9'h2;
+    $signed(_kIdx_T_4) > -9'sh1 & $signed(_kIdx_T_4) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_5;
+  always @(*) begin
+    casez (_kIdx_T_4[3:0])
+      4'b0000:
+        casez_tmp_5 = aRowBuf_1_0;
+      4'b0001:
+        casez_tmp_5 = aRowBuf_1_1;
+      4'b0010:
+        casez_tmp_5 = aRowBuf_1_2;
+      4'b0011:
+        casez_tmp_5 = aRowBuf_1_3;
+      4'b0100:
+        casez_tmp_5 = aRowBuf_1_4;
+      4'b0101:
+        casez_tmp_5 = aRowBuf_1_5;
+      4'b0110:
+        casez_tmp_5 = aRowBuf_1_6;
+      4'b0111:
+        casez_tmp_5 = aRowBuf_1_7;
+      4'b1000:
+        casez_tmp_5 = aRowBuf_1_8;
+      4'b1001:
+        casez_tmp_5 = aRowBuf_1_9;
+      4'b1010:
+        casez_tmp_5 = aRowBuf_1_10;
+      4'b1011:
+        casez_tmp_5 = aRowBuf_1_11;
+      4'b1100:
+        casez_tmp_5 = aRowBuf_1_12;
+      4'b1101:
+        casez_tmp_5 = aRowBuf_1_13;
+      4'b1110:
+        casez_tmp_5 = aRowBuf_1_14;
+      default:
+        casez_tmp_5 = aRowBuf_1_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_6;
+  always @(*) begin
+    casez (_kIdx_T_4[3:0])
+      4'b0000:
+        casez_tmp_6 = bColBuf_0_1_0;
+      4'b0001:
+        casez_tmp_6 = bColBuf_0_1_1;
+      4'b0010:
+        casez_tmp_6 = bColBuf_0_1_2;
+      4'b0011:
+        casez_tmp_6 = bColBuf_0_1_3;
+      4'b0100:
+        casez_tmp_6 = bColBuf_0_1_4;
+      4'b0101:
+        casez_tmp_6 = bColBuf_0_1_5;
+      4'b0110:
+        casez_tmp_6 = bColBuf_0_1_6;
+      4'b0111:
+        casez_tmp_6 = bColBuf_0_1_7;
+      4'b1000:
+        casez_tmp_6 = bColBuf_0_1_8;
+      4'b1001:
+        casez_tmp_6 = bColBuf_0_1_9;
+      4'b1010:
+        casez_tmp_6 = bColBuf_0_1_10;
+      4'b1011:
+        casez_tmp_6 = bColBuf_0_1_11;
+      4'b1100:
+        casez_tmp_6 = bColBuf_0_1_12;
+      4'b1101:
+        casez_tmp_6 = bColBuf_0_1_13;
+      4'b1110:
+        casez_tmp_6 = bColBuf_0_1_14;
+      default:
+        casez_tmp_6 = bColBuf_0_1_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_7;
+  always @(*) begin
+    casez (_kIdx_T_4[3:0])
+      4'b0000:
+        casez_tmp_7 = bColBuf_1_1_0;
+      4'b0001:
+        casez_tmp_7 = bColBuf_1_1_1;
+      4'b0010:
+        casez_tmp_7 = bColBuf_1_1_2;
+      4'b0011:
+        casez_tmp_7 = bColBuf_1_1_3;
+      4'b0100:
+        casez_tmp_7 = bColBuf_1_1_4;
+      4'b0101:
+        casez_tmp_7 = bColBuf_1_1_5;
+      4'b0110:
+        casez_tmp_7 = bColBuf_1_1_6;
+      4'b0111:
+        casez_tmp_7 = bColBuf_1_1_7;
+      4'b1000:
+        casez_tmp_7 = bColBuf_1_1_8;
+      4'b1001:
+        casez_tmp_7 = bColBuf_1_1_9;
+      4'b1010:
+        casez_tmp_7 = bColBuf_1_1_10;
+      4'b1011:
+        casez_tmp_7 = bColBuf_1_1_11;
+      4'b1100:
+        casez_tmp_7 = bColBuf_1_1_12;
+      4'b1101:
+        casez_tmp_7 = bColBuf_1_1_13;
+      4'b1110:
+        casez_tmp_7 = bColBuf_1_1_14;
+      default:
+        casez_tmp_7 = bColBuf_1_1_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_8;
+  always @(*) begin
+    casez (_kIdx_T_4[3:0])
+      4'b0000:
+        casez_tmp_8 = bColBuf_2_1_0;
+      4'b0001:
+        casez_tmp_8 = bColBuf_2_1_1;
+      4'b0010:
+        casez_tmp_8 = bColBuf_2_1_2;
+      4'b0011:
+        casez_tmp_8 = bColBuf_2_1_3;
+      4'b0100:
+        casez_tmp_8 = bColBuf_2_1_4;
+      4'b0101:
+        casez_tmp_8 = bColBuf_2_1_5;
+      4'b0110:
+        casez_tmp_8 = bColBuf_2_1_6;
+      4'b0111:
+        casez_tmp_8 = bColBuf_2_1_7;
+      4'b1000:
+        casez_tmp_8 = bColBuf_2_1_8;
+      4'b1001:
+        casez_tmp_8 = bColBuf_2_1_9;
+      4'b1010:
+        casez_tmp_8 = bColBuf_2_1_10;
+      4'b1011:
+        casez_tmp_8 = bColBuf_2_1_11;
+      4'b1100:
+        casez_tmp_8 = bColBuf_2_1_12;
+      4'b1101:
+        casez_tmp_8 = bColBuf_2_1_13;
+      4'b1110:
+        casez_tmp_8 = bColBuf_2_1_14;
+      default:
+        casez_tmp_8 = bColBuf_2_1_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_9;
+  always @(*) begin
+    casez (_kIdx_T_4[3:0])
+      4'b0000:
+        casez_tmp_9 = bColBuf_3_1_0;
+      4'b0001:
+        casez_tmp_9 = bColBuf_3_1_1;
+      4'b0010:
+        casez_tmp_9 = bColBuf_3_1_2;
+      4'b0011:
+        casez_tmp_9 = bColBuf_3_1_3;
+      4'b0100:
+        casez_tmp_9 = bColBuf_3_1_4;
+      4'b0101:
+        casez_tmp_9 = bColBuf_3_1_5;
+      4'b0110:
+        casez_tmp_9 = bColBuf_3_1_6;
+      4'b0111:
+        casez_tmp_9 = bColBuf_3_1_7;
+      4'b1000:
+        casez_tmp_9 = bColBuf_3_1_8;
+      4'b1001:
+        casez_tmp_9 = bColBuf_3_1_9;
+      4'b1010:
+        casez_tmp_9 = bColBuf_3_1_10;
+      4'b1011:
+        casez_tmp_9 = bColBuf_3_1_11;
+      4'b1100:
+        casez_tmp_9 = bColBuf_3_1_12;
+      4'b1101:
+        casez_tmp_9 = bColBuf_3_1_13;
+      4'b1110:
+        casez_tmp_9 = bColBuf_3_1_14;
+      default:
+        casez_tmp_9 = bColBuf_3_1_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_10;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_10 = casez_tmp_6;
+      2'b01:
+        casez_tmp_10 = casez_tmp_7;
+      2'b10:
+        casez_tmp_10 = casez_tmp_8;
+      default:
+        casez_tmp_10 = casez_tmp_9;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_7 = _GEN_1 - 9'h2;
   wire         kValid_2 =
-    $signed(_kIdx_T_7) > -9'sh1 & $signed(_kIdx_T_7) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_10 = _GEN_26 - 9'h3;
+    $signed(_kIdx_T_7) > -9'sh1 & $signed(_kIdx_T_7) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_11;
+  always @(*) begin
+    casez (_kIdx_T_7[3:0])
+      4'b0000:
+        casez_tmp_11 = aRowBuf_2_0;
+      4'b0001:
+        casez_tmp_11 = aRowBuf_2_1;
+      4'b0010:
+        casez_tmp_11 = aRowBuf_2_2;
+      4'b0011:
+        casez_tmp_11 = aRowBuf_2_3;
+      4'b0100:
+        casez_tmp_11 = aRowBuf_2_4;
+      4'b0101:
+        casez_tmp_11 = aRowBuf_2_5;
+      4'b0110:
+        casez_tmp_11 = aRowBuf_2_6;
+      4'b0111:
+        casez_tmp_11 = aRowBuf_2_7;
+      4'b1000:
+        casez_tmp_11 = aRowBuf_2_8;
+      4'b1001:
+        casez_tmp_11 = aRowBuf_2_9;
+      4'b1010:
+        casez_tmp_11 = aRowBuf_2_10;
+      4'b1011:
+        casez_tmp_11 = aRowBuf_2_11;
+      4'b1100:
+        casez_tmp_11 = aRowBuf_2_12;
+      4'b1101:
+        casez_tmp_11 = aRowBuf_2_13;
+      4'b1110:
+        casez_tmp_11 = aRowBuf_2_14;
+      default:
+        casez_tmp_11 = aRowBuf_2_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_12;
+  always @(*) begin
+    casez (_kIdx_T_7[3:0])
+      4'b0000:
+        casez_tmp_12 = bColBuf_0_2_0;
+      4'b0001:
+        casez_tmp_12 = bColBuf_0_2_1;
+      4'b0010:
+        casez_tmp_12 = bColBuf_0_2_2;
+      4'b0011:
+        casez_tmp_12 = bColBuf_0_2_3;
+      4'b0100:
+        casez_tmp_12 = bColBuf_0_2_4;
+      4'b0101:
+        casez_tmp_12 = bColBuf_0_2_5;
+      4'b0110:
+        casez_tmp_12 = bColBuf_0_2_6;
+      4'b0111:
+        casez_tmp_12 = bColBuf_0_2_7;
+      4'b1000:
+        casez_tmp_12 = bColBuf_0_2_8;
+      4'b1001:
+        casez_tmp_12 = bColBuf_0_2_9;
+      4'b1010:
+        casez_tmp_12 = bColBuf_0_2_10;
+      4'b1011:
+        casez_tmp_12 = bColBuf_0_2_11;
+      4'b1100:
+        casez_tmp_12 = bColBuf_0_2_12;
+      4'b1101:
+        casez_tmp_12 = bColBuf_0_2_13;
+      4'b1110:
+        casez_tmp_12 = bColBuf_0_2_14;
+      default:
+        casez_tmp_12 = bColBuf_0_2_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_13;
+  always @(*) begin
+    casez (_kIdx_T_7[3:0])
+      4'b0000:
+        casez_tmp_13 = bColBuf_1_2_0;
+      4'b0001:
+        casez_tmp_13 = bColBuf_1_2_1;
+      4'b0010:
+        casez_tmp_13 = bColBuf_1_2_2;
+      4'b0011:
+        casez_tmp_13 = bColBuf_1_2_3;
+      4'b0100:
+        casez_tmp_13 = bColBuf_1_2_4;
+      4'b0101:
+        casez_tmp_13 = bColBuf_1_2_5;
+      4'b0110:
+        casez_tmp_13 = bColBuf_1_2_6;
+      4'b0111:
+        casez_tmp_13 = bColBuf_1_2_7;
+      4'b1000:
+        casez_tmp_13 = bColBuf_1_2_8;
+      4'b1001:
+        casez_tmp_13 = bColBuf_1_2_9;
+      4'b1010:
+        casez_tmp_13 = bColBuf_1_2_10;
+      4'b1011:
+        casez_tmp_13 = bColBuf_1_2_11;
+      4'b1100:
+        casez_tmp_13 = bColBuf_1_2_12;
+      4'b1101:
+        casez_tmp_13 = bColBuf_1_2_13;
+      4'b1110:
+        casez_tmp_13 = bColBuf_1_2_14;
+      default:
+        casez_tmp_13 = bColBuf_1_2_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_14;
+  always @(*) begin
+    casez (_kIdx_T_7[3:0])
+      4'b0000:
+        casez_tmp_14 = bColBuf_2_2_0;
+      4'b0001:
+        casez_tmp_14 = bColBuf_2_2_1;
+      4'b0010:
+        casez_tmp_14 = bColBuf_2_2_2;
+      4'b0011:
+        casez_tmp_14 = bColBuf_2_2_3;
+      4'b0100:
+        casez_tmp_14 = bColBuf_2_2_4;
+      4'b0101:
+        casez_tmp_14 = bColBuf_2_2_5;
+      4'b0110:
+        casez_tmp_14 = bColBuf_2_2_6;
+      4'b0111:
+        casez_tmp_14 = bColBuf_2_2_7;
+      4'b1000:
+        casez_tmp_14 = bColBuf_2_2_8;
+      4'b1001:
+        casez_tmp_14 = bColBuf_2_2_9;
+      4'b1010:
+        casez_tmp_14 = bColBuf_2_2_10;
+      4'b1011:
+        casez_tmp_14 = bColBuf_2_2_11;
+      4'b1100:
+        casez_tmp_14 = bColBuf_2_2_12;
+      4'b1101:
+        casez_tmp_14 = bColBuf_2_2_13;
+      4'b1110:
+        casez_tmp_14 = bColBuf_2_2_14;
+      default:
+        casez_tmp_14 = bColBuf_2_2_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_15;
+  always @(*) begin
+    casez (_kIdx_T_7[3:0])
+      4'b0000:
+        casez_tmp_15 = bColBuf_3_2_0;
+      4'b0001:
+        casez_tmp_15 = bColBuf_3_2_1;
+      4'b0010:
+        casez_tmp_15 = bColBuf_3_2_2;
+      4'b0011:
+        casez_tmp_15 = bColBuf_3_2_3;
+      4'b0100:
+        casez_tmp_15 = bColBuf_3_2_4;
+      4'b0101:
+        casez_tmp_15 = bColBuf_3_2_5;
+      4'b0110:
+        casez_tmp_15 = bColBuf_3_2_6;
+      4'b0111:
+        casez_tmp_15 = bColBuf_3_2_7;
+      4'b1000:
+        casez_tmp_15 = bColBuf_3_2_8;
+      4'b1001:
+        casez_tmp_15 = bColBuf_3_2_9;
+      4'b1010:
+        casez_tmp_15 = bColBuf_3_2_10;
+      4'b1011:
+        casez_tmp_15 = bColBuf_3_2_11;
+      4'b1100:
+        casez_tmp_15 = bColBuf_3_2_12;
+      4'b1101:
+        casez_tmp_15 = bColBuf_3_2_13;
+      4'b1110:
+        casez_tmp_15 = bColBuf_3_2_14;
+      default:
+        casez_tmp_15 = bColBuf_3_2_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_16;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_16 = casez_tmp_12;
+      2'b01:
+        casez_tmp_16 = casez_tmp_13;
+      2'b10:
+        casez_tmp_16 = casez_tmp_14;
+      default:
+        casez_tmp_16 = casez_tmp_15;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_10 = _GEN_1 - 9'h3;
   wire         kValid_3 =
-    $signed(_kIdx_T_10) > -9'sh1 & $signed(_kIdx_T_10) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_13 = _GEN_26 - 9'h4;
+    $signed(_kIdx_T_10) > -9'sh1 & $signed(_kIdx_T_10) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_17;
+  always @(*) begin
+    casez (_kIdx_T_10[3:0])
+      4'b0000:
+        casez_tmp_17 = aRowBuf_3_0;
+      4'b0001:
+        casez_tmp_17 = aRowBuf_3_1;
+      4'b0010:
+        casez_tmp_17 = aRowBuf_3_2;
+      4'b0011:
+        casez_tmp_17 = aRowBuf_3_3;
+      4'b0100:
+        casez_tmp_17 = aRowBuf_3_4;
+      4'b0101:
+        casez_tmp_17 = aRowBuf_3_5;
+      4'b0110:
+        casez_tmp_17 = aRowBuf_3_6;
+      4'b0111:
+        casez_tmp_17 = aRowBuf_3_7;
+      4'b1000:
+        casez_tmp_17 = aRowBuf_3_8;
+      4'b1001:
+        casez_tmp_17 = aRowBuf_3_9;
+      4'b1010:
+        casez_tmp_17 = aRowBuf_3_10;
+      4'b1011:
+        casez_tmp_17 = aRowBuf_3_11;
+      4'b1100:
+        casez_tmp_17 = aRowBuf_3_12;
+      4'b1101:
+        casez_tmp_17 = aRowBuf_3_13;
+      4'b1110:
+        casez_tmp_17 = aRowBuf_3_14;
+      default:
+        casez_tmp_17 = aRowBuf_3_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_18;
+  always @(*) begin
+    casez (_kIdx_T_10[3:0])
+      4'b0000:
+        casez_tmp_18 = bColBuf_0_3_0;
+      4'b0001:
+        casez_tmp_18 = bColBuf_0_3_1;
+      4'b0010:
+        casez_tmp_18 = bColBuf_0_3_2;
+      4'b0011:
+        casez_tmp_18 = bColBuf_0_3_3;
+      4'b0100:
+        casez_tmp_18 = bColBuf_0_3_4;
+      4'b0101:
+        casez_tmp_18 = bColBuf_0_3_5;
+      4'b0110:
+        casez_tmp_18 = bColBuf_0_3_6;
+      4'b0111:
+        casez_tmp_18 = bColBuf_0_3_7;
+      4'b1000:
+        casez_tmp_18 = bColBuf_0_3_8;
+      4'b1001:
+        casez_tmp_18 = bColBuf_0_3_9;
+      4'b1010:
+        casez_tmp_18 = bColBuf_0_3_10;
+      4'b1011:
+        casez_tmp_18 = bColBuf_0_3_11;
+      4'b1100:
+        casez_tmp_18 = bColBuf_0_3_12;
+      4'b1101:
+        casez_tmp_18 = bColBuf_0_3_13;
+      4'b1110:
+        casez_tmp_18 = bColBuf_0_3_14;
+      default:
+        casez_tmp_18 = bColBuf_0_3_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_19;
+  always @(*) begin
+    casez (_kIdx_T_10[3:0])
+      4'b0000:
+        casez_tmp_19 = bColBuf_1_3_0;
+      4'b0001:
+        casez_tmp_19 = bColBuf_1_3_1;
+      4'b0010:
+        casez_tmp_19 = bColBuf_1_3_2;
+      4'b0011:
+        casez_tmp_19 = bColBuf_1_3_3;
+      4'b0100:
+        casez_tmp_19 = bColBuf_1_3_4;
+      4'b0101:
+        casez_tmp_19 = bColBuf_1_3_5;
+      4'b0110:
+        casez_tmp_19 = bColBuf_1_3_6;
+      4'b0111:
+        casez_tmp_19 = bColBuf_1_3_7;
+      4'b1000:
+        casez_tmp_19 = bColBuf_1_3_8;
+      4'b1001:
+        casez_tmp_19 = bColBuf_1_3_9;
+      4'b1010:
+        casez_tmp_19 = bColBuf_1_3_10;
+      4'b1011:
+        casez_tmp_19 = bColBuf_1_3_11;
+      4'b1100:
+        casez_tmp_19 = bColBuf_1_3_12;
+      4'b1101:
+        casez_tmp_19 = bColBuf_1_3_13;
+      4'b1110:
+        casez_tmp_19 = bColBuf_1_3_14;
+      default:
+        casez_tmp_19 = bColBuf_1_3_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_20;
+  always @(*) begin
+    casez (_kIdx_T_10[3:0])
+      4'b0000:
+        casez_tmp_20 = bColBuf_2_3_0;
+      4'b0001:
+        casez_tmp_20 = bColBuf_2_3_1;
+      4'b0010:
+        casez_tmp_20 = bColBuf_2_3_2;
+      4'b0011:
+        casez_tmp_20 = bColBuf_2_3_3;
+      4'b0100:
+        casez_tmp_20 = bColBuf_2_3_4;
+      4'b0101:
+        casez_tmp_20 = bColBuf_2_3_5;
+      4'b0110:
+        casez_tmp_20 = bColBuf_2_3_6;
+      4'b0111:
+        casez_tmp_20 = bColBuf_2_3_7;
+      4'b1000:
+        casez_tmp_20 = bColBuf_2_3_8;
+      4'b1001:
+        casez_tmp_20 = bColBuf_2_3_9;
+      4'b1010:
+        casez_tmp_20 = bColBuf_2_3_10;
+      4'b1011:
+        casez_tmp_20 = bColBuf_2_3_11;
+      4'b1100:
+        casez_tmp_20 = bColBuf_2_3_12;
+      4'b1101:
+        casez_tmp_20 = bColBuf_2_3_13;
+      4'b1110:
+        casez_tmp_20 = bColBuf_2_3_14;
+      default:
+        casez_tmp_20 = bColBuf_2_3_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_21;
+  always @(*) begin
+    casez (_kIdx_T_10[3:0])
+      4'b0000:
+        casez_tmp_21 = bColBuf_3_3_0;
+      4'b0001:
+        casez_tmp_21 = bColBuf_3_3_1;
+      4'b0010:
+        casez_tmp_21 = bColBuf_3_3_2;
+      4'b0011:
+        casez_tmp_21 = bColBuf_3_3_3;
+      4'b0100:
+        casez_tmp_21 = bColBuf_3_3_4;
+      4'b0101:
+        casez_tmp_21 = bColBuf_3_3_5;
+      4'b0110:
+        casez_tmp_21 = bColBuf_3_3_6;
+      4'b0111:
+        casez_tmp_21 = bColBuf_3_3_7;
+      4'b1000:
+        casez_tmp_21 = bColBuf_3_3_8;
+      4'b1001:
+        casez_tmp_21 = bColBuf_3_3_9;
+      4'b1010:
+        casez_tmp_21 = bColBuf_3_3_10;
+      4'b1011:
+        casez_tmp_21 = bColBuf_3_3_11;
+      4'b1100:
+        casez_tmp_21 = bColBuf_3_3_12;
+      4'b1101:
+        casez_tmp_21 = bColBuf_3_3_13;
+      4'b1110:
+        casez_tmp_21 = bColBuf_3_3_14;
+      default:
+        casez_tmp_21 = bColBuf_3_3_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_22;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_22 = casez_tmp_18;
+      2'b01:
+        casez_tmp_22 = casez_tmp_19;
+      2'b10:
+        casez_tmp_22 = casez_tmp_20;
+      default:
+        casez_tmp_22 = casez_tmp_21;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_13 = _GEN_1 - 9'h4;
   wire         kValid_4 =
-    $signed(_kIdx_T_13) > -9'sh1 & $signed(_kIdx_T_13) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_16 = _GEN_26 - 9'h5;
+    $signed(_kIdx_T_13) > -9'sh1 & $signed(_kIdx_T_13) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_23;
+  always @(*) begin
+    casez (_kIdx_T_13[3:0])
+      4'b0000:
+        casez_tmp_23 = aRowBuf_4_0;
+      4'b0001:
+        casez_tmp_23 = aRowBuf_4_1;
+      4'b0010:
+        casez_tmp_23 = aRowBuf_4_2;
+      4'b0011:
+        casez_tmp_23 = aRowBuf_4_3;
+      4'b0100:
+        casez_tmp_23 = aRowBuf_4_4;
+      4'b0101:
+        casez_tmp_23 = aRowBuf_4_5;
+      4'b0110:
+        casez_tmp_23 = aRowBuf_4_6;
+      4'b0111:
+        casez_tmp_23 = aRowBuf_4_7;
+      4'b1000:
+        casez_tmp_23 = aRowBuf_4_8;
+      4'b1001:
+        casez_tmp_23 = aRowBuf_4_9;
+      4'b1010:
+        casez_tmp_23 = aRowBuf_4_10;
+      4'b1011:
+        casez_tmp_23 = aRowBuf_4_11;
+      4'b1100:
+        casez_tmp_23 = aRowBuf_4_12;
+      4'b1101:
+        casez_tmp_23 = aRowBuf_4_13;
+      4'b1110:
+        casez_tmp_23 = aRowBuf_4_14;
+      default:
+        casez_tmp_23 = aRowBuf_4_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_24;
+  always @(*) begin
+    casez (_kIdx_T_13[3:0])
+      4'b0000:
+        casez_tmp_24 = bColBuf_0_4_0;
+      4'b0001:
+        casez_tmp_24 = bColBuf_0_4_1;
+      4'b0010:
+        casez_tmp_24 = bColBuf_0_4_2;
+      4'b0011:
+        casez_tmp_24 = bColBuf_0_4_3;
+      4'b0100:
+        casez_tmp_24 = bColBuf_0_4_4;
+      4'b0101:
+        casez_tmp_24 = bColBuf_0_4_5;
+      4'b0110:
+        casez_tmp_24 = bColBuf_0_4_6;
+      4'b0111:
+        casez_tmp_24 = bColBuf_0_4_7;
+      4'b1000:
+        casez_tmp_24 = bColBuf_0_4_8;
+      4'b1001:
+        casez_tmp_24 = bColBuf_0_4_9;
+      4'b1010:
+        casez_tmp_24 = bColBuf_0_4_10;
+      4'b1011:
+        casez_tmp_24 = bColBuf_0_4_11;
+      4'b1100:
+        casez_tmp_24 = bColBuf_0_4_12;
+      4'b1101:
+        casez_tmp_24 = bColBuf_0_4_13;
+      4'b1110:
+        casez_tmp_24 = bColBuf_0_4_14;
+      default:
+        casez_tmp_24 = bColBuf_0_4_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_25;
+  always @(*) begin
+    casez (_kIdx_T_13[3:0])
+      4'b0000:
+        casez_tmp_25 = bColBuf_1_4_0;
+      4'b0001:
+        casez_tmp_25 = bColBuf_1_4_1;
+      4'b0010:
+        casez_tmp_25 = bColBuf_1_4_2;
+      4'b0011:
+        casez_tmp_25 = bColBuf_1_4_3;
+      4'b0100:
+        casez_tmp_25 = bColBuf_1_4_4;
+      4'b0101:
+        casez_tmp_25 = bColBuf_1_4_5;
+      4'b0110:
+        casez_tmp_25 = bColBuf_1_4_6;
+      4'b0111:
+        casez_tmp_25 = bColBuf_1_4_7;
+      4'b1000:
+        casez_tmp_25 = bColBuf_1_4_8;
+      4'b1001:
+        casez_tmp_25 = bColBuf_1_4_9;
+      4'b1010:
+        casez_tmp_25 = bColBuf_1_4_10;
+      4'b1011:
+        casez_tmp_25 = bColBuf_1_4_11;
+      4'b1100:
+        casez_tmp_25 = bColBuf_1_4_12;
+      4'b1101:
+        casez_tmp_25 = bColBuf_1_4_13;
+      4'b1110:
+        casez_tmp_25 = bColBuf_1_4_14;
+      default:
+        casez_tmp_25 = bColBuf_1_4_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_26;
+  always @(*) begin
+    casez (_kIdx_T_13[3:0])
+      4'b0000:
+        casez_tmp_26 = bColBuf_2_4_0;
+      4'b0001:
+        casez_tmp_26 = bColBuf_2_4_1;
+      4'b0010:
+        casez_tmp_26 = bColBuf_2_4_2;
+      4'b0011:
+        casez_tmp_26 = bColBuf_2_4_3;
+      4'b0100:
+        casez_tmp_26 = bColBuf_2_4_4;
+      4'b0101:
+        casez_tmp_26 = bColBuf_2_4_5;
+      4'b0110:
+        casez_tmp_26 = bColBuf_2_4_6;
+      4'b0111:
+        casez_tmp_26 = bColBuf_2_4_7;
+      4'b1000:
+        casez_tmp_26 = bColBuf_2_4_8;
+      4'b1001:
+        casez_tmp_26 = bColBuf_2_4_9;
+      4'b1010:
+        casez_tmp_26 = bColBuf_2_4_10;
+      4'b1011:
+        casez_tmp_26 = bColBuf_2_4_11;
+      4'b1100:
+        casez_tmp_26 = bColBuf_2_4_12;
+      4'b1101:
+        casez_tmp_26 = bColBuf_2_4_13;
+      4'b1110:
+        casez_tmp_26 = bColBuf_2_4_14;
+      default:
+        casez_tmp_26 = bColBuf_2_4_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_27;
+  always @(*) begin
+    casez (_kIdx_T_13[3:0])
+      4'b0000:
+        casez_tmp_27 = bColBuf_3_4_0;
+      4'b0001:
+        casez_tmp_27 = bColBuf_3_4_1;
+      4'b0010:
+        casez_tmp_27 = bColBuf_3_4_2;
+      4'b0011:
+        casez_tmp_27 = bColBuf_3_4_3;
+      4'b0100:
+        casez_tmp_27 = bColBuf_3_4_4;
+      4'b0101:
+        casez_tmp_27 = bColBuf_3_4_5;
+      4'b0110:
+        casez_tmp_27 = bColBuf_3_4_6;
+      4'b0111:
+        casez_tmp_27 = bColBuf_3_4_7;
+      4'b1000:
+        casez_tmp_27 = bColBuf_3_4_8;
+      4'b1001:
+        casez_tmp_27 = bColBuf_3_4_9;
+      4'b1010:
+        casez_tmp_27 = bColBuf_3_4_10;
+      4'b1011:
+        casez_tmp_27 = bColBuf_3_4_11;
+      4'b1100:
+        casez_tmp_27 = bColBuf_3_4_12;
+      4'b1101:
+        casez_tmp_27 = bColBuf_3_4_13;
+      4'b1110:
+        casez_tmp_27 = bColBuf_3_4_14;
+      default:
+        casez_tmp_27 = bColBuf_3_4_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_28;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_28 = casez_tmp_24;
+      2'b01:
+        casez_tmp_28 = casez_tmp_25;
+      2'b10:
+        casez_tmp_28 = casez_tmp_26;
+      default:
+        casez_tmp_28 = casez_tmp_27;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_16 = _GEN_1 - 9'h5;
   wire         kValid_5 =
-    $signed(_kIdx_T_16) > -9'sh1 & $signed(_kIdx_T_16) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_19 = _GEN_26 - 9'h6;
+    $signed(_kIdx_T_16) > -9'sh1 & $signed(_kIdx_T_16) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_29;
+  always @(*) begin
+    casez (_kIdx_T_16[3:0])
+      4'b0000:
+        casez_tmp_29 = aRowBuf_5_0;
+      4'b0001:
+        casez_tmp_29 = aRowBuf_5_1;
+      4'b0010:
+        casez_tmp_29 = aRowBuf_5_2;
+      4'b0011:
+        casez_tmp_29 = aRowBuf_5_3;
+      4'b0100:
+        casez_tmp_29 = aRowBuf_5_4;
+      4'b0101:
+        casez_tmp_29 = aRowBuf_5_5;
+      4'b0110:
+        casez_tmp_29 = aRowBuf_5_6;
+      4'b0111:
+        casez_tmp_29 = aRowBuf_5_7;
+      4'b1000:
+        casez_tmp_29 = aRowBuf_5_8;
+      4'b1001:
+        casez_tmp_29 = aRowBuf_5_9;
+      4'b1010:
+        casez_tmp_29 = aRowBuf_5_10;
+      4'b1011:
+        casez_tmp_29 = aRowBuf_5_11;
+      4'b1100:
+        casez_tmp_29 = aRowBuf_5_12;
+      4'b1101:
+        casez_tmp_29 = aRowBuf_5_13;
+      4'b1110:
+        casez_tmp_29 = aRowBuf_5_14;
+      default:
+        casez_tmp_29 = aRowBuf_5_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_30;
+  always @(*) begin
+    casez (_kIdx_T_16[3:0])
+      4'b0000:
+        casez_tmp_30 = bColBuf_0_5_0;
+      4'b0001:
+        casez_tmp_30 = bColBuf_0_5_1;
+      4'b0010:
+        casez_tmp_30 = bColBuf_0_5_2;
+      4'b0011:
+        casez_tmp_30 = bColBuf_0_5_3;
+      4'b0100:
+        casez_tmp_30 = bColBuf_0_5_4;
+      4'b0101:
+        casez_tmp_30 = bColBuf_0_5_5;
+      4'b0110:
+        casez_tmp_30 = bColBuf_0_5_6;
+      4'b0111:
+        casez_tmp_30 = bColBuf_0_5_7;
+      4'b1000:
+        casez_tmp_30 = bColBuf_0_5_8;
+      4'b1001:
+        casez_tmp_30 = bColBuf_0_5_9;
+      4'b1010:
+        casez_tmp_30 = bColBuf_0_5_10;
+      4'b1011:
+        casez_tmp_30 = bColBuf_0_5_11;
+      4'b1100:
+        casez_tmp_30 = bColBuf_0_5_12;
+      4'b1101:
+        casez_tmp_30 = bColBuf_0_5_13;
+      4'b1110:
+        casez_tmp_30 = bColBuf_0_5_14;
+      default:
+        casez_tmp_30 = bColBuf_0_5_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_31;
+  always @(*) begin
+    casez (_kIdx_T_16[3:0])
+      4'b0000:
+        casez_tmp_31 = bColBuf_1_5_0;
+      4'b0001:
+        casez_tmp_31 = bColBuf_1_5_1;
+      4'b0010:
+        casez_tmp_31 = bColBuf_1_5_2;
+      4'b0011:
+        casez_tmp_31 = bColBuf_1_5_3;
+      4'b0100:
+        casez_tmp_31 = bColBuf_1_5_4;
+      4'b0101:
+        casez_tmp_31 = bColBuf_1_5_5;
+      4'b0110:
+        casez_tmp_31 = bColBuf_1_5_6;
+      4'b0111:
+        casez_tmp_31 = bColBuf_1_5_7;
+      4'b1000:
+        casez_tmp_31 = bColBuf_1_5_8;
+      4'b1001:
+        casez_tmp_31 = bColBuf_1_5_9;
+      4'b1010:
+        casez_tmp_31 = bColBuf_1_5_10;
+      4'b1011:
+        casez_tmp_31 = bColBuf_1_5_11;
+      4'b1100:
+        casez_tmp_31 = bColBuf_1_5_12;
+      4'b1101:
+        casez_tmp_31 = bColBuf_1_5_13;
+      4'b1110:
+        casez_tmp_31 = bColBuf_1_5_14;
+      default:
+        casez_tmp_31 = bColBuf_1_5_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_32;
+  always @(*) begin
+    casez (_kIdx_T_16[3:0])
+      4'b0000:
+        casez_tmp_32 = bColBuf_2_5_0;
+      4'b0001:
+        casez_tmp_32 = bColBuf_2_5_1;
+      4'b0010:
+        casez_tmp_32 = bColBuf_2_5_2;
+      4'b0011:
+        casez_tmp_32 = bColBuf_2_5_3;
+      4'b0100:
+        casez_tmp_32 = bColBuf_2_5_4;
+      4'b0101:
+        casez_tmp_32 = bColBuf_2_5_5;
+      4'b0110:
+        casez_tmp_32 = bColBuf_2_5_6;
+      4'b0111:
+        casez_tmp_32 = bColBuf_2_5_7;
+      4'b1000:
+        casez_tmp_32 = bColBuf_2_5_8;
+      4'b1001:
+        casez_tmp_32 = bColBuf_2_5_9;
+      4'b1010:
+        casez_tmp_32 = bColBuf_2_5_10;
+      4'b1011:
+        casez_tmp_32 = bColBuf_2_5_11;
+      4'b1100:
+        casez_tmp_32 = bColBuf_2_5_12;
+      4'b1101:
+        casez_tmp_32 = bColBuf_2_5_13;
+      4'b1110:
+        casez_tmp_32 = bColBuf_2_5_14;
+      default:
+        casez_tmp_32 = bColBuf_2_5_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_33;
+  always @(*) begin
+    casez (_kIdx_T_16[3:0])
+      4'b0000:
+        casez_tmp_33 = bColBuf_3_5_0;
+      4'b0001:
+        casez_tmp_33 = bColBuf_3_5_1;
+      4'b0010:
+        casez_tmp_33 = bColBuf_3_5_2;
+      4'b0011:
+        casez_tmp_33 = bColBuf_3_5_3;
+      4'b0100:
+        casez_tmp_33 = bColBuf_3_5_4;
+      4'b0101:
+        casez_tmp_33 = bColBuf_3_5_5;
+      4'b0110:
+        casez_tmp_33 = bColBuf_3_5_6;
+      4'b0111:
+        casez_tmp_33 = bColBuf_3_5_7;
+      4'b1000:
+        casez_tmp_33 = bColBuf_3_5_8;
+      4'b1001:
+        casez_tmp_33 = bColBuf_3_5_9;
+      4'b1010:
+        casez_tmp_33 = bColBuf_3_5_10;
+      4'b1011:
+        casez_tmp_33 = bColBuf_3_5_11;
+      4'b1100:
+        casez_tmp_33 = bColBuf_3_5_12;
+      4'b1101:
+        casez_tmp_33 = bColBuf_3_5_13;
+      4'b1110:
+        casez_tmp_33 = bColBuf_3_5_14;
+      default:
+        casez_tmp_33 = bColBuf_3_5_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_34;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_34 = casez_tmp_30;
+      2'b01:
+        casez_tmp_34 = casez_tmp_31;
+      2'b10:
+        casez_tmp_34 = casez_tmp_32;
+      default:
+        casez_tmp_34 = casez_tmp_33;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_19 = _GEN_1 - 9'h6;
   wire         kValid_6 =
-    $signed(_kIdx_T_19) > -9'sh1 & $signed(_kIdx_T_19) < $signed(_GEN_25);
-  wire [8:0]   _kIdx_T_22 = _GEN_26 - 9'h7;
+    $signed(_kIdx_T_19) > -9'sh1 & $signed(_kIdx_T_19) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_35;
+  always @(*) begin
+    casez (_kIdx_T_19[3:0])
+      4'b0000:
+        casez_tmp_35 = aRowBuf_6_0;
+      4'b0001:
+        casez_tmp_35 = aRowBuf_6_1;
+      4'b0010:
+        casez_tmp_35 = aRowBuf_6_2;
+      4'b0011:
+        casez_tmp_35 = aRowBuf_6_3;
+      4'b0100:
+        casez_tmp_35 = aRowBuf_6_4;
+      4'b0101:
+        casez_tmp_35 = aRowBuf_6_5;
+      4'b0110:
+        casez_tmp_35 = aRowBuf_6_6;
+      4'b0111:
+        casez_tmp_35 = aRowBuf_6_7;
+      4'b1000:
+        casez_tmp_35 = aRowBuf_6_8;
+      4'b1001:
+        casez_tmp_35 = aRowBuf_6_9;
+      4'b1010:
+        casez_tmp_35 = aRowBuf_6_10;
+      4'b1011:
+        casez_tmp_35 = aRowBuf_6_11;
+      4'b1100:
+        casez_tmp_35 = aRowBuf_6_12;
+      4'b1101:
+        casez_tmp_35 = aRowBuf_6_13;
+      4'b1110:
+        casez_tmp_35 = aRowBuf_6_14;
+      default:
+        casez_tmp_35 = aRowBuf_6_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_36;
+  always @(*) begin
+    casez (_kIdx_T_19[3:0])
+      4'b0000:
+        casez_tmp_36 = bColBuf_0_6_0;
+      4'b0001:
+        casez_tmp_36 = bColBuf_0_6_1;
+      4'b0010:
+        casez_tmp_36 = bColBuf_0_6_2;
+      4'b0011:
+        casez_tmp_36 = bColBuf_0_6_3;
+      4'b0100:
+        casez_tmp_36 = bColBuf_0_6_4;
+      4'b0101:
+        casez_tmp_36 = bColBuf_0_6_5;
+      4'b0110:
+        casez_tmp_36 = bColBuf_0_6_6;
+      4'b0111:
+        casez_tmp_36 = bColBuf_0_6_7;
+      4'b1000:
+        casez_tmp_36 = bColBuf_0_6_8;
+      4'b1001:
+        casez_tmp_36 = bColBuf_0_6_9;
+      4'b1010:
+        casez_tmp_36 = bColBuf_0_6_10;
+      4'b1011:
+        casez_tmp_36 = bColBuf_0_6_11;
+      4'b1100:
+        casez_tmp_36 = bColBuf_0_6_12;
+      4'b1101:
+        casez_tmp_36 = bColBuf_0_6_13;
+      4'b1110:
+        casez_tmp_36 = bColBuf_0_6_14;
+      default:
+        casez_tmp_36 = bColBuf_0_6_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_37;
+  always @(*) begin
+    casez (_kIdx_T_19[3:0])
+      4'b0000:
+        casez_tmp_37 = bColBuf_1_6_0;
+      4'b0001:
+        casez_tmp_37 = bColBuf_1_6_1;
+      4'b0010:
+        casez_tmp_37 = bColBuf_1_6_2;
+      4'b0011:
+        casez_tmp_37 = bColBuf_1_6_3;
+      4'b0100:
+        casez_tmp_37 = bColBuf_1_6_4;
+      4'b0101:
+        casez_tmp_37 = bColBuf_1_6_5;
+      4'b0110:
+        casez_tmp_37 = bColBuf_1_6_6;
+      4'b0111:
+        casez_tmp_37 = bColBuf_1_6_7;
+      4'b1000:
+        casez_tmp_37 = bColBuf_1_6_8;
+      4'b1001:
+        casez_tmp_37 = bColBuf_1_6_9;
+      4'b1010:
+        casez_tmp_37 = bColBuf_1_6_10;
+      4'b1011:
+        casez_tmp_37 = bColBuf_1_6_11;
+      4'b1100:
+        casez_tmp_37 = bColBuf_1_6_12;
+      4'b1101:
+        casez_tmp_37 = bColBuf_1_6_13;
+      4'b1110:
+        casez_tmp_37 = bColBuf_1_6_14;
+      default:
+        casez_tmp_37 = bColBuf_1_6_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_38;
+  always @(*) begin
+    casez (_kIdx_T_19[3:0])
+      4'b0000:
+        casez_tmp_38 = bColBuf_2_6_0;
+      4'b0001:
+        casez_tmp_38 = bColBuf_2_6_1;
+      4'b0010:
+        casez_tmp_38 = bColBuf_2_6_2;
+      4'b0011:
+        casez_tmp_38 = bColBuf_2_6_3;
+      4'b0100:
+        casez_tmp_38 = bColBuf_2_6_4;
+      4'b0101:
+        casez_tmp_38 = bColBuf_2_6_5;
+      4'b0110:
+        casez_tmp_38 = bColBuf_2_6_6;
+      4'b0111:
+        casez_tmp_38 = bColBuf_2_6_7;
+      4'b1000:
+        casez_tmp_38 = bColBuf_2_6_8;
+      4'b1001:
+        casez_tmp_38 = bColBuf_2_6_9;
+      4'b1010:
+        casez_tmp_38 = bColBuf_2_6_10;
+      4'b1011:
+        casez_tmp_38 = bColBuf_2_6_11;
+      4'b1100:
+        casez_tmp_38 = bColBuf_2_6_12;
+      4'b1101:
+        casez_tmp_38 = bColBuf_2_6_13;
+      4'b1110:
+        casez_tmp_38 = bColBuf_2_6_14;
+      default:
+        casez_tmp_38 = bColBuf_2_6_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_39;
+  always @(*) begin
+    casez (_kIdx_T_19[3:0])
+      4'b0000:
+        casez_tmp_39 = bColBuf_3_6_0;
+      4'b0001:
+        casez_tmp_39 = bColBuf_3_6_1;
+      4'b0010:
+        casez_tmp_39 = bColBuf_3_6_2;
+      4'b0011:
+        casez_tmp_39 = bColBuf_3_6_3;
+      4'b0100:
+        casez_tmp_39 = bColBuf_3_6_4;
+      4'b0101:
+        casez_tmp_39 = bColBuf_3_6_5;
+      4'b0110:
+        casez_tmp_39 = bColBuf_3_6_6;
+      4'b0111:
+        casez_tmp_39 = bColBuf_3_6_7;
+      4'b1000:
+        casez_tmp_39 = bColBuf_3_6_8;
+      4'b1001:
+        casez_tmp_39 = bColBuf_3_6_9;
+      4'b1010:
+        casez_tmp_39 = bColBuf_3_6_10;
+      4'b1011:
+        casez_tmp_39 = bColBuf_3_6_11;
+      4'b1100:
+        casez_tmp_39 = bColBuf_3_6_12;
+      4'b1101:
+        casez_tmp_39 = bColBuf_3_6_13;
+      4'b1110:
+        casez_tmp_39 = bColBuf_3_6_14;
+      default:
+        casez_tmp_39 = bColBuf_3_6_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_40;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_40 = casez_tmp_36;
+      2'b01:
+        casez_tmp_40 = casez_tmp_37;
+      2'b10:
+        casez_tmp_40 = casez_tmp_38;
+      default:
+        casez_tmp_40 = casez_tmp_39;
+    endcase
+  end // always @(*)
+  wire [8:0]   _kIdx_T_22 = _GEN_1 - 9'h7;
   wire         kValid_7 =
-    $signed(_kIdx_T_22) > -9'sh1 & $signed(_kIdx_T_22) < $signed(_GEN_25);
+    $signed(_kIdx_T_22) > -9'sh1 & $signed(_kIdx_T_22) < $signed(_GEN_0);
+  reg  [7:0]   casez_tmp_41;
+  always @(*) begin
+    casez (_kIdx_T_22[3:0])
+      4'b0000:
+        casez_tmp_41 = aRowBuf_7_0;
+      4'b0001:
+        casez_tmp_41 = aRowBuf_7_1;
+      4'b0010:
+        casez_tmp_41 = aRowBuf_7_2;
+      4'b0011:
+        casez_tmp_41 = aRowBuf_7_3;
+      4'b0100:
+        casez_tmp_41 = aRowBuf_7_4;
+      4'b0101:
+        casez_tmp_41 = aRowBuf_7_5;
+      4'b0110:
+        casez_tmp_41 = aRowBuf_7_6;
+      4'b0111:
+        casez_tmp_41 = aRowBuf_7_7;
+      4'b1000:
+        casez_tmp_41 = aRowBuf_7_8;
+      4'b1001:
+        casez_tmp_41 = aRowBuf_7_9;
+      4'b1010:
+        casez_tmp_41 = aRowBuf_7_10;
+      4'b1011:
+        casez_tmp_41 = aRowBuf_7_11;
+      4'b1100:
+        casez_tmp_41 = aRowBuf_7_12;
+      4'b1101:
+        casez_tmp_41 = aRowBuf_7_13;
+      4'b1110:
+        casez_tmp_41 = aRowBuf_7_14;
+      default:
+        casez_tmp_41 = aRowBuf_7_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_42;
+  always @(*) begin
+    casez (_kIdx_T_22[3:0])
+      4'b0000:
+        casez_tmp_42 = bColBuf_0_7_0;
+      4'b0001:
+        casez_tmp_42 = bColBuf_0_7_1;
+      4'b0010:
+        casez_tmp_42 = bColBuf_0_7_2;
+      4'b0011:
+        casez_tmp_42 = bColBuf_0_7_3;
+      4'b0100:
+        casez_tmp_42 = bColBuf_0_7_4;
+      4'b0101:
+        casez_tmp_42 = bColBuf_0_7_5;
+      4'b0110:
+        casez_tmp_42 = bColBuf_0_7_6;
+      4'b0111:
+        casez_tmp_42 = bColBuf_0_7_7;
+      4'b1000:
+        casez_tmp_42 = bColBuf_0_7_8;
+      4'b1001:
+        casez_tmp_42 = bColBuf_0_7_9;
+      4'b1010:
+        casez_tmp_42 = bColBuf_0_7_10;
+      4'b1011:
+        casez_tmp_42 = bColBuf_0_7_11;
+      4'b1100:
+        casez_tmp_42 = bColBuf_0_7_12;
+      4'b1101:
+        casez_tmp_42 = bColBuf_0_7_13;
+      4'b1110:
+        casez_tmp_42 = bColBuf_0_7_14;
+      default:
+        casez_tmp_42 = bColBuf_0_7_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_43;
+  always @(*) begin
+    casez (_kIdx_T_22[3:0])
+      4'b0000:
+        casez_tmp_43 = bColBuf_1_7_0;
+      4'b0001:
+        casez_tmp_43 = bColBuf_1_7_1;
+      4'b0010:
+        casez_tmp_43 = bColBuf_1_7_2;
+      4'b0011:
+        casez_tmp_43 = bColBuf_1_7_3;
+      4'b0100:
+        casez_tmp_43 = bColBuf_1_7_4;
+      4'b0101:
+        casez_tmp_43 = bColBuf_1_7_5;
+      4'b0110:
+        casez_tmp_43 = bColBuf_1_7_6;
+      4'b0111:
+        casez_tmp_43 = bColBuf_1_7_7;
+      4'b1000:
+        casez_tmp_43 = bColBuf_1_7_8;
+      4'b1001:
+        casez_tmp_43 = bColBuf_1_7_9;
+      4'b1010:
+        casez_tmp_43 = bColBuf_1_7_10;
+      4'b1011:
+        casez_tmp_43 = bColBuf_1_7_11;
+      4'b1100:
+        casez_tmp_43 = bColBuf_1_7_12;
+      4'b1101:
+        casez_tmp_43 = bColBuf_1_7_13;
+      4'b1110:
+        casez_tmp_43 = bColBuf_1_7_14;
+      default:
+        casez_tmp_43 = bColBuf_1_7_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_44;
+  always @(*) begin
+    casez (_kIdx_T_22[3:0])
+      4'b0000:
+        casez_tmp_44 = bColBuf_2_7_0;
+      4'b0001:
+        casez_tmp_44 = bColBuf_2_7_1;
+      4'b0010:
+        casez_tmp_44 = bColBuf_2_7_2;
+      4'b0011:
+        casez_tmp_44 = bColBuf_2_7_3;
+      4'b0100:
+        casez_tmp_44 = bColBuf_2_7_4;
+      4'b0101:
+        casez_tmp_44 = bColBuf_2_7_5;
+      4'b0110:
+        casez_tmp_44 = bColBuf_2_7_6;
+      4'b0111:
+        casez_tmp_44 = bColBuf_2_7_7;
+      4'b1000:
+        casez_tmp_44 = bColBuf_2_7_8;
+      4'b1001:
+        casez_tmp_44 = bColBuf_2_7_9;
+      4'b1010:
+        casez_tmp_44 = bColBuf_2_7_10;
+      4'b1011:
+        casez_tmp_44 = bColBuf_2_7_11;
+      4'b1100:
+        casez_tmp_44 = bColBuf_2_7_12;
+      4'b1101:
+        casez_tmp_44 = bColBuf_2_7_13;
+      4'b1110:
+        casez_tmp_44 = bColBuf_2_7_14;
+      default:
+        casez_tmp_44 = bColBuf_2_7_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_45;
+  always @(*) begin
+    casez (_kIdx_T_22[3:0])
+      4'b0000:
+        casez_tmp_45 = bColBuf_3_7_0;
+      4'b0001:
+        casez_tmp_45 = bColBuf_3_7_1;
+      4'b0010:
+        casez_tmp_45 = bColBuf_3_7_2;
+      4'b0011:
+        casez_tmp_45 = bColBuf_3_7_3;
+      4'b0100:
+        casez_tmp_45 = bColBuf_3_7_4;
+      4'b0101:
+        casez_tmp_45 = bColBuf_3_7_5;
+      4'b0110:
+        casez_tmp_45 = bColBuf_3_7_6;
+      4'b0111:
+        casez_tmp_45 = bColBuf_3_7_7;
+      4'b1000:
+        casez_tmp_45 = bColBuf_3_7_8;
+      4'b1001:
+        casez_tmp_45 = bColBuf_3_7_9;
+      4'b1010:
+        casez_tmp_45 = bColBuf_3_7_10;
+      4'b1011:
+        casez_tmp_45 = bColBuf_3_7_11;
+      4'b1100:
+        casez_tmp_45 = bColBuf_3_7_12;
+      4'b1101:
+        casez_tmp_45 = bColBuf_3_7_13;
+      4'b1110:
+        casez_tmp_45 = bColBuf_3_7_14;
+      default:
+        casez_tmp_45 = bColBuf_3_7_15;
+    endcase
+  end // always @(*)
+  reg  [7:0]   casez_tmp_46;
+  always @(*) begin
+    casez (bPanelUse)
+      2'b00:
+        casez_tmp_46 = casez_tmp_42;
+      2'b01:
+        casez_tmp_46 = casez_tmp_43;
+      2'b10:
+        casez_tmp_46 = casez_tmp_44;
+      default:
+        casez_tmp_46 = casez_tmp_45;
+    endcase
+  end // always @(*)
   wire         _pes_1_0_io_clearAcc_T = t == 8'h1;
   wire         _pes_2_0_io_clearAcc_T = t == 8'h2;
   wire         _pes_3_0_io_clearAcc_T = t == 8'h3;
@@ -412,7 +2605,6 @@ module mm_accel(
   wire         _pes_7_4_io_clearAcc_T = t == 8'hB;
   wire         _pes_7_5_io_clearAcc_T = t == 8'hC;
   wire         _pes_7_6_io_clearAcc_T = t == 8'hD;
-  reg  [3:0]   dmaGrp;
   reg  [127:0] rowLineReg_0;
   reg  [127:0] rowLineReg_1;
   reg  [127:0] rowLineReg_2;
@@ -421,195 +2613,207 @@ module mm_accel(
   reg  [127:0] rowLineReg_5;
   reg  [127:0] rowLineReg_6;
   reg  [127:0] rowLineReg_7;
-  reg  [127:0] casez_tmp;
+  reg  [3:0]   fillGrpD;
+  reg  [127:0] casez_tmp_47;
   always @(*) begin
-    casez (dmaGrp[3:1])
+    casez (fillGrpD[3:1])
       3'b000:
-        casez_tmp = rowLineReg_0;
+        casez_tmp_47 = rowLineReg_0;
       3'b001:
-        casez_tmp = rowLineReg_1;
+        casez_tmp_47 = rowLineReg_1;
       3'b010:
-        casez_tmp = rowLineReg_2;
+        casez_tmp_47 = rowLineReg_2;
       3'b011:
-        casez_tmp = rowLineReg_3;
+        casez_tmp_47 = rowLineReg_3;
       3'b100:
-        casez_tmp = rowLineReg_4;
+        casez_tmp_47 = rowLineReg_4;
       3'b101:
-        casez_tmp = rowLineReg_5;
+        casez_tmp_47 = rowLineReg_5;
       3'b110:
-        casez_tmp = rowLineReg_6;
+        casez_tmp_47 = rowLineReg_6;
       default:
-        casez_tmp = rowLineReg_7;
+        casez_tmp_47 = rowLineReg_7;
     endcase
   end // always @(*)
-  reg          memReqValid;
-  reg          dmaSettle;
-  reg  [31:0]  casez_tmp_0;
+  reg  [3:0]   ldIdx;
+  reg          ldReq;
+  wire [3:0]   ldLocal = ldIdx[3] ? ldIdx - 4'h8 : ldIdx;
+  wire [31:0]  _GEN_2 = {24'h0, kLen};
+  wire [31:0]  effSrcStride = srcStride == 32'h0 ? _GEN_2 : srcStride;
+  wire         burstOK = effSrcStride == 32'h10;
+  wire [31:0]  ldBase = ldIdx[3] ? bSrcAddr : aSrcAddr;
+  reg          fillValid;
+  wire         _destContig_T = destStride == 32'h0;
+  wire         destContig = _destContig_T | destStride == 32'h20;
+  wire [4:0]   wBurstLines = destContig ? 5'h10 : 5'h2;
+  reg  [8:0]   dmaSent;
+  wire         dmaDrive = dmaBusy & _lineFifo_io_deq_valid;
+  reg  [31:0]  casez_tmp_48;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_0 = _pes_0_0_io_acc;
+        casez_tmp_48 = _pes_0_0_io_acc;
       3'b001:
-        casez_tmp_0 = _pes_0_1_io_acc;
+        casez_tmp_48 = _pes_0_1_io_acc;
       3'b010:
-        casez_tmp_0 = _pes_0_2_io_acc;
+        casez_tmp_48 = _pes_0_2_io_acc;
       3'b011:
-        casez_tmp_0 = _pes_0_3_io_acc;
+        casez_tmp_48 = _pes_0_3_io_acc;
       3'b100:
-        casez_tmp_0 = _pes_0_4_io_acc;
+        casez_tmp_48 = _pes_0_4_io_acc;
       3'b101:
-        casez_tmp_0 = _pes_0_5_io_acc;
+        casez_tmp_48 = _pes_0_5_io_acc;
       3'b110:
-        casez_tmp_0 = _pes_0_6_io_acc;
+        casez_tmp_48 = _pes_0_6_io_acc;
       default:
-        casez_tmp_0 = _pes_0_7_io_acc;
+        casez_tmp_48 = _pes_0_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_1;
+  reg  [31:0]  casez_tmp_49;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_1 = _pes_1_0_io_acc;
+        casez_tmp_49 = _pes_1_0_io_acc;
       3'b001:
-        casez_tmp_1 = _pes_1_1_io_acc;
+        casez_tmp_49 = _pes_1_1_io_acc;
       3'b010:
-        casez_tmp_1 = _pes_1_2_io_acc;
+        casez_tmp_49 = _pes_1_2_io_acc;
       3'b011:
-        casez_tmp_1 = _pes_1_3_io_acc;
+        casez_tmp_49 = _pes_1_3_io_acc;
       3'b100:
-        casez_tmp_1 = _pes_1_4_io_acc;
+        casez_tmp_49 = _pes_1_4_io_acc;
       3'b101:
-        casez_tmp_1 = _pes_1_5_io_acc;
+        casez_tmp_49 = _pes_1_5_io_acc;
       3'b110:
-        casez_tmp_1 = _pes_1_6_io_acc;
+        casez_tmp_49 = _pes_1_6_io_acc;
       default:
-        casez_tmp_1 = _pes_1_7_io_acc;
+        casez_tmp_49 = _pes_1_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_2;
+  reg  [31:0]  casez_tmp_50;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_2 = _pes_2_0_io_acc;
+        casez_tmp_50 = _pes_2_0_io_acc;
       3'b001:
-        casez_tmp_2 = _pes_2_1_io_acc;
+        casez_tmp_50 = _pes_2_1_io_acc;
       3'b010:
-        casez_tmp_2 = _pes_2_2_io_acc;
+        casez_tmp_50 = _pes_2_2_io_acc;
       3'b011:
-        casez_tmp_2 = _pes_2_3_io_acc;
+        casez_tmp_50 = _pes_2_3_io_acc;
       3'b100:
-        casez_tmp_2 = _pes_2_4_io_acc;
+        casez_tmp_50 = _pes_2_4_io_acc;
       3'b101:
-        casez_tmp_2 = _pes_2_5_io_acc;
+        casez_tmp_50 = _pes_2_5_io_acc;
       3'b110:
-        casez_tmp_2 = _pes_2_6_io_acc;
+        casez_tmp_50 = _pes_2_6_io_acc;
       default:
-        casez_tmp_2 = _pes_2_7_io_acc;
+        casez_tmp_50 = _pes_2_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_3;
+  reg  [31:0]  casez_tmp_51;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_3 = _pes_3_0_io_acc;
+        casez_tmp_51 = _pes_3_0_io_acc;
       3'b001:
-        casez_tmp_3 = _pes_3_1_io_acc;
+        casez_tmp_51 = _pes_3_1_io_acc;
       3'b010:
-        casez_tmp_3 = _pes_3_2_io_acc;
+        casez_tmp_51 = _pes_3_2_io_acc;
       3'b011:
-        casez_tmp_3 = _pes_3_3_io_acc;
+        casez_tmp_51 = _pes_3_3_io_acc;
       3'b100:
-        casez_tmp_3 = _pes_3_4_io_acc;
+        casez_tmp_51 = _pes_3_4_io_acc;
       3'b101:
-        casez_tmp_3 = _pes_3_5_io_acc;
+        casez_tmp_51 = _pes_3_5_io_acc;
       3'b110:
-        casez_tmp_3 = _pes_3_6_io_acc;
+        casez_tmp_51 = _pes_3_6_io_acc;
       default:
-        casez_tmp_3 = _pes_3_7_io_acc;
+        casez_tmp_51 = _pes_3_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_4;
+  reg  [31:0]  casez_tmp_52;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_4 = _pes_4_0_io_acc;
+        casez_tmp_52 = _pes_4_0_io_acc;
       3'b001:
-        casez_tmp_4 = _pes_4_1_io_acc;
+        casez_tmp_52 = _pes_4_1_io_acc;
       3'b010:
-        casez_tmp_4 = _pes_4_2_io_acc;
+        casez_tmp_52 = _pes_4_2_io_acc;
       3'b011:
-        casez_tmp_4 = _pes_4_3_io_acc;
+        casez_tmp_52 = _pes_4_3_io_acc;
       3'b100:
-        casez_tmp_4 = _pes_4_4_io_acc;
+        casez_tmp_52 = _pes_4_4_io_acc;
       3'b101:
-        casez_tmp_4 = _pes_4_5_io_acc;
+        casez_tmp_52 = _pes_4_5_io_acc;
       3'b110:
-        casez_tmp_4 = _pes_4_6_io_acc;
+        casez_tmp_52 = _pes_4_6_io_acc;
       default:
-        casez_tmp_4 = _pes_4_7_io_acc;
+        casez_tmp_52 = _pes_4_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_5;
+  reg  [31:0]  casez_tmp_53;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_5 = _pes_5_0_io_acc;
+        casez_tmp_53 = _pes_5_0_io_acc;
       3'b001:
-        casez_tmp_5 = _pes_5_1_io_acc;
+        casez_tmp_53 = _pes_5_1_io_acc;
       3'b010:
-        casez_tmp_5 = _pes_5_2_io_acc;
+        casez_tmp_53 = _pes_5_2_io_acc;
       3'b011:
-        casez_tmp_5 = _pes_5_3_io_acc;
+        casez_tmp_53 = _pes_5_3_io_acc;
       3'b100:
-        casez_tmp_5 = _pes_5_4_io_acc;
+        casez_tmp_53 = _pes_5_4_io_acc;
       3'b101:
-        casez_tmp_5 = _pes_5_5_io_acc;
+        casez_tmp_53 = _pes_5_5_io_acc;
       3'b110:
-        casez_tmp_5 = _pes_5_6_io_acc;
+        casez_tmp_53 = _pes_5_6_io_acc;
       default:
-        casez_tmp_5 = _pes_5_7_io_acc;
+        casez_tmp_53 = _pes_5_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_6;
+  reg  [31:0]  casez_tmp_54;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_6 = _pes_6_0_io_acc;
+        casez_tmp_54 = _pes_6_0_io_acc;
       3'b001:
-        casez_tmp_6 = _pes_6_1_io_acc;
+        casez_tmp_54 = _pes_6_1_io_acc;
       3'b010:
-        casez_tmp_6 = _pes_6_2_io_acc;
+        casez_tmp_54 = _pes_6_2_io_acc;
       3'b011:
-        casez_tmp_6 = _pes_6_3_io_acc;
+        casez_tmp_54 = _pes_6_3_io_acc;
       3'b100:
-        casez_tmp_6 = _pes_6_4_io_acc;
+        casez_tmp_54 = _pes_6_4_io_acc;
       3'b101:
-        casez_tmp_6 = _pes_6_5_io_acc;
+        casez_tmp_54 = _pes_6_5_io_acc;
       3'b110:
-        casez_tmp_6 = _pes_6_6_io_acc;
+        casez_tmp_54 = _pes_6_6_io_acc;
       default:
-        casez_tmp_6 = _pes_6_7_io_acc;
+        casez_tmp_54 = _pes_6_7_io_acc;
     endcase
   end // always @(*)
-  reg  [31:0]  casez_tmp_7;
+  reg  [31:0]  casez_tmp_55;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_7 = _pes_7_0_io_acc;
+        casez_tmp_55 = _pes_7_0_io_acc;
       3'b001:
-        casez_tmp_7 = _pes_7_1_io_acc;
+        casez_tmp_55 = _pes_7_1_io_acc;
       3'b010:
-        casez_tmp_7 = _pes_7_2_io_acc;
+        casez_tmp_55 = _pes_7_2_io_acc;
       3'b011:
-        casez_tmp_7 = _pes_7_3_io_acc;
+        casez_tmp_55 = _pes_7_3_io_acc;
       3'b100:
-        casez_tmp_7 = _pes_7_4_io_acc;
+        casez_tmp_55 = _pes_7_4_io_acc;
       3'b101:
-        casez_tmp_7 = _pes_7_5_io_acc;
+        casez_tmp_55 = _pes_7_5_io_acc;
       3'b110:
-        casez_tmp_7 = _pes_7_6_io_acc;
+        casez_tmp_55 = _pes_7_6_io_acc;
       default:
-        casez_tmp_7 = _pes_7_7_io_acc;
+        casez_tmp_55 = _pes_7_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  rowSelReg_0;
@@ -620,41 +2824,101 @@ module mm_accel(
   reg  [31:0]  rowSelReg_5;
   reg  [31:0]  rowSelReg_6;
   reg  [31:0]  rowSelReg_7;
-  reg  [31:0]  casez_tmp_8;
+  reg  [31:0]  casez_tmp_56;
   always @(*) begin
     casez (resultIdx[5:3])
       3'b000:
-        casez_tmp_8 = rowSelReg_0;
+        casez_tmp_56 = rowSelReg_0;
       3'b001:
-        casez_tmp_8 = rowSelReg_1;
+        casez_tmp_56 = rowSelReg_1;
       3'b010:
-        casez_tmp_8 = rowSelReg_2;
+        casez_tmp_56 = rowSelReg_2;
       3'b011:
-        casez_tmp_8 = rowSelReg_3;
+        casez_tmp_56 = rowSelReg_3;
       3'b100:
-        casez_tmp_8 = rowSelReg_4;
+        casez_tmp_56 = rowSelReg_4;
       3'b101:
-        casez_tmp_8 = rowSelReg_5;
+        casez_tmp_56 = rowSelReg_5;
       3'b110:
-        casez_tmp_8 = rowSelReg_6;
+        casez_tmp_56 = rowSelReg_6;
       default:
-        casez_tmp_8 = rowSelReg_7;
+        casez_tmp_56 = rowSelReg_7;
     endcase
   end // always @(*)
-  wire         _GEN_27 = s_axi_awaddr[7:2] == 6'h4;
-  wire         _GEN_28 = pushA | pushB;
-  wire         _GEN_29 = {4'h0, loadK} == kLen[7:2] - 6'h1;
-  wire         _GEN_30 = ~dmaBusy | dmaSettle | ~mem_ready | (&dmaGrp);
-  wire [31:0]  _dmaRowBase_T = dmaRowBase + (destStride == 32'h0 ? 32'h20 : destStride);
-  wire         _GEN_31 = wState & s_axi_bready;
-  wire         _GEN_32 = rState & s_axi_rready;
-  wire         _dmaStart_T = s_axi_awaddr[7:2] == 6'h0;
-  wire         startPulse = doWrite & _dmaStart_T & s_axi_wdata[0] & ~busy;
-  wire         softRstPulse = doWrite & _dmaStart_T & s_axi_wdata[1];
-  wire         dmaStart = doWrite & _dmaStart_T & s_axi_wdata[2] & ~dmaBusy;
-  wire         _GEN_33 = busy & t == kLen + 8'hD;
-  wire         _GEN_34 = softRstPulse | startPulse;
-  wire         _GEN_35 = mem_ready & (&dmaGrp);
+  wire         _GEN_3 = {4'h0, loadK} == kLen[7:2] - 6'h1;
+  wire         _GEN_4 = dmaBusy & mem_ready;
+  wire [31:0]  _dmaRowBase_T = dmaRowBase + (_destContig_T ? 32'h20 : destStride);
+  wire         _GEN_5 = wState & s_axi_bready;
+  wire         _GEN_6 = rState & s_axi_rready;
+  wire         _GEN_7 = busy & t == kLen + 8'hD;
+  wire         _GEN_8 = ldBusy & mem_ready & (&ldIdx);
+  wire [3:0]   _ldReq_T = ldIdx + 4'h1;
+  wire         _GEN_9 = ldBusy & mem_ready;
+  wire         fillFire = dmaBusy & (|fillLeft) & _lineFifo_io_count < 4'h7;
+  wire [8:0]   _nextSent_T = dmaSent + {4'h0, wBurstLines};
+  wire         _GEN_10 = dmaBusy & mem_ready & (|(_nextSent_T[8:4]));
+  wire         _GEN_11 = ~_GEN_4 | (|(_nextSent_T[8:4]));
+  wire         doWrite = s_axi_awvalid & s_axi_wvalid & ~wState;
+  wire         _ldStartB_T = s_axi_awaddr[7:2] == 6'h0;
+  wire         ldStartB = doWrite & _ldStartB_T & s_axi_wdata[4] & ~ldBusy & ~dmaBusy;
+  wire         pushA = doWrite & ~busy & s_axi_awaddr[7:2] == 6'h5;
+  wire         pushB = doWrite & ~busy & s_axi_awaddr[7:2] == 6'h6;
+  wire         _GEN_12 = doWrite & ~busy;
+  wire         _GEN_13 = loadLane == 3'h0;
+  wire         _GEN_14 = loadK == 2'h0;
+  wire         _GEN_15 = pushA & _GEN_14;
+  wire         _GEN_16 = loadK == 2'h1;
+  wire         _GEN_17 = loadK == 2'h2;
+  wire         _GEN_18 = bPanelLoad == 2'h0;
+  wire         _GEN_19 = pushB & _GEN_18 & _GEN_14;
+  wire         _GEN_20 = bPanelLoad == 2'h1;
+  wire         _GEN_21 = pushB & _GEN_20 & _GEN_14;
+  wire         _GEN_22 = bPanelLoad == 2'h2;
+  wire         _GEN_23 = pushB & _GEN_22 & _GEN_14;
+  wire         _GEN_24 = pushB & (&bPanelLoad) & _GEN_14;
+  wire         _GEN_25 = _GEN_12 & _GEN_13;
+  wire         _GEN_26 = pushA & (&loadK);
+  wire         _GEN_27 = pushB & _GEN_18 & (&loadK);
+  wire         _GEN_28 = pushB & _GEN_20 & (&loadK);
+  wire         _GEN_29 = pushB & _GEN_22 & (&loadK);
+  wire         _GEN_30 = pushB & (&bPanelLoad) & (&loadK);
+  wire         _GEN_31 = loadLane == 3'h1;
+  wire         _GEN_32 = _GEN_12 & _GEN_31;
+  wire         _GEN_33 = loadLane == 3'h2;
+  wire         _GEN_34 = _GEN_12 & _GEN_33;
+  wire         _GEN_35 = loadLane == 3'h3;
+  wire         _GEN_36 = _GEN_12 & _GEN_35;
+  wire         _GEN_37 = loadLane == 3'h4;
+  wire         _GEN_38 = _GEN_12 & _GEN_37;
+  wire         _GEN_39 = loadLane == 3'h5;
+  wire         _GEN_40 = _GEN_12 & _GEN_39;
+  wire         _GEN_41 = loadLane == 3'h6;
+  wire         _GEN_42 = _GEN_12 & _GEN_41;
+  wire         _GEN_43 = _GEN_12 & (&loadLane);
+  wire         _GEN_44 =
+    doWrite & _ldStartB_T & s_axi_wdata[3] & ~ldBusy & ~dmaBusy | ldStartB;
+  wire         _GEN_45 = ldLocal == 4'h0;
+  wire         _GEN_46 = ldBusy & mem_ready & _GEN_45;
+  wire         _GEN_47 = ldLocal == 4'h1;
+  wire         _GEN_48 = ldBusy & mem_ready & _GEN_47;
+  wire         _GEN_49 = ldLocal == 4'h2;
+  wire         _GEN_50 = ldBusy & mem_ready & _GEN_49;
+  wire         _GEN_51 = ldLocal == 4'h3;
+  wire         _GEN_52 = ldBusy & mem_ready & _GEN_51;
+  wire         _GEN_53 = ldLocal == 4'h4;
+  wire         _GEN_54 = ldBusy & mem_ready & _GEN_53;
+  wire         _GEN_55 = ldLocal == 4'h5;
+  wire         _GEN_56 = ldBusy & mem_ready & _GEN_55;
+  wire         _GEN_57 = ldLocal == 4'h6;
+  wire         _GEN_58 = ldBusy & mem_ready & _GEN_57;
+  wire         _GEN_59 = ldLocal == 4'h7;
+  wire         _GEN_60 = ldBusy & mem_ready & _GEN_59;
+  wire         startPulse = doWrite & _ldStartB_T & s_axi_wdata[0] & ~busy;
+  wire         softRstPulse = doWrite & _ldStartB_T & s_axi_wdata[1];
+  wire         dmaStart = doWrite & _ldStartB_T & s_axi_wdata[2] & ~dmaBusy & ~ldBusy;
+  wire         _GEN_61 = softRstPulse | startPulse;
+  wire         _GEN_62 = s_axi_awaddr[7:2] == 6'h4;
+  wire         _GEN_63 = pushA | pushB;
   always @(posedge clk) begin
     if (rst) begin
       busy <= 1'h0;
@@ -664,12 +2928,21 @@ module mm_accel(
       loadLane <= 3'h0;
       resultIdx <= 6'h0;
       t <= 8'h0;
+      fillGrp <= 4'h0;
+      fillLeft <= 9'h0;
       destAddr <= 32'h0;
       dmaAddr <= 32'h0;
       dmaBusy <= 1'h0;
       dmaDone <= 1'h0;
       destStride <= 32'h0;
       dmaRowBase <= 32'h0;
+      aSrcAddr <= 32'h0;
+      bSrcAddr <= 32'h0;
+      srcStride <= 32'h0;
+      ldBusy <= 1'h0;
+      ldDone <= 1'h0;
+      bPanelUse <= 2'h0;
+      bPanelLoad <= 2'h0;
       wState <= 1'h0;
       awreadyReg <= 1'h0;
       wreadyReg <= 1'h0;
@@ -678,71 +2951,93 @@ module mm_accel(
       raddrWord <= 6'h0;
       arreadyReg <= 1'h0;
       rvalidReg <= 1'h0;
-      dmaGrp <= 4'h0;
-      memReqValid <= 1'h0;
-      dmaSettle <= 1'h0;
+      fillGrpD <= 4'h0;
+      ldIdx <= 4'h0;
+      ldReq <= 1'h0;
+      fillValid <= 1'h0;
+      dmaSent <= 9'h0;
     end
     else begin
-      busy <= ~softRstPulse & (startPulse | ~_GEN_33 & busy);
-      done <= ~_GEN_34 & (_GEN_33 | done);
-      if (_GEN_0 & s_axi_awaddr[7:2] == 6'h2)
+      busy <= ~softRstPulse & (startPulse | ~_GEN_7 & busy);
+      done <= ~_GEN_61 & (_GEN_7 | done);
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'h2)
         kLen <= s_axi_wdata[7:0];
-      if (_GEN_0) begin
-        if (_GEN_28) begin
-          if (_GEN_29)
+      if (_GEN_12) begin
+        if (_GEN_63) begin
+          if (_GEN_3)
             loadK <= 2'h0;
           else
             loadK <= loadK + 2'h1;
         end
-        else if (_GEN_27)
+        else if (_GEN_62)
           loadK <= 2'h0;
         else if (s_axi_awaddr[7:2] == 6'h3)
           loadK <= s_axi_wdata[1:0];
-        if (_GEN_28 & _GEN_29)
+        if (_GEN_63 & _GEN_3)
           loadLane <= loadLane + 3'h1;
-        else if (_GEN_27)
+        else if (_GEN_62)
           loadLane <= s_axi_wdata[2:0];
       end
-      if (_GEN_0 & s_axi_awaddr[7:2] == 6'h7)
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'h7)
         resultIdx <= s_axi_wdata[5:0];
       else if (rState & s_axi_rready & _GEN)
         resultIdx <= resultIdx + 6'h1;
-      if (_GEN_34)
+      if (_GEN_61)
         t <= 8'h0;
       else if (busy)
         t <= t + 8'h1;
-      if (_GEN_0 & s_axi_awaddr[7:2] == 6'hA)
-        destAddr <= s_axi_wdata;
       if (dmaStart) begin
+        fillGrp <= 4'h0;
+        fillLeft <= 9'h10;
         dmaAddr <= destAddr;
         dmaRowBase <= destAddr;
-        dmaGrp <= 4'h0;
+        dmaSent <= 9'h0;
       end
       else begin
-        if (_GEN_30) begin
+        if (fillFire) begin
+          fillGrp <= fillGrp + 4'h1;
+          fillLeft <= fillLeft - 9'h1;
         end
-        else if (dmaGrp[0])
-          dmaAddr <= _dmaRowBase_T;
-        else
+        if (_GEN_11) begin
+        end
+        else if (destContig)
+          dmaAddr <= {23'h0, wBurstLines, 4'h0} + dmaAddr;
+        else if (_nextSent_T[0])
           dmaAddr <= dmaAddr + 32'h10;
-        if (~dmaBusy | dmaSettle | ~mem_ready | (&dmaGrp) | ~(dmaGrp[0])) begin
+        else
+          dmaAddr <= _dmaRowBase_T;
+        if (~_GEN_4 | (|(_nextSent_T[8:4])) | destContig | _nextSent_T[0]) begin
         end
         else
           dmaRowBase <= _dmaRowBase_T;
-        if (_GEN_30) begin
+        if (_GEN_11) begin
         end
         else
-          dmaGrp <= dmaGrp + 4'h1;
+          dmaSent <= _nextSent_T;
       end
-      dmaBusy <= dmaStart | (~dmaBusy | dmaSettle | ~_GEN_35) & dmaBusy;
-      dmaDone <= ~dmaStart & (dmaBusy & ~dmaSettle & _GEN_35 | dmaDone);
-      if (_GEN_0 & s_axi_awaddr[7:2] == 6'hB)
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'hA)
+        destAddr <= s_axi_wdata;
+      dmaBusy <= dmaStart | ~_GEN_10 & dmaBusy;
+      dmaDone <= ~dmaStart & (_GEN_10 | dmaDone);
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'hB)
         destStride <= s_axi_wdata;
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'hC)
+        aSrcAddr <= s_axi_wdata;
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'hD)
+        bSrcAddr <= s_axi_wdata;
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'hE)
+        srcStride <= s_axi_wdata;
+      ldBusy <= _GEN_44 | ~_GEN_8 & ldBusy;
+      ldDone <= ~_GEN_44 & (_GEN_8 | ldDone);
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'hF)
+        bPanelUse <= s_axi_wdata[1:0];
+      if (_GEN_12 & s_axi_awaddr[7:2] == 6'h10)
+        bPanelLoad <= s_axi_wdata[1:0];
       if (wState) begin
-        wState <= ~_GEN_31 & wState;
+        wState <= ~_GEN_5 & wState;
         awreadyReg <= ~wState & awreadyReg;
         wreadyReg <= ~wState & wreadyReg;
-        bvalidReg <= ~_GEN_31 & bvalidReg;
+        bvalidReg <= ~_GEN_5 & bvalidReg;
       end
       else begin
         wState <= doWrite | wState;
@@ -751,427 +3046,1917 @@ module mm_accel(
         bvalidReg <= doWrite | bvalidReg;
       end
       if (rState)
-        rState <= ~_GEN_32 & rState;
+        rState <= ~_GEN_6 & rState;
       else
         rState <= s_axi_arvalid | rState;
       if (~rState & s_axi_arvalid)
         raddrWord <= s_axi_araddr[7:2];
       if (rState) begin
         arreadyReg <= ~rState & arreadyReg;
-        rvalidReg <= ~_GEN_32 & rvalidReg;
+        rvalidReg <= ~_GEN_6 & rvalidReg;
       end
       else begin
         arreadyReg <= s_axi_arvalid;
         rvalidReg <= s_axi_arvalid | rvalidReg;
       end
-      if (dmaStart | ~dmaBusy) begin
+      fillGrpD <= fillGrp;
+      if (_GEN_44)
+        ldIdx <= {ldStartB, 3'h0};
+      else if (~_GEN_9 | (&ldIdx)) begin
       end
       else
-        memReqValid <= dmaSettle | ~mem_ready & memReqValid;
-      dmaSettle <=
-        dmaStart
-        | (dmaBusy ? ~dmaSettle & (mem_ready & ~(&dmaGrp) | dmaSettle) : dmaSettle);
+        ldIdx <= _ldReq_T;
+      ldReq <= _GEN_44 | (_GEN_9 ? ~(&ldIdx) & (~burstOK | _ldReq_T == 4'h8) : ldReq);
+      fillValid <= fillFire;
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_45 & ~(ldIdx[3]))) begin
+      if (_GEN_25 & _GEN_15)
+        aRowBuf_0_0 <= s_axi_wdata[7:0];
+      if (_GEN_25 & pushA & _GEN_14) begin
+        aRowBuf_0_1 <= s_axi_wdata[15:8];
+        aRowBuf_0_2 <= s_axi_wdata[23:16];
+        aRowBuf_0_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushA & _GEN_16) begin
+        aRowBuf_0_4 <= s_axi_wdata[7:0];
+        aRowBuf_0_5 <= s_axi_wdata[15:8];
+        aRowBuf_0_6 <= s_axi_wdata[23:16];
+        aRowBuf_0_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushA & _GEN_17) begin
+        aRowBuf_0_8 <= s_axi_wdata[7:0];
+        aRowBuf_0_9 <= s_axi_wdata[15:8];
+        aRowBuf_0_10 <= s_axi_wdata[23:16];
+        aRowBuf_0_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushA & (&loadK)) begin
+        aRowBuf_0_12 <= s_axi_wdata[7:0];
+        aRowBuf_0_13 <= s_axi_wdata[15:8];
+        aRowBuf_0_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_13 & _GEN_26)
+        aRowBuf_0_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_0_0 <= mem_rline[7:0];
+      aRowBuf_0_1 <= mem_rline[15:8];
+      aRowBuf_0_2 <= mem_rline[23:16];
+      aRowBuf_0_3 <= mem_rline[31:24];
+      aRowBuf_0_4 <= mem_rline[39:32];
+      aRowBuf_0_5 <= mem_rline[47:40];
+      aRowBuf_0_6 <= mem_rline[55:48];
+      aRowBuf_0_7 <= mem_rline[63:56];
+      aRowBuf_0_8 <= mem_rline[71:64];
+      aRowBuf_0_9 <= mem_rline[79:72];
+      aRowBuf_0_10 <= mem_rline[87:80];
+      aRowBuf_0_11 <= mem_rline[95:88];
+      aRowBuf_0_12 <= mem_rline[103:96];
+      aRowBuf_0_13 <= mem_rline[111:104];
+      aRowBuf_0_14 <= mem_rline[119:112];
+      aRowBuf_0_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_47 & ~(ldIdx[3]))) begin
+      if (_GEN_32 & _GEN_15)
+        aRowBuf_1_0 <= s_axi_wdata[7:0];
+      if (_GEN_32 & pushA & _GEN_14) begin
+        aRowBuf_1_1 <= s_axi_wdata[15:8];
+        aRowBuf_1_2 <= s_axi_wdata[23:16];
+        aRowBuf_1_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushA & _GEN_16) begin
+        aRowBuf_1_4 <= s_axi_wdata[7:0];
+        aRowBuf_1_5 <= s_axi_wdata[15:8];
+        aRowBuf_1_6 <= s_axi_wdata[23:16];
+        aRowBuf_1_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushA & _GEN_17) begin
+        aRowBuf_1_8 <= s_axi_wdata[7:0];
+        aRowBuf_1_9 <= s_axi_wdata[15:8];
+        aRowBuf_1_10 <= s_axi_wdata[23:16];
+        aRowBuf_1_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushA & (&loadK)) begin
+        aRowBuf_1_12 <= s_axi_wdata[7:0];
+        aRowBuf_1_13 <= s_axi_wdata[15:8];
+        aRowBuf_1_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_31 & _GEN_26)
+        aRowBuf_1_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_1_0 <= mem_rline[7:0];
+      aRowBuf_1_1 <= mem_rline[15:8];
+      aRowBuf_1_2 <= mem_rline[23:16];
+      aRowBuf_1_3 <= mem_rline[31:24];
+      aRowBuf_1_4 <= mem_rline[39:32];
+      aRowBuf_1_5 <= mem_rline[47:40];
+      aRowBuf_1_6 <= mem_rline[55:48];
+      aRowBuf_1_7 <= mem_rline[63:56];
+      aRowBuf_1_8 <= mem_rline[71:64];
+      aRowBuf_1_9 <= mem_rline[79:72];
+      aRowBuf_1_10 <= mem_rline[87:80];
+      aRowBuf_1_11 <= mem_rline[95:88];
+      aRowBuf_1_12 <= mem_rline[103:96];
+      aRowBuf_1_13 <= mem_rline[111:104];
+      aRowBuf_1_14 <= mem_rline[119:112];
+      aRowBuf_1_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_49 & ~(ldIdx[3]))) begin
+      if (_GEN_34 & _GEN_15)
+        aRowBuf_2_0 <= s_axi_wdata[7:0];
+      if (_GEN_34 & pushA & _GEN_14) begin
+        aRowBuf_2_1 <= s_axi_wdata[15:8];
+        aRowBuf_2_2 <= s_axi_wdata[23:16];
+        aRowBuf_2_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushA & _GEN_16) begin
+        aRowBuf_2_4 <= s_axi_wdata[7:0];
+        aRowBuf_2_5 <= s_axi_wdata[15:8];
+        aRowBuf_2_6 <= s_axi_wdata[23:16];
+        aRowBuf_2_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushA & _GEN_17) begin
+        aRowBuf_2_8 <= s_axi_wdata[7:0];
+        aRowBuf_2_9 <= s_axi_wdata[15:8];
+        aRowBuf_2_10 <= s_axi_wdata[23:16];
+        aRowBuf_2_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushA & (&loadK)) begin
+        aRowBuf_2_12 <= s_axi_wdata[7:0];
+        aRowBuf_2_13 <= s_axi_wdata[15:8];
+        aRowBuf_2_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_33 & _GEN_26)
+        aRowBuf_2_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_2_0 <= mem_rline[7:0];
+      aRowBuf_2_1 <= mem_rline[15:8];
+      aRowBuf_2_2 <= mem_rline[23:16];
+      aRowBuf_2_3 <= mem_rline[31:24];
+      aRowBuf_2_4 <= mem_rline[39:32];
+      aRowBuf_2_5 <= mem_rline[47:40];
+      aRowBuf_2_6 <= mem_rline[55:48];
+      aRowBuf_2_7 <= mem_rline[63:56];
+      aRowBuf_2_8 <= mem_rline[71:64];
+      aRowBuf_2_9 <= mem_rline[79:72];
+      aRowBuf_2_10 <= mem_rline[87:80];
+      aRowBuf_2_11 <= mem_rline[95:88];
+      aRowBuf_2_12 <= mem_rline[103:96];
+      aRowBuf_2_13 <= mem_rline[111:104];
+      aRowBuf_2_14 <= mem_rline[119:112];
+      aRowBuf_2_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_51 & ~(ldIdx[3]))) begin
+      if (_GEN_36 & _GEN_15)
+        aRowBuf_3_0 <= s_axi_wdata[7:0];
+      if (_GEN_36 & pushA & _GEN_14) begin
+        aRowBuf_3_1 <= s_axi_wdata[15:8];
+        aRowBuf_3_2 <= s_axi_wdata[23:16];
+        aRowBuf_3_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushA & _GEN_16) begin
+        aRowBuf_3_4 <= s_axi_wdata[7:0];
+        aRowBuf_3_5 <= s_axi_wdata[15:8];
+        aRowBuf_3_6 <= s_axi_wdata[23:16];
+        aRowBuf_3_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushA & _GEN_17) begin
+        aRowBuf_3_8 <= s_axi_wdata[7:0];
+        aRowBuf_3_9 <= s_axi_wdata[15:8];
+        aRowBuf_3_10 <= s_axi_wdata[23:16];
+        aRowBuf_3_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushA & (&loadK)) begin
+        aRowBuf_3_12 <= s_axi_wdata[7:0];
+        aRowBuf_3_13 <= s_axi_wdata[15:8];
+        aRowBuf_3_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_35 & _GEN_26)
+        aRowBuf_3_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_3_0 <= mem_rline[7:0];
+      aRowBuf_3_1 <= mem_rline[15:8];
+      aRowBuf_3_2 <= mem_rline[23:16];
+      aRowBuf_3_3 <= mem_rline[31:24];
+      aRowBuf_3_4 <= mem_rline[39:32];
+      aRowBuf_3_5 <= mem_rline[47:40];
+      aRowBuf_3_6 <= mem_rline[55:48];
+      aRowBuf_3_7 <= mem_rline[63:56];
+      aRowBuf_3_8 <= mem_rline[71:64];
+      aRowBuf_3_9 <= mem_rline[79:72];
+      aRowBuf_3_10 <= mem_rline[87:80];
+      aRowBuf_3_11 <= mem_rline[95:88];
+      aRowBuf_3_12 <= mem_rline[103:96];
+      aRowBuf_3_13 <= mem_rline[111:104];
+      aRowBuf_3_14 <= mem_rline[119:112];
+      aRowBuf_3_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_53 & ~(ldIdx[3]))) begin
+      if (_GEN_38 & _GEN_15)
+        aRowBuf_4_0 <= s_axi_wdata[7:0];
+      if (_GEN_38 & pushA & _GEN_14) begin
+        aRowBuf_4_1 <= s_axi_wdata[15:8];
+        aRowBuf_4_2 <= s_axi_wdata[23:16];
+        aRowBuf_4_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushA & _GEN_16) begin
+        aRowBuf_4_4 <= s_axi_wdata[7:0];
+        aRowBuf_4_5 <= s_axi_wdata[15:8];
+        aRowBuf_4_6 <= s_axi_wdata[23:16];
+        aRowBuf_4_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushA & _GEN_17) begin
+        aRowBuf_4_8 <= s_axi_wdata[7:0];
+        aRowBuf_4_9 <= s_axi_wdata[15:8];
+        aRowBuf_4_10 <= s_axi_wdata[23:16];
+        aRowBuf_4_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushA & (&loadK)) begin
+        aRowBuf_4_12 <= s_axi_wdata[7:0];
+        aRowBuf_4_13 <= s_axi_wdata[15:8];
+        aRowBuf_4_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_37 & _GEN_26)
+        aRowBuf_4_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_4_0 <= mem_rline[7:0];
+      aRowBuf_4_1 <= mem_rline[15:8];
+      aRowBuf_4_2 <= mem_rline[23:16];
+      aRowBuf_4_3 <= mem_rline[31:24];
+      aRowBuf_4_4 <= mem_rline[39:32];
+      aRowBuf_4_5 <= mem_rline[47:40];
+      aRowBuf_4_6 <= mem_rline[55:48];
+      aRowBuf_4_7 <= mem_rline[63:56];
+      aRowBuf_4_8 <= mem_rline[71:64];
+      aRowBuf_4_9 <= mem_rline[79:72];
+      aRowBuf_4_10 <= mem_rline[87:80];
+      aRowBuf_4_11 <= mem_rline[95:88];
+      aRowBuf_4_12 <= mem_rline[103:96];
+      aRowBuf_4_13 <= mem_rline[111:104];
+      aRowBuf_4_14 <= mem_rline[119:112];
+      aRowBuf_4_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_55 & ~(ldIdx[3]))) begin
+      if (_GEN_40 & _GEN_15)
+        aRowBuf_5_0 <= s_axi_wdata[7:0];
+      if (_GEN_40 & pushA & _GEN_14) begin
+        aRowBuf_5_1 <= s_axi_wdata[15:8];
+        aRowBuf_5_2 <= s_axi_wdata[23:16];
+        aRowBuf_5_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushA & _GEN_16) begin
+        aRowBuf_5_4 <= s_axi_wdata[7:0];
+        aRowBuf_5_5 <= s_axi_wdata[15:8];
+        aRowBuf_5_6 <= s_axi_wdata[23:16];
+        aRowBuf_5_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushA & _GEN_17) begin
+        aRowBuf_5_8 <= s_axi_wdata[7:0];
+        aRowBuf_5_9 <= s_axi_wdata[15:8];
+        aRowBuf_5_10 <= s_axi_wdata[23:16];
+        aRowBuf_5_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushA & (&loadK)) begin
+        aRowBuf_5_12 <= s_axi_wdata[7:0];
+        aRowBuf_5_13 <= s_axi_wdata[15:8];
+        aRowBuf_5_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_39 & _GEN_26)
+        aRowBuf_5_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_5_0 <= mem_rline[7:0];
+      aRowBuf_5_1 <= mem_rline[15:8];
+      aRowBuf_5_2 <= mem_rline[23:16];
+      aRowBuf_5_3 <= mem_rline[31:24];
+      aRowBuf_5_4 <= mem_rline[39:32];
+      aRowBuf_5_5 <= mem_rline[47:40];
+      aRowBuf_5_6 <= mem_rline[55:48];
+      aRowBuf_5_7 <= mem_rline[63:56];
+      aRowBuf_5_8 <= mem_rline[71:64];
+      aRowBuf_5_9 <= mem_rline[79:72];
+      aRowBuf_5_10 <= mem_rline[87:80];
+      aRowBuf_5_11 <= mem_rline[95:88];
+      aRowBuf_5_12 <= mem_rline[103:96];
+      aRowBuf_5_13 <= mem_rline[111:104];
+      aRowBuf_5_14 <= mem_rline[119:112];
+      aRowBuf_5_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_57 & ~(ldIdx[3]))) begin
+      if (_GEN_42 & _GEN_15)
+        aRowBuf_6_0 <= s_axi_wdata[7:0];
+      if (_GEN_42 & pushA & _GEN_14) begin
+        aRowBuf_6_1 <= s_axi_wdata[15:8];
+        aRowBuf_6_2 <= s_axi_wdata[23:16];
+        aRowBuf_6_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushA & _GEN_16) begin
+        aRowBuf_6_4 <= s_axi_wdata[7:0];
+        aRowBuf_6_5 <= s_axi_wdata[15:8];
+        aRowBuf_6_6 <= s_axi_wdata[23:16];
+        aRowBuf_6_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushA & _GEN_17) begin
+        aRowBuf_6_8 <= s_axi_wdata[7:0];
+        aRowBuf_6_9 <= s_axi_wdata[15:8];
+        aRowBuf_6_10 <= s_axi_wdata[23:16];
+        aRowBuf_6_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushA & (&loadK)) begin
+        aRowBuf_6_12 <= s_axi_wdata[7:0];
+        aRowBuf_6_13 <= s_axi_wdata[15:8];
+        aRowBuf_6_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_41 & _GEN_26)
+        aRowBuf_6_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_6_0 <= mem_rline[7:0];
+      aRowBuf_6_1 <= mem_rline[15:8];
+      aRowBuf_6_2 <= mem_rline[23:16];
+      aRowBuf_6_3 <= mem_rline[31:24];
+      aRowBuf_6_4 <= mem_rline[39:32];
+      aRowBuf_6_5 <= mem_rline[47:40];
+      aRowBuf_6_6 <= mem_rline[55:48];
+      aRowBuf_6_7 <= mem_rline[63:56];
+      aRowBuf_6_8 <= mem_rline[71:64];
+      aRowBuf_6_9 <= mem_rline[79:72];
+      aRowBuf_6_10 <= mem_rline[87:80];
+      aRowBuf_6_11 <= mem_rline[95:88];
+      aRowBuf_6_12 <= mem_rline[103:96];
+      aRowBuf_6_13 <= mem_rline[111:104];
+      aRowBuf_6_14 <= mem_rline[119:112];
+      aRowBuf_6_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(ldBusy & mem_ready & _GEN_59 & ~(ldIdx[3]))) begin
+      if (_GEN_43 & _GEN_15)
+        aRowBuf_7_0 <= s_axi_wdata[7:0];
+      if (_GEN_43 & pushA & _GEN_14) begin
+        aRowBuf_7_1 <= s_axi_wdata[15:8];
+        aRowBuf_7_2 <= s_axi_wdata[23:16];
+        aRowBuf_7_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushA & _GEN_16) begin
+        aRowBuf_7_4 <= s_axi_wdata[7:0];
+        aRowBuf_7_5 <= s_axi_wdata[15:8];
+        aRowBuf_7_6 <= s_axi_wdata[23:16];
+        aRowBuf_7_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushA & _GEN_17) begin
+        aRowBuf_7_8 <= s_axi_wdata[7:0];
+        aRowBuf_7_9 <= s_axi_wdata[15:8];
+        aRowBuf_7_10 <= s_axi_wdata[23:16];
+        aRowBuf_7_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushA & (&loadK)) begin
+        aRowBuf_7_12 <= s_axi_wdata[7:0];
+        aRowBuf_7_13 <= s_axi_wdata[15:8];
+        aRowBuf_7_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & (&loadLane) & _GEN_26)
+        aRowBuf_7_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      aRowBuf_7_0 <= mem_rline[7:0];
+      aRowBuf_7_1 <= mem_rline[15:8];
+      aRowBuf_7_2 <= mem_rline[23:16];
+      aRowBuf_7_3 <= mem_rline[31:24];
+      aRowBuf_7_4 <= mem_rline[39:32];
+      aRowBuf_7_5 <= mem_rline[47:40];
+      aRowBuf_7_6 <= mem_rline[55:48];
+      aRowBuf_7_7 <= mem_rline[63:56];
+      aRowBuf_7_8 <= mem_rline[71:64];
+      aRowBuf_7_9 <= mem_rline[79:72];
+      aRowBuf_7_10 <= mem_rline[87:80];
+      aRowBuf_7_11 <= mem_rline[95:88];
+      aRowBuf_7_12 <= mem_rline[103:96];
+      aRowBuf_7_13 <= mem_rline[111:104];
+      aRowBuf_7_14 <= mem_rline[119:112];
+      aRowBuf_7_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_46 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_25 & _GEN_19)
+        bColBuf_0_0_0 <= s_axi_wdata[7:0];
+      if (_GEN_25 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_0_1 <= s_axi_wdata[15:8];
+        bColBuf_0_0_2 <= s_axi_wdata[23:16];
+        bColBuf_0_0_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_0_4 <= s_axi_wdata[7:0];
+        bColBuf_0_0_5 <= s_axi_wdata[15:8];
+        bColBuf_0_0_6 <= s_axi_wdata[23:16];
+        bColBuf_0_0_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_0_8 <= s_axi_wdata[7:0];
+        bColBuf_0_0_9 <= s_axi_wdata[15:8];
+        bColBuf_0_0_10 <= s_axi_wdata[23:16];
+        bColBuf_0_0_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_0_12 <= s_axi_wdata[7:0];
+        bColBuf_0_0_13 <= s_axi_wdata[15:8];
+        bColBuf_0_0_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_13 & _GEN_27)
+        bColBuf_0_0_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_0_0 <= mem_rline[7:0];
+      bColBuf_0_0_1 <= mem_rline[15:8];
+      bColBuf_0_0_2 <= mem_rline[23:16];
+      bColBuf_0_0_3 <= mem_rline[31:24];
+      bColBuf_0_0_4 <= mem_rline[39:32];
+      bColBuf_0_0_5 <= mem_rline[47:40];
+      bColBuf_0_0_6 <= mem_rline[55:48];
+      bColBuf_0_0_7 <= mem_rline[63:56];
+      bColBuf_0_0_8 <= mem_rline[71:64];
+      bColBuf_0_0_9 <= mem_rline[79:72];
+      bColBuf_0_0_10 <= mem_rline[87:80];
+      bColBuf_0_0_11 <= mem_rline[95:88];
+      bColBuf_0_0_12 <= mem_rline[103:96];
+      bColBuf_0_0_13 <= mem_rline[111:104];
+      bColBuf_0_0_14 <= mem_rline[119:112];
+      bColBuf_0_0_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_48 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_32 & _GEN_19)
+        bColBuf_0_1_0 <= s_axi_wdata[7:0];
+      if (_GEN_32 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_1_1 <= s_axi_wdata[15:8];
+        bColBuf_0_1_2 <= s_axi_wdata[23:16];
+        bColBuf_0_1_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_1_4 <= s_axi_wdata[7:0];
+        bColBuf_0_1_5 <= s_axi_wdata[15:8];
+        bColBuf_0_1_6 <= s_axi_wdata[23:16];
+        bColBuf_0_1_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_1_8 <= s_axi_wdata[7:0];
+        bColBuf_0_1_9 <= s_axi_wdata[15:8];
+        bColBuf_0_1_10 <= s_axi_wdata[23:16];
+        bColBuf_0_1_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_1_12 <= s_axi_wdata[7:0];
+        bColBuf_0_1_13 <= s_axi_wdata[15:8];
+        bColBuf_0_1_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_31 & _GEN_27)
+        bColBuf_0_1_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_1_0 <= mem_rline[7:0];
+      bColBuf_0_1_1 <= mem_rline[15:8];
+      bColBuf_0_1_2 <= mem_rline[23:16];
+      bColBuf_0_1_3 <= mem_rline[31:24];
+      bColBuf_0_1_4 <= mem_rline[39:32];
+      bColBuf_0_1_5 <= mem_rline[47:40];
+      bColBuf_0_1_6 <= mem_rline[55:48];
+      bColBuf_0_1_7 <= mem_rline[63:56];
+      bColBuf_0_1_8 <= mem_rline[71:64];
+      bColBuf_0_1_9 <= mem_rline[79:72];
+      bColBuf_0_1_10 <= mem_rline[87:80];
+      bColBuf_0_1_11 <= mem_rline[95:88];
+      bColBuf_0_1_12 <= mem_rline[103:96];
+      bColBuf_0_1_13 <= mem_rline[111:104];
+      bColBuf_0_1_14 <= mem_rline[119:112];
+      bColBuf_0_1_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_50 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_34 & _GEN_19)
+        bColBuf_0_2_0 <= s_axi_wdata[7:0];
+      if (_GEN_34 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_2_1 <= s_axi_wdata[15:8];
+        bColBuf_0_2_2 <= s_axi_wdata[23:16];
+        bColBuf_0_2_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_2_4 <= s_axi_wdata[7:0];
+        bColBuf_0_2_5 <= s_axi_wdata[15:8];
+        bColBuf_0_2_6 <= s_axi_wdata[23:16];
+        bColBuf_0_2_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_2_8 <= s_axi_wdata[7:0];
+        bColBuf_0_2_9 <= s_axi_wdata[15:8];
+        bColBuf_0_2_10 <= s_axi_wdata[23:16];
+        bColBuf_0_2_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_2_12 <= s_axi_wdata[7:0];
+        bColBuf_0_2_13 <= s_axi_wdata[15:8];
+        bColBuf_0_2_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_33 & _GEN_27)
+        bColBuf_0_2_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_2_0 <= mem_rline[7:0];
+      bColBuf_0_2_1 <= mem_rline[15:8];
+      bColBuf_0_2_2 <= mem_rline[23:16];
+      bColBuf_0_2_3 <= mem_rline[31:24];
+      bColBuf_0_2_4 <= mem_rline[39:32];
+      bColBuf_0_2_5 <= mem_rline[47:40];
+      bColBuf_0_2_6 <= mem_rline[55:48];
+      bColBuf_0_2_7 <= mem_rline[63:56];
+      bColBuf_0_2_8 <= mem_rline[71:64];
+      bColBuf_0_2_9 <= mem_rline[79:72];
+      bColBuf_0_2_10 <= mem_rline[87:80];
+      bColBuf_0_2_11 <= mem_rline[95:88];
+      bColBuf_0_2_12 <= mem_rline[103:96];
+      bColBuf_0_2_13 <= mem_rline[111:104];
+      bColBuf_0_2_14 <= mem_rline[119:112];
+      bColBuf_0_2_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_52 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_36 & _GEN_19)
+        bColBuf_0_3_0 <= s_axi_wdata[7:0];
+      if (_GEN_36 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_3_1 <= s_axi_wdata[15:8];
+        bColBuf_0_3_2 <= s_axi_wdata[23:16];
+        bColBuf_0_3_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_3_4 <= s_axi_wdata[7:0];
+        bColBuf_0_3_5 <= s_axi_wdata[15:8];
+        bColBuf_0_3_6 <= s_axi_wdata[23:16];
+        bColBuf_0_3_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_3_8 <= s_axi_wdata[7:0];
+        bColBuf_0_3_9 <= s_axi_wdata[15:8];
+        bColBuf_0_3_10 <= s_axi_wdata[23:16];
+        bColBuf_0_3_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_3_12 <= s_axi_wdata[7:0];
+        bColBuf_0_3_13 <= s_axi_wdata[15:8];
+        bColBuf_0_3_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_35 & _GEN_27)
+        bColBuf_0_3_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_3_0 <= mem_rline[7:0];
+      bColBuf_0_3_1 <= mem_rline[15:8];
+      bColBuf_0_3_2 <= mem_rline[23:16];
+      bColBuf_0_3_3 <= mem_rline[31:24];
+      bColBuf_0_3_4 <= mem_rline[39:32];
+      bColBuf_0_3_5 <= mem_rline[47:40];
+      bColBuf_0_3_6 <= mem_rline[55:48];
+      bColBuf_0_3_7 <= mem_rline[63:56];
+      bColBuf_0_3_8 <= mem_rline[71:64];
+      bColBuf_0_3_9 <= mem_rline[79:72];
+      bColBuf_0_3_10 <= mem_rline[87:80];
+      bColBuf_0_3_11 <= mem_rline[95:88];
+      bColBuf_0_3_12 <= mem_rline[103:96];
+      bColBuf_0_3_13 <= mem_rline[111:104];
+      bColBuf_0_3_14 <= mem_rline[119:112];
+      bColBuf_0_3_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_54 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_38 & _GEN_19)
+        bColBuf_0_4_0 <= s_axi_wdata[7:0];
+      if (_GEN_38 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_4_1 <= s_axi_wdata[15:8];
+        bColBuf_0_4_2 <= s_axi_wdata[23:16];
+        bColBuf_0_4_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_4_4 <= s_axi_wdata[7:0];
+        bColBuf_0_4_5 <= s_axi_wdata[15:8];
+        bColBuf_0_4_6 <= s_axi_wdata[23:16];
+        bColBuf_0_4_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_4_8 <= s_axi_wdata[7:0];
+        bColBuf_0_4_9 <= s_axi_wdata[15:8];
+        bColBuf_0_4_10 <= s_axi_wdata[23:16];
+        bColBuf_0_4_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_4_12 <= s_axi_wdata[7:0];
+        bColBuf_0_4_13 <= s_axi_wdata[15:8];
+        bColBuf_0_4_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_37 & _GEN_27)
+        bColBuf_0_4_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_4_0 <= mem_rline[7:0];
+      bColBuf_0_4_1 <= mem_rline[15:8];
+      bColBuf_0_4_2 <= mem_rline[23:16];
+      bColBuf_0_4_3 <= mem_rline[31:24];
+      bColBuf_0_4_4 <= mem_rline[39:32];
+      bColBuf_0_4_5 <= mem_rline[47:40];
+      bColBuf_0_4_6 <= mem_rline[55:48];
+      bColBuf_0_4_7 <= mem_rline[63:56];
+      bColBuf_0_4_8 <= mem_rline[71:64];
+      bColBuf_0_4_9 <= mem_rline[79:72];
+      bColBuf_0_4_10 <= mem_rline[87:80];
+      bColBuf_0_4_11 <= mem_rline[95:88];
+      bColBuf_0_4_12 <= mem_rline[103:96];
+      bColBuf_0_4_13 <= mem_rline[111:104];
+      bColBuf_0_4_14 <= mem_rline[119:112];
+      bColBuf_0_4_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_56 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_40 & _GEN_19)
+        bColBuf_0_5_0 <= s_axi_wdata[7:0];
+      if (_GEN_40 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_5_1 <= s_axi_wdata[15:8];
+        bColBuf_0_5_2 <= s_axi_wdata[23:16];
+        bColBuf_0_5_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_5_4 <= s_axi_wdata[7:0];
+        bColBuf_0_5_5 <= s_axi_wdata[15:8];
+        bColBuf_0_5_6 <= s_axi_wdata[23:16];
+        bColBuf_0_5_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_5_8 <= s_axi_wdata[7:0];
+        bColBuf_0_5_9 <= s_axi_wdata[15:8];
+        bColBuf_0_5_10 <= s_axi_wdata[23:16];
+        bColBuf_0_5_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_5_12 <= s_axi_wdata[7:0];
+        bColBuf_0_5_13 <= s_axi_wdata[15:8];
+        bColBuf_0_5_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_39 & _GEN_27)
+        bColBuf_0_5_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_5_0 <= mem_rline[7:0];
+      bColBuf_0_5_1 <= mem_rline[15:8];
+      bColBuf_0_5_2 <= mem_rline[23:16];
+      bColBuf_0_5_3 <= mem_rline[31:24];
+      bColBuf_0_5_4 <= mem_rline[39:32];
+      bColBuf_0_5_5 <= mem_rline[47:40];
+      bColBuf_0_5_6 <= mem_rline[55:48];
+      bColBuf_0_5_7 <= mem_rline[63:56];
+      bColBuf_0_5_8 <= mem_rline[71:64];
+      bColBuf_0_5_9 <= mem_rline[79:72];
+      bColBuf_0_5_10 <= mem_rline[87:80];
+      bColBuf_0_5_11 <= mem_rline[95:88];
+      bColBuf_0_5_12 <= mem_rline[103:96];
+      bColBuf_0_5_13 <= mem_rline[111:104];
+      bColBuf_0_5_14 <= mem_rline[119:112];
+      bColBuf_0_5_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_58 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_42 & _GEN_19)
+        bColBuf_0_6_0 <= s_axi_wdata[7:0];
+      if (_GEN_42 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_6_1 <= s_axi_wdata[15:8];
+        bColBuf_0_6_2 <= s_axi_wdata[23:16];
+        bColBuf_0_6_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_6_4 <= s_axi_wdata[7:0];
+        bColBuf_0_6_5 <= s_axi_wdata[15:8];
+        bColBuf_0_6_6 <= s_axi_wdata[23:16];
+        bColBuf_0_6_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_6_8 <= s_axi_wdata[7:0];
+        bColBuf_0_6_9 <= s_axi_wdata[15:8];
+        bColBuf_0_6_10 <= s_axi_wdata[23:16];
+        bColBuf_0_6_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_6_12 <= s_axi_wdata[7:0];
+        bColBuf_0_6_13 <= s_axi_wdata[15:8];
+        bColBuf_0_6_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_41 & _GEN_27)
+        bColBuf_0_6_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_6_0 <= mem_rline[7:0];
+      bColBuf_0_6_1 <= mem_rline[15:8];
+      bColBuf_0_6_2 <= mem_rline[23:16];
+      bColBuf_0_6_3 <= mem_rline[31:24];
+      bColBuf_0_6_4 <= mem_rline[39:32];
+      bColBuf_0_6_5 <= mem_rline[47:40];
+      bColBuf_0_6_6 <= mem_rline[55:48];
+      bColBuf_0_6_7 <= mem_rline[63:56];
+      bColBuf_0_6_8 <= mem_rline[71:64];
+      bColBuf_0_6_9 <= mem_rline[79:72];
+      bColBuf_0_6_10 <= mem_rline[87:80];
+      bColBuf_0_6_11 <= mem_rline[95:88];
+      bColBuf_0_6_12 <= mem_rline[103:96];
+      bColBuf_0_6_13 <= mem_rline[111:104];
+      bColBuf_0_6_14 <= mem_rline[119:112];
+      bColBuf_0_6_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_60 & ldIdx[3] & _GEN_18)) begin
+      if (_GEN_43 & _GEN_19)
+        bColBuf_0_7_0 <= s_axi_wdata[7:0];
+      if (_GEN_43 & pushB & _GEN_18 & _GEN_14) begin
+        bColBuf_0_7_1 <= s_axi_wdata[15:8];
+        bColBuf_0_7_2 <= s_axi_wdata[23:16];
+        bColBuf_0_7_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_18 & _GEN_16) begin
+        bColBuf_0_7_4 <= s_axi_wdata[7:0];
+        bColBuf_0_7_5 <= s_axi_wdata[15:8];
+        bColBuf_0_7_6 <= s_axi_wdata[23:16];
+        bColBuf_0_7_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_18 & _GEN_17) begin
+        bColBuf_0_7_8 <= s_axi_wdata[7:0];
+        bColBuf_0_7_9 <= s_axi_wdata[15:8];
+        bColBuf_0_7_10 <= s_axi_wdata[23:16];
+        bColBuf_0_7_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_18 & (&loadK)) begin
+        bColBuf_0_7_12 <= s_axi_wdata[7:0];
+        bColBuf_0_7_13 <= s_axi_wdata[15:8];
+        bColBuf_0_7_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & (&loadLane) & _GEN_27)
+        bColBuf_0_7_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_0_7_0 <= mem_rline[7:0];
+      bColBuf_0_7_1 <= mem_rline[15:8];
+      bColBuf_0_7_2 <= mem_rline[23:16];
+      bColBuf_0_7_3 <= mem_rline[31:24];
+      bColBuf_0_7_4 <= mem_rline[39:32];
+      bColBuf_0_7_5 <= mem_rline[47:40];
+      bColBuf_0_7_6 <= mem_rline[55:48];
+      bColBuf_0_7_7 <= mem_rline[63:56];
+      bColBuf_0_7_8 <= mem_rline[71:64];
+      bColBuf_0_7_9 <= mem_rline[79:72];
+      bColBuf_0_7_10 <= mem_rline[87:80];
+      bColBuf_0_7_11 <= mem_rline[95:88];
+      bColBuf_0_7_12 <= mem_rline[103:96];
+      bColBuf_0_7_13 <= mem_rline[111:104];
+      bColBuf_0_7_14 <= mem_rline[119:112];
+      bColBuf_0_7_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_46 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_25 & _GEN_21)
+        bColBuf_1_0_0 <= s_axi_wdata[7:0];
+      if (_GEN_25 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_0_1 <= s_axi_wdata[15:8];
+        bColBuf_1_0_2 <= s_axi_wdata[23:16];
+        bColBuf_1_0_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_0_4 <= s_axi_wdata[7:0];
+        bColBuf_1_0_5 <= s_axi_wdata[15:8];
+        bColBuf_1_0_6 <= s_axi_wdata[23:16];
+        bColBuf_1_0_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_0_8 <= s_axi_wdata[7:0];
+        bColBuf_1_0_9 <= s_axi_wdata[15:8];
+        bColBuf_1_0_10 <= s_axi_wdata[23:16];
+        bColBuf_1_0_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_0_12 <= s_axi_wdata[7:0];
+        bColBuf_1_0_13 <= s_axi_wdata[15:8];
+        bColBuf_1_0_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_13 & _GEN_28)
+        bColBuf_1_0_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_0_0 <= mem_rline[7:0];
+      bColBuf_1_0_1 <= mem_rline[15:8];
+      bColBuf_1_0_2 <= mem_rline[23:16];
+      bColBuf_1_0_3 <= mem_rline[31:24];
+      bColBuf_1_0_4 <= mem_rline[39:32];
+      bColBuf_1_0_5 <= mem_rline[47:40];
+      bColBuf_1_0_6 <= mem_rline[55:48];
+      bColBuf_1_0_7 <= mem_rline[63:56];
+      bColBuf_1_0_8 <= mem_rline[71:64];
+      bColBuf_1_0_9 <= mem_rline[79:72];
+      bColBuf_1_0_10 <= mem_rline[87:80];
+      bColBuf_1_0_11 <= mem_rline[95:88];
+      bColBuf_1_0_12 <= mem_rline[103:96];
+      bColBuf_1_0_13 <= mem_rline[111:104];
+      bColBuf_1_0_14 <= mem_rline[119:112];
+      bColBuf_1_0_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_48 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_32 & _GEN_21)
+        bColBuf_1_1_0 <= s_axi_wdata[7:0];
+      if (_GEN_32 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_1_1 <= s_axi_wdata[15:8];
+        bColBuf_1_1_2 <= s_axi_wdata[23:16];
+        bColBuf_1_1_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_1_4 <= s_axi_wdata[7:0];
+        bColBuf_1_1_5 <= s_axi_wdata[15:8];
+        bColBuf_1_1_6 <= s_axi_wdata[23:16];
+        bColBuf_1_1_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_1_8 <= s_axi_wdata[7:0];
+        bColBuf_1_1_9 <= s_axi_wdata[15:8];
+        bColBuf_1_1_10 <= s_axi_wdata[23:16];
+        bColBuf_1_1_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_1_12 <= s_axi_wdata[7:0];
+        bColBuf_1_1_13 <= s_axi_wdata[15:8];
+        bColBuf_1_1_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_31 & _GEN_28)
+        bColBuf_1_1_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_1_0 <= mem_rline[7:0];
+      bColBuf_1_1_1 <= mem_rline[15:8];
+      bColBuf_1_1_2 <= mem_rline[23:16];
+      bColBuf_1_1_3 <= mem_rline[31:24];
+      bColBuf_1_1_4 <= mem_rline[39:32];
+      bColBuf_1_1_5 <= mem_rline[47:40];
+      bColBuf_1_1_6 <= mem_rline[55:48];
+      bColBuf_1_1_7 <= mem_rline[63:56];
+      bColBuf_1_1_8 <= mem_rline[71:64];
+      bColBuf_1_1_9 <= mem_rline[79:72];
+      bColBuf_1_1_10 <= mem_rline[87:80];
+      bColBuf_1_1_11 <= mem_rline[95:88];
+      bColBuf_1_1_12 <= mem_rline[103:96];
+      bColBuf_1_1_13 <= mem_rline[111:104];
+      bColBuf_1_1_14 <= mem_rline[119:112];
+      bColBuf_1_1_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_50 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_34 & _GEN_21)
+        bColBuf_1_2_0 <= s_axi_wdata[7:0];
+      if (_GEN_34 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_2_1 <= s_axi_wdata[15:8];
+        bColBuf_1_2_2 <= s_axi_wdata[23:16];
+        bColBuf_1_2_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_2_4 <= s_axi_wdata[7:0];
+        bColBuf_1_2_5 <= s_axi_wdata[15:8];
+        bColBuf_1_2_6 <= s_axi_wdata[23:16];
+        bColBuf_1_2_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_2_8 <= s_axi_wdata[7:0];
+        bColBuf_1_2_9 <= s_axi_wdata[15:8];
+        bColBuf_1_2_10 <= s_axi_wdata[23:16];
+        bColBuf_1_2_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_2_12 <= s_axi_wdata[7:0];
+        bColBuf_1_2_13 <= s_axi_wdata[15:8];
+        bColBuf_1_2_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_33 & _GEN_28)
+        bColBuf_1_2_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_2_0 <= mem_rline[7:0];
+      bColBuf_1_2_1 <= mem_rline[15:8];
+      bColBuf_1_2_2 <= mem_rline[23:16];
+      bColBuf_1_2_3 <= mem_rline[31:24];
+      bColBuf_1_2_4 <= mem_rline[39:32];
+      bColBuf_1_2_5 <= mem_rline[47:40];
+      bColBuf_1_2_6 <= mem_rline[55:48];
+      bColBuf_1_2_7 <= mem_rline[63:56];
+      bColBuf_1_2_8 <= mem_rline[71:64];
+      bColBuf_1_2_9 <= mem_rline[79:72];
+      bColBuf_1_2_10 <= mem_rline[87:80];
+      bColBuf_1_2_11 <= mem_rline[95:88];
+      bColBuf_1_2_12 <= mem_rline[103:96];
+      bColBuf_1_2_13 <= mem_rline[111:104];
+      bColBuf_1_2_14 <= mem_rline[119:112];
+      bColBuf_1_2_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_52 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_36 & _GEN_21)
+        bColBuf_1_3_0 <= s_axi_wdata[7:0];
+      if (_GEN_36 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_3_1 <= s_axi_wdata[15:8];
+        bColBuf_1_3_2 <= s_axi_wdata[23:16];
+        bColBuf_1_3_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_3_4 <= s_axi_wdata[7:0];
+        bColBuf_1_3_5 <= s_axi_wdata[15:8];
+        bColBuf_1_3_6 <= s_axi_wdata[23:16];
+        bColBuf_1_3_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_3_8 <= s_axi_wdata[7:0];
+        bColBuf_1_3_9 <= s_axi_wdata[15:8];
+        bColBuf_1_3_10 <= s_axi_wdata[23:16];
+        bColBuf_1_3_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_3_12 <= s_axi_wdata[7:0];
+        bColBuf_1_3_13 <= s_axi_wdata[15:8];
+        bColBuf_1_3_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_35 & _GEN_28)
+        bColBuf_1_3_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_3_0 <= mem_rline[7:0];
+      bColBuf_1_3_1 <= mem_rline[15:8];
+      bColBuf_1_3_2 <= mem_rline[23:16];
+      bColBuf_1_3_3 <= mem_rline[31:24];
+      bColBuf_1_3_4 <= mem_rline[39:32];
+      bColBuf_1_3_5 <= mem_rline[47:40];
+      bColBuf_1_3_6 <= mem_rline[55:48];
+      bColBuf_1_3_7 <= mem_rline[63:56];
+      bColBuf_1_3_8 <= mem_rline[71:64];
+      bColBuf_1_3_9 <= mem_rline[79:72];
+      bColBuf_1_3_10 <= mem_rline[87:80];
+      bColBuf_1_3_11 <= mem_rline[95:88];
+      bColBuf_1_3_12 <= mem_rline[103:96];
+      bColBuf_1_3_13 <= mem_rline[111:104];
+      bColBuf_1_3_14 <= mem_rline[119:112];
+      bColBuf_1_3_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_54 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_38 & _GEN_21)
+        bColBuf_1_4_0 <= s_axi_wdata[7:0];
+      if (_GEN_38 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_4_1 <= s_axi_wdata[15:8];
+        bColBuf_1_4_2 <= s_axi_wdata[23:16];
+        bColBuf_1_4_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_4_4 <= s_axi_wdata[7:0];
+        bColBuf_1_4_5 <= s_axi_wdata[15:8];
+        bColBuf_1_4_6 <= s_axi_wdata[23:16];
+        bColBuf_1_4_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_4_8 <= s_axi_wdata[7:0];
+        bColBuf_1_4_9 <= s_axi_wdata[15:8];
+        bColBuf_1_4_10 <= s_axi_wdata[23:16];
+        bColBuf_1_4_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_4_12 <= s_axi_wdata[7:0];
+        bColBuf_1_4_13 <= s_axi_wdata[15:8];
+        bColBuf_1_4_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_37 & _GEN_28)
+        bColBuf_1_4_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_4_0 <= mem_rline[7:0];
+      bColBuf_1_4_1 <= mem_rline[15:8];
+      bColBuf_1_4_2 <= mem_rline[23:16];
+      bColBuf_1_4_3 <= mem_rline[31:24];
+      bColBuf_1_4_4 <= mem_rline[39:32];
+      bColBuf_1_4_5 <= mem_rline[47:40];
+      bColBuf_1_4_6 <= mem_rline[55:48];
+      bColBuf_1_4_7 <= mem_rline[63:56];
+      bColBuf_1_4_8 <= mem_rline[71:64];
+      bColBuf_1_4_9 <= mem_rline[79:72];
+      bColBuf_1_4_10 <= mem_rline[87:80];
+      bColBuf_1_4_11 <= mem_rline[95:88];
+      bColBuf_1_4_12 <= mem_rline[103:96];
+      bColBuf_1_4_13 <= mem_rline[111:104];
+      bColBuf_1_4_14 <= mem_rline[119:112];
+      bColBuf_1_4_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_56 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_40 & _GEN_21)
+        bColBuf_1_5_0 <= s_axi_wdata[7:0];
+      if (_GEN_40 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_5_1 <= s_axi_wdata[15:8];
+        bColBuf_1_5_2 <= s_axi_wdata[23:16];
+        bColBuf_1_5_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_5_4 <= s_axi_wdata[7:0];
+        bColBuf_1_5_5 <= s_axi_wdata[15:8];
+        bColBuf_1_5_6 <= s_axi_wdata[23:16];
+        bColBuf_1_5_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_5_8 <= s_axi_wdata[7:0];
+        bColBuf_1_5_9 <= s_axi_wdata[15:8];
+        bColBuf_1_5_10 <= s_axi_wdata[23:16];
+        bColBuf_1_5_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_5_12 <= s_axi_wdata[7:0];
+        bColBuf_1_5_13 <= s_axi_wdata[15:8];
+        bColBuf_1_5_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_39 & _GEN_28)
+        bColBuf_1_5_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_5_0 <= mem_rline[7:0];
+      bColBuf_1_5_1 <= mem_rline[15:8];
+      bColBuf_1_5_2 <= mem_rline[23:16];
+      bColBuf_1_5_3 <= mem_rline[31:24];
+      bColBuf_1_5_4 <= mem_rline[39:32];
+      bColBuf_1_5_5 <= mem_rline[47:40];
+      bColBuf_1_5_6 <= mem_rline[55:48];
+      bColBuf_1_5_7 <= mem_rline[63:56];
+      bColBuf_1_5_8 <= mem_rline[71:64];
+      bColBuf_1_5_9 <= mem_rline[79:72];
+      bColBuf_1_5_10 <= mem_rline[87:80];
+      bColBuf_1_5_11 <= mem_rline[95:88];
+      bColBuf_1_5_12 <= mem_rline[103:96];
+      bColBuf_1_5_13 <= mem_rline[111:104];
+      bColBuf_1_5_14 <= mem_rline[119:112];
+      bColBuf_1_5_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_58 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_42 & _GEN_21)
+        bColBuf_1_6_0 <= s_axi_wdata[7:0];
+      if (_GEN_42 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_6_1 <= s_axi_wdata[15:8];
+        bColBuf_1_6_2 <= s_axi_wdata[23:16];
+        bColBuf_1_6_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_6_4 <= s_axi_wdata[7:0];
+        bColBuf_1_6_5 <= s_axi_wdata[15:8];
+        bColBuf_1_6_6 <= s_axi_wdata[23:16];
+        bColBuf_1_6_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_6_8 <= s_axi_wdata[7:0];
+        bColBuf_1_6_9 <= s_axi_wdata[15:8];
+        bColBuf_1_6_10 <= s_axi_wdata[23:16];
+        bColBuf_1_6_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_6_12 <= s_axi_wdata[7:0];
+        bColBuf_1_6_13 <= s_axi_wdata[15:8];
+        bColBuf_1_6_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_41 & _GEN_28)
+        bColBuf_1_6_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_6_0 <= mem_rline[7:0];
+      bColBuf_1_6_1 <= mem_rline[15:8];
+      bColBuf_1_6_2 <= mem_rline[23:16];
+      bColBuf_1_6_3 <= mem_rline[31:24];
+      bColBuf_1_6_4 <= mem_rline[39:32];
+      bColBuf_1_6_5 <= mem_rline[47:40];
+      bColBuf_1_6_6 <= mem_rline[55:48];
+      bColBuf_1_6_7 <= mem_rline[63:56];
+      bColBuf_1_6_8 <= mem_rline[71:64];
+      bColBuf_1_6_9 <= mem_rline[79:72];
+      bColBuf_1_6_10 <= mem_rline[87:80];
+      bColBuf_1_6_11 <= mem_rline[95:88];
+      bColBuf_1_6_12 <= mem_rline[103:96];
+      bColBuf_1_6_13 <= mem_rline[111:104];
+      bColBuf_1_6_14 <= mem_rline[119:112];
+      bColBuf_1_6_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_60 & ldIdx[3] & _GEN_20)) begin
+      if (_GEN_43 & _GEN_21)
+        bColBuf_1_7_0 <= s_axi_wdata[7:0];
+      if (_GEN_43 & pushB & _GEN_20 & _GEN_14) begin
+        bColBuf_1_7_1 <= s_axi_wdata[15:8];
+        bColBuf_1_7_2 <= s_axi_wdata[23:16];
+        bColBuf_1_7_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_20 & _GEN_16) begin
+        bColBuf_1_7_4 <= s_axi_wdata[7:0];
+        bColBuf_1_7_5 <= s_axi_wdata[15:8];
+        bColBuf_1_7_6 <= s_axi_wdata[23:16];
+        bColBuf_1_7_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_20 & _GEN_17) begin
+        bColBuf_1_7_8 <= s_axi_wdata[7:0];
+        bColBuf_1_7_9 <= s_axi_wdata[15:8];
+        bColBuf_1_7_10 <= s_axi_wdata[23:16];
+        bColBuf_1_7_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_20 & (&loadK)) begin
+        bColBuf_1_7_12 <= s_axi_wdata[7:0];
+        bColBuf_1_7_13 <= s_axi_wdata[15:8];
+        bColBuf_1_7_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & (&loadLane) & _GEN_28)
+        bColBuf_1_7_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_1_7_0 <= mem_rline[7:0];
+      bColBuf_1_7_1 <= mem_rline[15:8];
+      bColBuf_1_7_2 <= mem_rline[23:16];
+      bColBuf_1_7_3 <= mem_rline[31:24];
+      bColBuf_1_7_4 <= mem_rline[39:32];
+      bColBuf_1_7_5 <= mem_rline[47:40];
+      bColBuf_1_7_6 <= mem_rline[55:48];
+      bColBuf_1_7_7 <= mem_rline[63:56];
+      bColBuf_1_7_8 <= mem_rline[71:64];
+      bColBuf_1_7_9 <= mem_rline[79:72];
+      bColBuf_1_7_10 <= mem_rline[87:80];
+      bColBuf_1_7_11 <= mem_rline[95:88];
+      bColBuf_1_7_12 <= mem_rline[103:96];
+      bColBuf_1_7_13 <= mem_rline[111:104];
+      bColBuf_1_7_14 <= mem_rline[119:112];
+      bColBuf_1_7_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_46 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_25 & _GEN_23)
+        bColBuf_2_0_0 <= s_axi_wdata[7:0];
+      if (_GEN_25 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_0_1 <= s_axi_wdata[15:8];
+        bColBuf_2_0_2 <= s_axi_wdata[23:16];
+        bColBuf_2_0_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_0_4 <= s_axi_wdata[7:0];
+        bColBuf_2_0_5 <= s_axi_wdata[15:8];
+        bColBuf_2_0_6 <= s_axi_wdata[23:16];
+        bColBuf_2_0_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_0_8 <= s_axi_wdata[7:0];
+        bColBuf_2_0_9 <= s_axi_wdata[15:8];
+        bColBuf_2_0_10 <= s_axi_wdata[23:16];
+        bColBuf_2_0_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_0_12 <= s_axi_wdata[7:0];
+        bColBuf_2_0_13 <= s_axi_wdata[15:8];
+        bColBuf_2_0_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_13 & _GEN_29)
+        bColBuf_2_0_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_0_0 <= mem_rline[7:0];
+      bColBuf_2_0_1 <= mem_rline[15:8];
+      bColBuf_2_0_2 <= mem_rline[23:16];
+      bColBuf_2_0_3 <= mem_rline[31:24];
+      bColBuf_2_0_4 <= mem_rline[39:32];
+      bColBuf_2_0_5 <= mem_rline[47:40];
+      bColBuf_2_0_6 <= mem_rline[55:48];
+      bColBuf_2_0_7 <= mem_rline[63:56];
+      bColBuf_2_0_8 <= mem_rline[71:64];
+      bColBuf_2_0_9 <= mem_rline[79:72];
+      bColBuf_2_0_10 <= mem_rline[87:80];
+      bColBuf_2_0_11 <= mem_rline[95:88];
+      bColBuf_2_0_12 <= mem_rline[103:96];
+      bColBuf_2_0_13 <= mem_rline[111:104];
+      bColBuf_2_0_14 <= mem_rline[119:112];
+      bColBuf_2_0_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_48 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_32 & _GEN_23)
+        bColBuf_2_1_0 <= s_axi_wdata[7:0];
+      if (_GEN_32 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_1_1 <= s_axi_wdata[15:8];
+        bColBuf_2_1_2 <= s_axi_wdata[23:16];
+        bColBuf_2_1_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_1_4 <= s_axi_wdata[7:0];
+        bColBuf_2_1_5 <= s_axi_wdata[15:8];
+        bColBuf_2_1_6 <= s_axi_wdata[23:16];
+        bColBuf_2_1_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_1_8 <= s_axi_wdata[7:0];
+        bColBuf_2_1_9 <= s_axi_wdata[15:8];
+        bColBuf_2_1_10 <= s_axi_wdata[23:16];
+        bColBuf_2_1_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_1_12 <= s_axi_wdata[7:0];
+        bColBuf_2_1_13 <= s_axi_wdata[15:8];
+        bColBuf_2_1_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_31 & _GEN_29)
+        bColBuf_2_1_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_1_0 <= mem_rline[7:0];
+      bColBuf_2_1_1 <= mem_rline[15:8];
+      bColBuf_2_1_2 <= mem_rline[23:16];
+      bColBuf_2_1_3 <= mem_rline[31:24];
+      bColBuf_2_1_4 <= mem_rline[39:32];
+      bColBuf_2_1_5 <= mem_rline[47:40];
+      bColBuf_2_1_6 <= mem_rline[55:48];
+      bColBuf_2_1_7 <= mem_rline[63:56];
+      bColBuf_2_1_8 <= mem_rline[71:64];
+      bColBuf_2_1_9 <= mem_rline[79:72];
+      bColBuf_2_1_10 <= mem_rline[87:80];
+      bColBuf_2_1_11 <= mem_rline[95:88];
+      bColBuf_2_1_12 <= mem_rline[103:96];
+      bColBuf_2_1_13 <= mem_rline[111:104];
+      bColBuf_2_1_14 <= mem_rline[119:112];
+      bColBuf_2_1_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_50 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_34 & _GEN_23)
+        bColBuf_2_2_0 <= s_axi_wdata[7:0];
+      if (_GEN_34 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_2_1 <= s_axi_wdata[15:8];
+        bColBuf_2_2_2 <= s_axi_wdata[23:16];
+        bColBuf_2_2_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_2_4 <= s_axi_wdata[7:0];
+        bColBuf_2_2_5 <= s_axi_wdata[15:8];
+        bColBuf_2_2_6 <= s_axi_wdata[23:16];
+        bColBuf_2_2_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_2_8 <= s_axi_wdata[7:0];
+        bColBuf_2_2_9 <= s_axi_wdata[15:8];
+        bColBuf_2_2_10 <= s_axi_wdata[23:16];
+        bColBuf_2_2_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_2_12 <= s_axi_wdata[7:0];
+        bColBuf_2_2_13 <= s_axi_wdata[15:8];
+        bColBuf_2_2_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_33 & _GEN_29)
+        bColBuf_2_2_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_2_0 <= mem_rline[7:0];
+      bColBuf_2_2_1 <= mem_rline[15:8];
+      bColBuf_2_2_2 <= mem_rline[23:16];
+      bColBuf_2_2_3 <= mem_rline[31:24];
+      bColBuf_2_2_4 <= mem_rline[39:32];
+      bColBuf_2_2_5 <= mem_rline[47:40];
+      bColBuf_2_2_6 <= mem_rline[55:48];
+      bColBuf_2_2_7 <= mem_rline[63:56];
+      bColBuf_2_2_8 <= mem_rline[71:64];
+      bColBuf_2_2_9 <= mem_rline[79:72];
+      bColBuf_2_2_10 <= mem_rline[87:80];
+      bColBuf_2_2_11 <= mem_rline[95:88];
+      bColBuf_2_2_12 <= mem_rline[103:96];
+      bColBuf_2_2_13 <= mem_rline[111:104];
+      bColBuf_2_2_14 <= mem_rline[119:112];
+      bColBuf_2_2_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_52 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_36 & _GEN_23)
+        bColBuf_2_3_0 <= s_axi_wdata[7:0];
+      if (_GEN_36 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_3_1 <= s_axi_wdata[15:8];
+        bColBuf_2_3_2 <= s_axi_wdata[23:16];
+        bColBuf_2_3_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_3_4 <= s_axi_wdata[7:0];
+        bColBuf_2_3_5 <= s_axi_wdata[15:8];
+        bColBuf_2_3_6 <= s_axi_wdata[23:16];
+        bColBuf_2_3_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_3_8 <= s_axi_wdata[7:0];
+        bColBuf_2_3_9 <= s_axi_wdata[15:8];
+        bColBuf_2_3_10 <= s_axi_wdata[23:16];
+        bColBuf_2_3_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_3_12 <= s_axi_wdata[7:0];
+        bColBuf_2_3_13 <= s_axi_wdata[15:8];
+        bColBuf_2_3_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_35 & _GEN_29)
+        bColBuf_2_3_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_3_0 <= mem_rline[7:0];
+      bColBuf_2_3_1 <= mem_rline[15:8];
+      bColBuf_2_3_2 <= mem_rline[23:16];
+      bColBuf_2_3_3 <= mem_rline[31:24];
+      bColBuf_2_3_4 <= mem_rline[39:32];
+      bColBuf_2_3_5 <= mem_rline[47:40];
+      bColBuf_2_3_6 <= mem_rline[55:48];
+      bColBuf_2_3_7 <= mem_rline[63:56];
+      bColBuf_2_3_8 <= mem_rline[71:64];
+      bColBuf_2_3_9 <= mem_rline[79:72];
+      bColBuf_2_3_10 <= mem_rline[87:80];
+      bColBuf_2_3_11 <= mem_rline[95:88];
+      bColBuf_2_3_12 <= mem_rline[103:96];
+      bColBuf_2_3_13 <= mem_rline[111:104];
+      bColBuf_2_3_14 <= mem_rline[119:112];
+      bColBuf_2_3_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_54 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_38 & _GEN_23)
+        bColBuf_2_4_0 <= s_axi_wdata[7:0];
+      if (_GEN_38 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_4_1 <= s_axi_wdata[15:8];
+        bColBuf_2_4_2 <= s_axi_wdata[23:16];
+        bColBuf_2_4_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_4_4 <= s_axi_wdata[7:0];
+        bColBuf_2_4_5 <= s_axi_wdata[15:8];
+        bColBuf_2_4_6 <= s_axi_wdata[23:16];
+        bColBuf_2_4_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_4_8 <= s_axi_wdata[7:0];
+        bColBuf_2_4_9 <= s_axi_wdata[15:8];
+        bColBuf_2_4_10 <= s_axi_wdata[23:16];
+        bColBuf_2_4_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_4_12 <= s_axi_wdata[7:0];
+        bColBuf_2_4_13 <= s_axi_wdata[15:8];
+        bColBuf_2_4_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_37 & _GEN_29)
+        bColBuf_2_4_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_4_0 <= mem_rline[7:0];
+      bColBuf_2_4_1 <= mem_rline[15:8];
+      bColBuf_2_4_2 <= mem_rline[23:16];
+      bColBuf_2_4_3 <= mem_rline[31:24];
+      bColBuf_2_4_4 <= mem_rline[39:32];
+      bColBuf_2_4_5 <= mem_rline[47:40];
+      bColBuf_2_4_6 <= mem_rline[55:48];
+      bColBuf_2_4_7 <= mem_rline[63:56];
+      bColBuf_2_4_8 <= mem_rline[71:64];
+      bColBuf_2_4_9 <= mem_rline[79:72];
+      bColBuf_2_4_10 <= mem_rline[87:80];
+      bColBuf_2_4_11 <= mem_rline[95:88];
+      bColBuf_2_4_12 <= mem_rline[103:96];
+      bColBuf_2_4_13 <= mem_rline[111:104];
+      bColBuf_2_4_14 <= mem_rline[119:112];
+      bColBuf_2_4_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_56 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_40 & _GEN_23)
+        bColBuf_2_5_0 <= s_axi_wdata[7:0];
+      if (_GEN_40 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_5_1 <= s_axi_wdata[15:8];
+        bColBuf_2_5_2 <= s_axi_wdata[23:16];
+        bColBuf_2_5_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_5_4 <= s_axi_wdata[7:0];
+        bColBuf_2_5_5 <= s_axi_wdata[15:8];
+        bColBuf_2_5_6 <= s_axi_wdata[23:16];
+        bColBuf_2_5_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_5_8 <= s_axi_wdata[7:0];
+        bColBuf_2_5_9 <= s_axi_wdata[15:8];
+        bColBuf_2_5_10 <= s_axi_wdata[23:16];
+        bColBuf_2_5_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_5_12 <= s_axi_wdata[7:0];
+        bColBuf_2_5_13 <= s_axi_wdata[15:8];
+        bColBuf_2_5_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_39 & _GEN_29)
+        bColBuf_2_5_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_5_0 <= mem_rline[7:0];
+      bColBuf_2_5_1 <= mem_rline[15:8];
+      bColBuf_2_5_2 <= mem_rline[23:16];
+      bColBuf_2_5_3 <= mem_rline[31:24];
+      bColBuf_2_5_4 <= mem_rline[39:32];
+      bColBuf_2_5_5 <= mem_rline[47:40];
+      bColBuf_2_5_6 <= mem_rline[55:48];
+      bColBuf_2_5_7 <= mem_rline[63:56];
+      bColBuf_2_5_8 <= mem_rline[71:64];
+      bColBuf_2_5_9 <= mem_rline[79:72];
+      bColBuf_2_5_10 <= mem_rline[87:80];
+      bColBuf_2_5_11 <= mem_rline[95:88];
+      bColBuf_2_5_12 <= mem_rline[103:96];
+      bColBuf_2_5_13 <= mem_rline[111:104];
+      bColBuf_2_5_14 <= mem_rline[119:112];
+      bColBuf_2_5_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_58 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_42 & _GEN_23)
+        bColBuf_2_6_0 <= s_axi_wdata[7:0];
+      if (_GEN_42 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_6_1 <= s_axi_wdata[15:8];
+        bColBuf_2_6_2 <= s_axi_wdata[23:16];
+        bColBuf_2_6_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_6_4 <= s_axi_wdata[7:0];
+        bColBuf_2_6_5 <= s_axi_wdata[15:8];
+        bColBuf_2_6_6 <= s_axi_wdata[23:16];
+        bColBuf_2_6_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_6_8 <= s_axi_wdata[7:0];
+        bColBuf_2_6_9 <= s_axi_wdata[15:8];
+        bColBuf_2_6_10 <= s_axi_wdata[23:16];
+        bColBuf_2_6_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_6_12 <= s_axi_wdata[7:0];
+        bColBuf_2_6_13 <= s_axi_wdata[15:8];
+        bColBuf_2_6_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_41 & _GEN_29)
+        bColBuf_2_6_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_6_0 <= mem_rline[7:0];
+      bColBuf_2_6_1 <= mem_rline[15:8];
+      bColBuf_2_6_2 <= mem_rline[23:16];
+      bColBuf_2_6_3 <= mem_rline[31:24];
+      bColBuf_2_6_4 <= mem_rline[39:32];
+      bColBuf_2_6_5 <= mem_rline[47:40];
+      bColBuf_2_6_6 <= mem_rline[55:48];
+      bColBuf_2_6_7 <= mem_rline[63:56];
+      bColBuf_2_6_8 <= mem_rline[71:64];
+      bColBuf_2_6_9 <= mem_rline[79:72];
+      bColBuf_2_6_10 <= mem_rline[87:80];
+      bColBuf_2_6_11 <= mem_rline[95:88];
+      bColBuf_2_6_12 <= mem_rline[103:96];
+      bColBuf_2_6_13 <= mem_rline[111:104];
+      bColBuf_2_6_14 <= mem_rline[119:112];
+      bColBuf_2_6_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_60 & ldIdx[3] & _GEN_22)) begin
+      if (_GEN_43 & _GEN_23)
+        bColBuf_2_7_0 <= s_axi_wdata[7:0];
+      if (_GEN_43 & pushB & _GEN_22 & _GEN_14) begin
+        bColBuf_2_7_1 <= s_axi_wdata[15:8];
+        bColBuf_2_7_2 <= s_axi_wdata[23:16];
+        bColBuf_2_7_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_22 & _GEN_16) begin
+        bColBuf_2_7_4 <= s_axi_wdata[7:0];
+        bColBuf_2_7_5 <= s_axi_wdata[15:8];
+        bColBuf_2_7_6 <= s_axi_wdata[23:16];
+        bColBuf_2_7_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_22 & _GEN_17) begin
+        bColBuf_2_7_8 <= s_axi_wdata[7:0];
+        bColBuf_2_7_9 <= s_axi_wdata[15:8];
+        bColBuf_2_7_10 <= s_axi_wdata[23:16];
+        bColBuf_2_7_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & _GEN_22 & (&loadK)) begin
+        bColBuf_2_7_12 <= s_axi_wdata[7:0];
+        bColBuf_2_7_13 <= s_axi_wdata[15:8];
+        bColBuf_2_7_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & (&loadLane) & _GEN_29)
+        bColBuf_2_7_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_2_7_0 <= mem_rline[7:0];
+      bColBuf_2_7_1 <= mem_rline[15:8];
+      bColBuf_2_7_2 <= mem_rline[23:16];
+      bColBuf_2_7_3 <= mem_rline[31:24];
+      bColBuf_2_7_4 <= mem_rline[39:32];
+      bColBuf_2_7_5 <= mem_rline[47:40];
+      bColBuf_2_7_6 <= mem_rline[55:48];
+      bColBuf_2_7_7 <= mem_rline[63:56];
+      bColBuf_2_7_8 <= mem_rline[71:64];
+      bColBuf_2_7_9 <= mem_rline[79:72];
+      bColBuf_2_7_10 <= mem_rline[87:80];
+      bColBuf_2_7_11 <= mem_rline[95:88];
+      bColBuf_2_7_12 <= mem_rline[103:96];
+      bColBuf_2_7_13 <= mem_rline[111:104];
+      bColBuf_2_7_14 <= mem_rline[119:112];
+      bColBuf_2_7_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_46 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_25 & _GEN_24)
+        bColBuf_3_0_0 <= s_axi_wdata[7:0];
+      if (_GEN_25 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_0_1 <= s_axi_wdata[15:8];
+        bColBuf_3_0_2 <= s_axi_wdata[23:16];
+        bColBuf_3_0_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_0_4 <= s_axi_wdata[7:0];
+        bColBuf_3_0_5 <= s_axi_wdata[15:8];
+        bColBuf_3_0_6 <= s_axi_wdata[23:16];
+        bColBuf_3_0_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_0_8 <= s_axi_wdata[7:0];
+        bColBuf_3_0_9 <= s_axi_wdata[15:8];
+        bColBuf_3_0_10 <= s_axi_wdata[23:16];
+        bColBuf_3_0_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_25 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_0_12 <= s_axi_wdata[7:0];
+        bColBuf_3_0_13 <= s_axi_wdata[15:8];
+        bColBuf_3_0_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_13 & _GEN_30)
+        bColBuf_3_0_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_0_0 <= mem_rline[7:0];
+      bColBuf_3_0_1 <= mem_rline[15:8];
+      bColBuf_3_0_2 <= mem_rline[23:16];
+      bColBuf_3_0_3 <= mem_rline[31:24];
+      bColBuf_3_0_4 <= mem_rline[39:32];
+      bColBuf_3_0_5 <= mem_rline[47:40];
+      bColBuf_3_0_6 <= mem_rline[55:48];
+      bColBuf_3_0_7 <= mem_rline[63:56];
+      bColBuf_3_0_8 <= mem_rline[71:64];
+      bColBuf_3_0_9 <= mem_rline[79:72];
+      bColBuf_3_0_10 <= mem_rline[87:80];
+      bColBuf_3_0_11 <= mem_rline[95:88];
+      bColBuf_3_0_12 <= mem_rline[103:96];
+      bColBuf_3_0_13 <= mem_rline[111:104];
+      bColBuf_3_0_14 <= mem_rline[119:112];
+      bColBuf_3_0_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_48 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_32 & _GEN_24)
+        bColBuf_3_1_0 <= s_axi_wdata[7:0];
+      if (_GEN_32 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_1_1 <= s_axi_wdata[15:8];
+        bColBuf_3_1_2 <= s_axi_wdata[23:16];
+        bColBuf_3_1_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_1_4 <= s_axi_wdata[7:0];
+        bColBuf_3_1_5 <= s_axi_wdata[15:8];
+        bColBuf_3_1_6 <= s_axi_wdata[23:16];
+        bColBuf_3_1_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_1_8 <= s_axi_wdata[7:0];
+        bColBuf_3_1_9 <= s_axi_wdata[15:8];
+        bColBuf_3_1_10 <= s_axi_wdata[23:16];
+        bColBuf_3_1_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_32 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_1_12 <= s_axi_wdata[7:0];
+        bColBuf_3_1_13 <= s_axi_wdata[15:8];
+        bColBuf_3_1_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_31 & _GEN_30)
+        bColBuf_3_1_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_1_0 <= mem_rline[7:0];
+      bColBuf_3_1_1 <= mem_rline[15:8];
+      bColBuf_3_1_2 <= mem_rline[23:16];
+      bColBuf_3_1_3 <= mem_rline[31:24];
+      bColBuf_3_1_4 <= mem_rline[39:32];
+      bColBuf_3_1_5 <= mem_rline[47:40];
+      bColBuf_3_1_6 <= mem_rline[55:48];
+      bColBuf_3_1_7 <= mem_rline[63:56];
+      bColBuf_3_1_8 <= mem_rline[71:64];
+      bColBuf_3_1_9 <= mem_rline[79:72];
+      bColBuf_3_1_10 <= mem_rline[87:80];
+      bColBuf_3_1_11 <= mem_rline[95:88];
+      bColBuf_3_1_12 <= mem_rline[103:96];
+      bColBuf_3_1_13 <= mem_rline[111:104];
+      bColBuf_3_1_14 <= mem_rline[119:112];
+      bColBuf_3_1_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_50 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_34 & _GEN_24)
+        bColBuf_3_2_0 <= s_axi_wdata[7:0];
+      if (_GEN_34 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_2_1 <= s_axi_wdata[15:8];
+        bColBuf_3_2_2 <= s_axi_wdata[23:16];
+        bColBuf_3_2_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_2_4 <= s_axi_wdata[7:0];
+        bColBuf_3_2_5 <= s_axi_wdata[15:8];
+        bColBuf_3_2_6 <= s_axi_wdata[23:16];
+        bColBuf_3_2_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_2_8 <= s_axi_wdata[7:0];
+        bColBuf_3_2_9 <= s_axi_wdata[15:8];
+        bColBuf_3_2_10 <= s_axi_wdata[23:16];
+        bColBuf_3_2_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_34 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_2_12 <= s_axi_wdata[7:0];
+        bColBuf_3_2_13 <= s_axi_wdata[15:8];
+        bColBuf_3_2_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_33 & _GEN_30)
+        bColBuf_3_2_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_2_0 <= mem_rline[7:0];
+      bColBuf_3_2_1 <= mem_rline[15:8];
+      bColBuf_3_2_2 <= mem_rline[23:16];
+      bColBuf_3_2_3 <= mem_rline[31:24];
+      bColBuf_3_2_4 <= mem_rline[39:32];
+      bColBuf_3_2_5 <= mem_rline[47:40];
+      bColBuf_3_2_6 <= mem_rline[55:48];
+      bColBuf_3_2_7 <= mem_rline[63:56];
+      bColBuf_3_2_8 <= mem_rline[71:64];
+      bColBuf_3_2_9 <= mem_rline[79:72];
+      bColBuf_3_2_10 <= mem_rline[87:80];
+      bColBuf_3_2_11 <= mem_rline[95:88];
+      bColBuf_3_2_12 <= mem_rline[103:96];
+      bColBuf_3_2_13 <= mem_rline[111:104];
+      bColBuf_3_2_14 <= mem_rline[119:112];
+      bColBuf_3_2_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_52 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_36 & _GEN_24)
+        bColBuf_3_3_0 <= s_axi_wdata[7:0];
+      if (_GEN_36 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_3_1 <= s_axi_wdata[15:8];
+        bColBuf_3_3_2 <= s_axi_wdata[23:16];
+        bColBuf_3_3_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_3_4 <= s_axi_wdata[7:0];
+        bColBuf_3_3_5 <= s_axi_wdata[15:8];
+        bColBuf_3_3_6 <= s_axi_wdata[23:16];
+        bColBuf_3_3_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_3_8 <= s_axi_wdata[7:0];
+        bColBuf_3_3_9 <= s_axi_wdata[15:8];
+        bColBuf_3_3_10 <= s_axi_wdata[23:16];
+        bColBuf_3_3_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_36 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_3_12 <= s_axi_wdata[7:0];
+        bColBuf_3_3_13 <= s_axi_wdata[15:8];
+        bColBuf_3_3_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_35 & _GEN_30)
+        bColBuf_3_3_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_3_0 <= mem_rline[7:0];
+      bColBuf_3_3_1 <= mem_rline[15:8];
+      bColBuf_3_3_2 <= mem_rline[23:16];
+      bColBuf_3_3_3 <= mem_rline[31:24];
+      bColBuf_3_3_4 <= mem_rline[39:32];
+      bColBuf_3_3_5 <= mem_rline[47:40];
+      bColBuf_3_3_6 <= mem_rline[55:48];
+      bColBuf_3_3_7 <= mem_rline[63:56];
+      bColBuf_3_3_8 <= mem_rline[71:64];
+      bColBuf_3_3_9 <= mem_rline[79:72];
+      bColBuf_3_3_10 <= mem_rline[87:80];
+      bColBuf_3_3_11 <= mem_rline[95:88];
+      bColBuf_3_3_12 <= mem_rline[103:96];
+      bColBuf_3_3_13 <= mem_rline[111:104];
+      bColBuf_3_3_14 <= mem_rline[119:112];
+      bColBuf_3_3_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_54 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_38 & _GEN_24)
+        bColBuf_3_4_0 <= s_axi_wdata[7:0];
+      if (_GEN_38 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_4_1 <= s_axi_wdata[15:8];
+        bColBuf_3_4_2 <= s_axi_wdata[23:16];
+        bColBuf_3_4_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_4_4 <= s_axi_wdata[7:0];
+        bColBuf_3_4_5 <= s_axi_wdata[15:8];
+        bColBuf_3_4_6 <= s_axi_wdata[23:16];
+        bColBuf_3_4_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_4_8 <= s_axi_wdata[7:0];
+        bColBuf_3_4_9 <= s_axi_wdata[15:8];
+        bColBuf_3_4_10 <= s_axi_wdata[23:16];
+        bColBuf_3_4_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_38 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_4_12 <= s_axi_wdata[7:0];
+        bColBuf_3_4_13 <= s_axi_wdata[15:8];
+        bColBuf_3_4_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_37 & _GEN_30)
+        bColBuf_3_4_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_4_0 <= mem_rline[7:0];
+      bColBuf_3_4_1 <= mem_rline[15:8];
+      bColBuf_3_4_2 <= mem_rline[23:16];
+      bColBuf_3_4_3 <= mem_rline[31:24];
+      bColBuf_3_4_4 <= mem_rline[39:32];
+      bColBuf_3_4_5 <= mem_rline[47:40];
+      bColBuf_3_4_6 <= mem_rline[55:48];
+      bColBuf_3_4_7 <= mem_rline[63:56];
+      bColBuf_3_4_8 <= mem_rline[71:64];
+      bColBuf_3_4_9 <= mem_rline[79:72];
+      bColBuf_3_4_10 <= mem_rline[87:80];
+      bColBuf_3_4_11 <= mem_rline[95:88];
+      bColBuf_3_4_12 <= mem_rline[103:96];
+      bColBuf_3_4_13 <= mem_rline[111:104];
+      bColBuf_3_4_14 <= mem_rline[119:112];
+      bColBuf_3_4_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_56 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_40 & _GEN_24)
+        bColBuf_3_5_0 <= s_axi_wdata[7:0];
+      if (_GEN_40 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_5_1 <= s_axi_wdata[15:8];
+        bColBuf_3_5_2 <= s_axi_wdata[23:16];
+        bColBuf_3_5_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_5_4 <= s_axi_wdata[7:0];
+        bColBuf_3_5_5 <= s_axi_wdata[15:8];
+        bColBuf_3_5_6 <= s_axi_wdata[23:16];
+        bColBuf_3_5_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_5_8 <= s_axi_wdata[7:0];
+        bColBuf_3_5_9 <= s_axi_wdata[15:8];
+        bColBuf_3_5_10 <= s_axi_wdata[23:16];
+        bColBuf_3_5_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_40 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_5_12 <= s_axi_wdata[7:0];
+        bColBuf_3_5_13 <= s_axi_wdata[15:8];
+        bColBuf_3_5_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_39 & _GEN_30)
+        bColBuf_3_5_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_5_0 <= mem_rline[7:0];
+      bColBuf_3_5_1 <= mem_rline[15:8];
+      bColBuf_3_5_2 <= mem_rline[23:16];
+      bColBuf_3_5_3 <= mem_rline[31:24];
+      bColBuf_3_5_4 <= mem_rline[39:32];
+      bColBuf_3_5_5 <= mem_rline[47:40];
+      bColBuf_3_5_6 <= mem_rline[55:48];
+      bColBuf_3_5_7 <= mem_rline[63:56];
+      bColBuf_3_5_8 <= mem_rline[71:64];
+      bColBuf_3_5_9 <= mem_rline[79:72];
+      bColBuf_3_5_10 <= mem_rline[87:80];
+      bColBuf_3_5_11 <= mem_rline[95:88];
+      bColBuf_3_5_12 <= mem_rline[103:96];
+      bColBuf_3_5_13 <= mem_rline[111:104];
+      bColBuf_3_5_14 <= mem_rline[119:112];
+      bColBuf_3_5_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_58 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_42 & _GEN_24)
+        bColBuf_3_6_0 <= s_axi_wdata[7:0];
+      if (_GEN_42 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_6_1 <= s_axi_wdata[15:8];
+        bColBuf_3_6_2 <= s_axi_wdata[23:16];
+        bColBuf_3_6_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_6_4 <= s_axi_wdata[7:0];
+        bColBuf_3_6_5 <= s_axi_wdata[15:8];
+        bColBuf_3_6_6 <= s_axi_wdata[23:16];
+        bColBuf_3_6_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_6_8 <= s_axi_wdata[7:0];
+        bColBuf_3_6_9 <= s_axi_wdata[15:8];
+        bColBuf_3_6_10 <= s_axi_wdata[23:16];
+        bColBuf_3_6_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_42 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_6_12 <= s_axi_wdata[7:0];
+        bColBuf_3_6_13 <= s_axi_wdata[15:8];
+        bColBuf_3_6_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & _GEN_41 & _GEN_30)
+        bColBuf_3_6_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_6_0 <= mem_rline[7:0];
+      bColBuf_3_6_1 <= mem_rline[15:8];
+      bColBuf_3_6_2 <= mem_rline[23:16];
+      bColBuf_3_6_3 <= mem_rline[31:24];
+      bColBuf_3_6_4 <= mem_rline[39:32];
+      bColBuf_3_6_5 <= mem_rline[47:40];
+      bColBuf_3_6_6 <= mem_rline[55:48];
+      bColBuf_3_6_7 <= mem_rline[63:56];
+      bColBuf_3_6_8 <= mem_rline[71:64];
+      bColBuf_3_6_9 <= mem_rline[79:72];
+      bColBuf_3_6_10 <= mem_rline[87:80];
+      bColBuf_3_6_11 <= mem_rline[95:88];
+      bColBuf_3_6_12 <= mem_rline[103:96];
+      bColBuf_3_6_13 <= mem_rline[111:104];
+      bColBuf_3_6_14 <= mem_rline[119:112];
+      bColBuf_3_6_15 <= mem_rline[127:120];
+    end
+    if (_GEN_44 | ~(_GEN_60 & ldIdx[3] & (&bPanelLoad))) begin
+      if (_GEN_43 & _GEN_24)
+        bColBuf_3_7_0 <= s_axi_wdata[7:0];
+      if (_GEN_43 & pushB & (&bPanelLoad) & _GEN_14) begin
+        bColBuf_3_7_1 <= s_axi_wdata[15:8];
+        bColBuf_3_7_2 <= s_axi_wdata[23:16];
+        bColBuf_3_7_3 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & (&bPanelLoad) & _GEN_16) begin
+        bColBuf_3_7_4 <= s_axi_wdata[7:0];
+        bColBuf_3_7_5 <= s_axi_wdata[15:8];
+        bColBuf_3_7_6 <= s_axi_wdata[23:16];
+        bColBuf_3_7_7 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & (&bPanelLoad) & _GEN_17) begin
+        bColBuf_3_7_8 <= s_axi_wdata[7:0];
+        bColBuf_3_7_9 <= s_axi_wdata[15:8];
+        bColBuf_3_7_10 <= s_axi_wdata[23:16];
+        bColBuf_3_7_11 <= s_axi_wdata[31:24];
+      end
+      if (_GEN_43 & pushB & (&bPanelLoad) & (&loadK)) begin
+        bColBuf_3_7_12 <= s_axi_wdata[7:0];
+        bColBuf_3_7_13 <= s_axi_wdata[15:8];
+        bColBuf_3_7_14 <= s_axi_wdata[23:16];
+      end
+      if (_GEN_12 & (&loadLane) & _GEN_30)
+        bColBuf_3_7_15 <= s_axi_wdata[31:24];
+    end
+    else begin
+      bColBuf_3_7_0 <= mem_rline[7:0];
+      bColBuf_3_7_1 <= mem_rline[15:8];
+      bColBuf_3_7_2 <= mem_rline[23:16];
+      bColBuf_3_7_3 <= mem_rline[31:24];
+      bColBuf_3_7_4 <= mem_rline[39:32];
+      bColBuf_3_7_5 <= mem_rline[47:40];
+      bColBuf_3_7_6 <= mem_rline[55:48];
+      bColBuf_3_7_7 <= mem_rline[63:56];
+      bColBuf_3_7_8 <= mem_rline[71:64];
+      bColBuf_3_7_9 <= mem_rline[79:72];
+      bColBuf_3_7_10 <= mem_rline[87:80];
+      bColBuf_3_7_11 <= mem_rline[95:88];
+      bColBuf_3_7_12 <= mem_rline[103:96];
+      bColBuf_3_7_13 <= mem_rline[111:104];
+      bColBuf_3_7_14 <= mem_rline[119:112];
+      bColBuf_3_7_15 <= mem_rline[127:120];
     end
     rowLineReg_0 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_0_7_io_acc, _pes_0_6_io_acc, _pes_0_5_io_acc, _pes_0_4_io_acc}
         : {_pes_0_3_io_acc, _pes_0_2_io_acc, _pes_0_1_io_acc, _pes_0_0_io_acc};
     rowLineReg_1 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_1_7_io_acc, _pes_1_6_io_acc, _pes_1_5_io_acc, _pes_1_4_io_acc}
         : {_pes_1_3_io_acc, _pes_1_2_io_acc, _pes_1_1_io_acc, _pes_1_0_io_acc};
     rowLineReg_2 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_2_7_io_acc, _pes_2_6_io_acc, _pes_2_5_io_acc, _pes_2_4_io_acc}
         : {_pes_2_3_io_acc, _pes_2_2_io_acc, _pes_2_1_io_acc, _pes_2_0_io_acc};
     rowLineReg_3 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_3_7_io_acc, _pes_3_6_io_acc, _pes_3_5_io_acc, _pes_3_4_io_acc}
         : {_pes_3_3_io_acc, _pes_3_2_io_acc, _pes_3_1_io_acc, _pes_3_0_io_acc};
     rowLineReg_4 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_4_7_io_acc, _pes_4_6_io_acc, _pes_4_5_io_acc, _pes_4_4_io_acc}
         : {_pes_4_3_io_acc, _pes_4_2_io_acc, _pes_4_1_io_acc, _pes_4_0_io_acc};
     rowLineReg_5 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_5_7_io_acc, _pes_5_6_io_acc, _pes_5_5_io_acc, _pes_5_4_io_acc}
         : {_pes_5_3_io_acc, _pes_5_2_io_acc, _pes_5_1_io_acc, _pes_5_0_io_acc};
     rowLineReg_6 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_6_7_io_acc, _pes_6_6_io_acc, _pes_6_5_io_acc, _pes_6_4_io_acc}
         : {_pes_6_3_io_acc, _pes_6_2_io_acc, _pes_6_1_io_acc, _pes_6_0_io_acc};
     rowLineReg_7 <=
-      dmaGrp[0]
+      fillGrp[0]
         ? {_pes_7_7_io_acc, _pes_7_6_io_acc, _pes_7_5_io_acc, _pes_7_4_io_acc}
         : {_pes_7_3_io_acc, _pes_7_2_io_acc, _pes_7_1_io_acc, _pes_7_0_io_acc};
-    rowSelReg_0 <= casez_tmp_0;
-    rowSelReg_1 <= casez_tmp_1;
-    rowSelReg_2 <= casez_tmp_2;
-    rowSelReg_3 <= casez_tmp_3;
-    rowSelReg_4 <= casez_tmp_4;
-    rowSelReg_5 <= casez_tmp_5;
-    rowSelReg_6 <= casez_tmp_6;
-    rowSelReg_7 <= casez_tmp_7;
+    rowSelReg_0 <= casez_tmp_48;
+    rowSelReg_1 <= casez_tmp_49;
+    rowSelReg_2 <= casez_tmp_50;
+    rowSelReg_3 <= casez_tmp_51;
+    rowSelReg_4 <= casez_tmp_52;
+    rowSelReg_5 <= casez_tmp_53;
+    rowSelReg_6 <= casez_tmp_54;
+    rowSelReg_7 <= casez_tmp_55;
   end // always @(posedge)
-  mem_16x8 aRowBuf_0_ext (
-    .R0_addr (t[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_0_ext_R0_data),
-    .W0_addr (addr_3),
-    .W0_en   (_GEN_2),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_2),
-    .W1_en   (_GEN_2),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_1),
-    .W2_en   (_GEN_2),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr),
-    .W3_en   (_GEN_2),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 aRowBuf_1_ext (
-    .R0_addr (_kIdx_T_4[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_1_ext_R0_data),
-    .W0_addr (addr_4),
-    .W0_en   (_GEN_5),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[7:0]),
-    .W1_addr (addr_7),
-    .W1_en   (_GEN_5),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[31:24]),
-    .W2_addr (addr_6),
-    .W2_en   (_GEN_5),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[23:16]),
-    .W3_addr (addr_5),
-    .W3_en   (_GEN_5),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[15:8])
-  );
-  mem_16x8 aRowBuf_2_ext (
-    .R0_addr (_kIdx_T_7[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_2_ext_R0_data),
-    .W0_addr (addr_11),
-    .W0_en   (_GEN_8),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_10),
-    .W1_en   (_GEN_8),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_9),
-    .W2_en   (_GEN_8),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_8),
-    .W3_en   (_GEN_8),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 aRowBuf_3_ext (
-    .R0_addr (_kIdx_T_10[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_3_ext_R0_data),
-    .W0_addr (addr_15),
-    .W0_en   (_GEN_11),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_14),
-    .W1_en   (_GEN_11),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_13),
-    .W2_en   (_GEN_11),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_12),
-    .W3_en   (_GEN_11),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 aRowBuf_4_ext (
-    .R0_addr (_kIdx_T_13[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_4_ext_R0_data),
-    .W0_addr (addr_19),
-    .W0_en   (_GEN_14),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_18),
-    .W1_en   (_GEN_14),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_17),
-    .W2_en   (_GEN_14),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_16),
-    .W3_en   (_GEN_14),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 aRowBuf_5_ext (
-    .R0_addr (_kIdx_T_16[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_5_ext_R0_data),
-    .W0_addr (addr_23),
-    .W0_en   (_GEN_17),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_22),
-    .W1_en   (_GEN_17),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_21),
-    .W2_en   (_GEN_17),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_20),
-    .W3_en   (_GEN_17),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 aRowBuf_6_ext (
-    .R0_addr (_kIdx_T_19[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_6_ext_R0_data),
-    .W0_addr (addr_27),
-    .W0_en   (_GEN_20),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_26),
-    .W1_en   (_GEN_20),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_25),
-    .W2_en   (_GEN_20),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_24),
-    .W3_en   (_GEN_20),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 aRowBuf_7_ext (
-    .R0_addr (_kIdx_T_22[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_aRowBuf_7_ext_R0_data),
-    .W0_addr (addr_31),
-    .W0_en   (_GEN_23),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_30),
-    .W1_en   (_GEN_23),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_29),
-    .W2_en   (_GEN_23),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_28),
-    .W3_en   (_GEN_23),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_0_ext (
-    .R0_addr (t[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_0_ext_R0_data),
-    .W0_addr (addr_3),
-    .W0_en   (_GEN_3),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_2),
-    .W1_en   (_GEN_3),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_1),
-    .W2_en   (_GEN_3),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr),
-    .W3_en   (_GEN_3),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_1_ext (
-    .R0_addr (_kIdx_T_4[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_1_ext_R0_data),
-    .W0_addr (addr_4),
-    .W0_en   (_GEN_6),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[7:0]),
-    .W1_addr (addr_7),
-    .W1_en   (_GEN_6),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[31:24]),
-    .W2_addr (addr_6),
-    .W2_en   (_GEN_6),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[23:16]),
-    .W3_addr (addr_5),
-    .W3_en   (_GEN_6),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[15:8])
-  );
-  mem_16x8 bColBuf_2_ext (
-    .R0_addr (_kIdx_T_7[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_2_ext_R0_data),
-    .W0_addr (addr_11),
-    .W0_en   (_GEN_9),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_10),
-    .W1_en   (_GEN_9),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_9),
-    .W2_en   (_GEN_9),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_8),
-    .W3_en   (_GEN_9),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_3_ext (
-    .R0_addr (_kIdx_T_10[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_3_ext_R0_data),
-    .W0_addr (addr_15),
-    .W0_en   (_GEN_12),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_14),
-    .W1_en   (_GEN_12),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_13),
-    .W2_en   (_GEN_12),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_12),
-    .W3_en   (_GEN_12),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_4_ext (
-    .R0_addr (_kIdx_T_13[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_4_ext_R0_data),
-    .W0_addr (addr_19),
-    .W0_en   (_GEN_15),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_18),
-    .W1_en   (_GEN_15),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_17),
-    .W2_en   (_GEN_15),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_16),
-    .W3_en   (_GEN_15),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_5_ext (
-    .R0_addr (_kIdx_T_16[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_5_ext_R0_data),
-    .W0_addr (addr_23),
-    .W0_en   (_GEN_18),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_22),
-    .W1_en   (_GEN_18),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_21),
-    .W2_en   (_GEN_18),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_20),
-    .W3_en   (_GEN_18),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_6_ext (
-    .R0_addr (_kIdx_T_19[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_6_ext_R0_data),
-    .W0_addr (addr_27),
-    .W0_en   (_GEN_21),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_26),
-    .W1_en   (_GEN_21),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_25),
-    .W2_en   (_GEN_21),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_24),
-    .W3_en   (_GEN_21),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
-  mem_16x8 bColBuf_7_ext (
-    .R0_addr (_kIdx_T_22[3:0]),
-    .R0_en   (1'h1),
-    .R0_clk  (clk),
-    .R0_data (_bColBuf_7_ext_R0_data),
-    .W0_addr (addr_31),
-    .W0_en   (_GEN_24),
-    .W0_clk  (clk),
-    .W0_data (s_axi_wdata[31:24]),
-    .W1_addr (addr_30),
-    .W1_en   (_GEN_24),
-    .W1_clk  (clk),
-    .W1_data (s_axi_wdata[23:16]),
-    .W2_addr (addr_29),
-    .W2_en   (_GEN_24),
-    .W2_clk  (clk),
-    .W2_data (s_axi_wdata[15:8]),
-    .W3_addr (addr_28),
-    .W3_en   (_GEN_24),
-    .W3_clk  (clk),
-    .W3_data (s_axi_wdata[7:0])
-  );
   SystolicPE pes_0_0 (
     .clock       (clk),
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (t == 8'h0),
-    .io_aIn      (kValid ? _aRowBuf_0_ext_R0_data : 8'h0),
-    .io_bIn      (kValid ? _bColBuf_0_ext_R0_data : 8'h0),
+    .io_aIn      (kValid ? casez_tmp : 8'h0),
+    .io_bIn      (kValid ? casez_tmp_4 : 8'h0),
     .io_aOut     (_pes_0_0_io_aOut),
     .io_bOut     (_pes_0_0_io_bOut),
     .io_acc      (_pes_0_0_io_acc)
@@ -1182,7 +4967,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_1_0_io_clearAcc_T),
     .io_aIn      (_pes_0_0_io_aOut),
-    .io_bIn      (kValid_1 ? _bColBuf_1_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_1 ? casez_tmp_10 : 8'h0),
     .io_aOut     (_pes_0_1_io_aOut),
     .io_bOut     (_pes_0_1_io_bOut),
     .io_acc      (_pes_0_1_io_acc)
@@ -1193,7 +4978,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_2_0_io_clearAcc_T),
     .io_aIn      (_pes_0_1_io_aOut),
-    .io_bIn      (kValid_2 ? _bColBuf_2_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_2 ? casez_tmp_16 : 8'h0),
     .io_aOut     (_pes_0_2_io_aOut),
     .io_bOut     (_pes_0_2_io_bOut),
     .io_acc      (_pes_0_2_io_acc)
@@ -1204,7 +4989,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_3_0_io_clearAcc_T),
     .io_aIn      (_pes_0_2_io_aOut),
-    .io_bIn      (kValid_3 ? _bColBuf_3_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_3 ? casez_tmp_22 : 8'h0),
     .io_aOut     (_pes_0_3_io_aOut),
     .io_bOut     (_pes_0_3_io_bOut),
     .io_acc      (_pes_0_3_io_acc)
@@ -1215,7 +5000,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
     .io_aIn      (_pes_0_3_io_aOut),
-    .io_bIn      (kValid_4 ? _bColBuf_4_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_4 ? casez_tmp_28 : 8'h0),
     .io_aOut     (_pes_0_4_io_aOut),
     .io_bOut     (_pes_0_4_io_bOut),
     .io_acc      (_pes_0_4_io_acc)
@@ -1226,7 +5011,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
     .io_aIn      (_pes_0_4_io_aOut),
-    .io_bIn      (kValid_5 ? _bColBuf_5_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_5 ? casez_tmp_34 : 8'h0),
     .io_aOut     (_pes_0_5_io_aOut),
     .io_bOut     (_pes_0_5_io_bOut),
     .io_acc      (_pes_0_5_io_acc)
@@ -1237,7 +5022,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_0_5_io_aOut),
-    .io_bIn      (kValid_6 ? _bColBuf_6_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_6 ? casez_tmp_40 : 8'h0),
     .io_aOut     (_pes_0_6_io_aOut),
     .io_bOut     (_pes_0_6_io_bOut),
     .io_acc      (_pes_0_6_io_acc)
@@ -1248,7 +5033,7 @@ module mm_accel(
     .io_en       (busy),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_0_6_io_aOut),
-    .io_bIn      (kValid_7 ? _bColBuf_7_ext_R0_data : 8'h0),
+    .io_bIn      (kValid_7 ? casez_tmp_46 : 8'h0),
     .io_aOut     (/* unused */),
     .io_bOut     (_pes_0_7_io_bOut),
     .io_acc      (_pes_0_7_io_acc)
@@ -1258,7 +5043,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_1_0_io_clearAcc_T),
-    .io_aIn      (kValid_1 ? _aRowBuf_1_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_1 ? casez_tmp_5 : 8'h0),
     .io_bIn      (_pes_0_0_io_bOut),
     .io_aOut     (_pes_1_0_io_aOut),
     .io_bOut     (_pes_1_0_io_bOut),
@@ -1346,7 +5131,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_2_0_io_clearAcc_T),
-    .io_aIn      (kValid_2 ? _aRowBuf_2_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_2 ? casez_tmp_11 : 8'h0),
     .io_bIn      (_pes_1_0_io_bOut),
     .io_aOut     (_pes_2_0_io_aOut),
     .io_bOut     (_pes_2_0_io_bOut),
@@ -1434,7 +5219,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_3_0_io_clearAcc_T),
-    .io_aIn      (kValid_3 ? _aRowBuf_3_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_3 ? casez_tmp_17 : 8'h0),
     .io_bIn      (_pes_2_0_io_bOut),
     .io_aOut     (_pes_3_0_io_aOut),
     .io_bOut     (_pes_3_0_io_bOut),
@@ -1522,7 +5307,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
-    .io_aIn      (kValid_4 ? _aRowBuf_4_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_4 ? casez_tmp_23 : 8'h0),
     .io_bIn      (_pes_3_0_io_bOut),
     .io_aOut     (_pes_4_0_io_aOut),
     .io_bOut     (_pes_4_0_io_bOut),
@@ -1610,7 +5395,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
-    .io_aIn      (kValid_5 ? _aRowBuf_5_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_5 ? casez_tmp_29 : 8'h0),
     .io_bIn      (_pes_4_0_io_bOut),
     .io_aOut     (_pes_5_0_io_aOut),
     .io_bOut     (_pes_5_0_io_bOut),
@@ -1698,7 +5483,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
-    .io_aIn      (kValid_6 ? _aRowBuf_6_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_6 ? casez_tmp_35 : 8'h0),
     .io_bIn      (_pes_5_0_io_bOut),
     .io_aOut     (_pes_6_0_io_aOut),
     .io_bOut     (_pes_6_0_io_bOut),
@@ -1786,7 +5571,7 @@ module mm_accel(
     .reset       (rst),
     .io_en       (busy),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
-    .io_aIn      (kValid_7 ? _aRowBuf_7_ext_R0_data : 8'h0),
+    .io_aIn      (kValid_7 ? casez_tmp_41 : 8'h0),
     .io_bIn      (_pes_6_0_io_bOut),
     .io_aOut     (_pes_7_0_io_aOut),
     .io_bOut     (/* unused */),
@@ -1869,6 +5654,16 @@ module mm_accel(
     .io_bOut     (/* unused */),
     .io_acc      (_pes_7_7_io_acc)
   );
+  Queue8_UInt128 lineFifo (
+    .clock        (clk),
+    .reset        (rst),
+    .io_enq_valid (fillValid),
+    .io_enq_bits  (casez_tmp_47),
+    .io_deq_ready (mem_wnext | dmaBusy & mem_ready | ~dmaBusy),
+    .io_deq_valid (_lineFifo_io_deq_valid),
+    .io_deq_bits  (mem_wline),
+    .io_count     (_lineFifo_io_count)
+  );
   assign s_axi_awready = awreadyReg;
   assign s_axi_wready = wreadyReg;
   assign s_axi_bresp = 2'h0;
@@ -1876,25 +5671,40 @@ module mm_accel(
   assign s_axi_arready = arreadyReg;
   assign s_axi_rdata =
     raddrWord == 6'h1
-      ? {28'h0, dmaDone, dmaBusy, done, busy}
+      ? {26'h0, ldDone, ldBusy, dmaDone, dmaBusy, done, busy}
       : raddrWord == 6'hA
           ? destAddr
           : raddrWord == 6'hB
               ? destStride
-              : raddrWord == 6'h2
-                  ? {24'h0, kLen}
-                  : raddrWord == 6'h3
-                      ? {30'h0, loadK}
-                      : raddrWord == 6'h4
-                          ? {29'h0, loadLane}
-                          : raddrWord == 6'h7
-                              ? {26'h0, resultIdx}
-                              : _GEN ? casez_tmp_8 : raddrWord == 6'h9 ? 32'h1008 : 32'h0;
+              : raddrWord == 6'hC
+                  ? aSrcAddr
+                  : raddrWord == 6'hD
+                      ? bSrcAddr
+                      : raddrWord == 6'hE
+                          ? srcStride
+                          : raddrWord == 6'hF
+                              ? {30'h0, bPanelUse}
+                              : raddrWord == 6'h10
+                                  ? {30'h0, bPanelLoad}
+                                  : raddrWord == 6'h2
+                                      ? _GEN_2
+                                      : raddrWord == 6'h3
+                                          ? {30'h0, loadK}
+                                          : raddrWord == 6'h4
+                                              ? {29'h0, loadLane}
+                                              : raddrWord == 6'h7
+                                                  ? {26'h0, resultIdx}
+                                                  : _GEN
+                                                      ? casez_tmp_56
+                                                      : raddrWord == 6'h9
+                                                          ? 32'h41008
+                                                          : 32'h0;
   assign s_axi_rresp = 2'h0;
   assign s_axi_rvalid = rvalidReg;
-  assign mem_req_valid = memReqValid & dmaBusy & ~dmaSettle;
-  assign mem_req_write = 1'h1;
-  assign mem_req_addr = dmaAddr;
-  assign mem_wline = casez_tmp;
+  assign mem_req_valid = dmaDrive | ldBusy & ldReq;
+  assign mem_req_write = dmaDrive;
+  assign mem_req_addr =
+    dmaDrive ? dmaAddr : burstOK ? ldBase : ldBase + {28'h0, ldLocal} * effSrcStride;
+  assign mem_req_lines = {3'h0, dmaDrive ? wBurstLines : {1'h0, burstOK ? 4'h8 : 4'h1}};
 endmodule
 
