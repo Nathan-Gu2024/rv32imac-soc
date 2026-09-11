@@ -1,10 +1,23 @@
 `timescale 1ns/1ps
 `include "../src/cpu.v"
 
-// Sim pre-check for fpga/tests/test_amo.c before handing it to hardware -
+// Sim pre-check for the accelerator's C driver before handing it to hardware -
 // same mock memory harness as tb_coremark_sim.v, UART output captured the
 // same way (snoop uart_mmio's tx_start/tx_data) since this test reports via
-// UART print, not register peeks (unlike tb_amo_test.v).
+// UART print, not register peeks.
+//
+// TRUST THIS BENCH FOR THE CPU SIDE, NOT FOR THE MEMORY SIDE.
+//
+// It substitutes its own model for BOTH mem_arbiter and axi_cache_adapter, so
+// anything that depends on their timing is being checked against a guess. It
+// has contradicted the board three times - most expensively by declaring write
+// bursts corrupt when they were correct and 2.8x faster. What it is good for
+// is the part no other bench covers: a real CPU running the real driver
+// against the real register map.
+//
+// For the memory path use tb_burst_integration.v (arbiter + adapter + an AXI
+// slave) or tb_result_dma.v (those plus the real accelerator, with
+// configurable slave latency and WREADY stalls).
 module tb_mm_accel_c_test;
     reg clk, rst;
     wire uart_tx_line;
@@ -260,76 +273,6 @@ module tb_mm_accel_c_test;
     //  ddr_mem itself, and this block drove X from an unassigned
     //  a_wline_latched, which hung the run rather than failing it)
 
-
-    // ---- TEMPORARY PROBE: result-DMA stall diagnosis ----
-    integer dbg_dma = 0;
-    reg dbg_prev = 1'b0;
-    always @(posedge clk) begin
-        dbg_prev <= DUT.ACCEL.dmaBusy;
-        if (DUT.ACCEL.dmaBusy && !dbg_prev)
-            $display("[dbg] DMA start t=%0t", $time);
-        if (!DUT.ACCEL.dmaBusy && dbg_prev)
-            $display("[dbg] DMA END t=%0t done=%b sent=%0d fillLeft=%0d cnt=%0d",
-                     $time, DUT.ACCEL.dmaDone, DUT.ACCEL.dmaSent,
-                     DUT.ACCEL.fillLeft, DUT.ACCEL._lineFifo_io_count);
-        if (accel_mem_req_valid && $time > 6215000000 && $time < 6216000000)
-            $display("[dbg] REQ t=%0t addr=%h lines=%0d wr=%b", $time,
-                     accel_mem_req_addr, accel_mem_req_lines, accel_mem_req_write);
-        if (DUT.ACCEL.dmaBusy) begin
-            dbg_dma = dbg_dma + 1;
-            if (0)
-                $display("[dbg] t=%0t busy=%b fillLeft=%0d cnt=%0d deqv=%b reqv=%b lines=%0d rdy=%b wnext=%b sent=%0d",
-                         $time, DUT.ACCEL.dmaBusy, DUT.ACCEL.fillLeft,
-                         DUT.ACCEL._lineFifo_io_count, DUT.ACCEL._lineFifo_io_deq_valid,
-                         accel_mem_req_valid, accel_mem_req_lines,
-                         accel_mem_ready, accel_mem_wnext, DUT.ACCEL.dmaSent);
-        end
-    end
-
-    // PC probe: where is the CPU stuck after the DMA?
-    integer pcn = 0;
-    always @(posedge clk) begin
-        if ($time > 6216000000) begin
-            pcn = pcn + 1;
-            if (pcn % 20000 == 1)
-                $display("[pc] t=%0t pc=%h stall=%b dreq=%b dready=%b",
-                         $time, DUT.pc, DUT.global_mem_stall,
-                         DUT.dcache_ren | DUT.dcache_wen, DUT.dcache_ready);
-        end
-    end
-
-
-    // ---- TEMPORARY: dump the DMA destination straight out of ddr_mem ----
-    integer dbg_ddr = 0;
-    reg dbg_dma_prev = 1'b0;
-    integer dbgi;
-    always @(posedge clk) begin
-        dbg_dma_prev <= DUT.ACCEL.dmaBusy;
-        if (!DUT.ACCEL.dmaBusy && dbg_dma_prev && dbg_ddr == 0) begin
-            dbg_ddr = 1;
-            $display("[ddr] result buffer as written by the DMA:");
-            for (dbgi = 0; dbgi < 16; dbgi = dbgi + 1)
-                $display("[ddr]   word %0d = %0d", dbgi,
-                         $signed(ddr_mem[(32'h00180000 >> 2) + dbgi]));
-        end
-    end
-
-
-    // ---- TEMPORARY: log D-cache fetches of the DMA destination ----
-    integer dbg_fetch = 0;
-    always @(posedge clk) begin
-        if (dcache_mem_req_valid && !dcache_mem_req_write &&
-            dmem_req_addr >= 32'h00180000 && dmem_req_addr < 32'h00180100 &&
-            dbg_fetch < 6) begin
-            dbg_fetch = dbg_fetch + 1;
-            $display("[fetch] addr=%h  ddr[+0]=%0d ddr[+1]=%0d ddr[+2]=%0d ddr[+3]=%0d",
-                     dmem_req_addr,
-                     $signed(ddr_mem[{dmem_req_addr[28:4], 2'b00}]),
-                     $signed(ddr_mem[{dmem_req_addr[28:4], 2'b01}]),
-                     $signed(ddr_mem[{dmem_req_addr[28:4], 2'b10}]),
-                     $signed(ddr_mem[{dmem_req_addr[28:4], 2'b11}]));
-        end
-    end
 
     initial clk = 0;
     always #5 clk = ~clk;

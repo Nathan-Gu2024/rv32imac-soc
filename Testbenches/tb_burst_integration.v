@@ -24,6 +24,16 @@
 //   2. a multi-line WRITE completes with exactly one transaction
 //   3. the arbiter releases the port afterwards in both directions
 //   4. cache ports still work unchanged alongside
+// Cycles WREADY is withheld between accepted write beats. AXI4 lets a slave
+// deassert WREADY at any time, so a master must hold WVALID/WDATA until the
+// beat is taken. Defaulting this to 0 is what let a real violation live: the
+// adapter sliced mem_wline live on multi-line bursts, and mem_wnext advances
+// the requester one beat EARLY, so the last beat of every line took the next
+// line's bytes - visible only if the slave ever stalls mid-line.
+`ifndef WGAP
+  `define WGAP 2
+`endif
+
 module tb_burst_integration;
 
     localparam AXI_W = 64;
@@ -110,6 +120,8 @@ module tb_burst_integration;
     // accepted separately from W, WREADY is held for the whole data phase, and
     // the read channel can restart immediately after RLAST.
     integer beats_left, beats_seen, aw_seen, ar_seen, w_beats;
+    integer w_gap;
+    reg [AXI_W-1:0] WBEAT [0:255];
     reg [63:0] beat_seed;
     reg        wr_active;
     integer    wr_beats_left;
@@ -119,7 +131,7 @@ module tb_burst_integration;
             arready <= 1'b0; awready <= 1'b0; wready <= 1'b0;
             rvalid  <= 1'b0; rlast   <= 1'b0; bvalid  <= 1'b0;
             beats_left <= 0; beats_seen <= 0; aw_seen <= 0; ar_seen <= 0;
-            w_beats <= 0; beat_seed <= 64'd0;
+            w_beats <= 0; beat_seed <= 64'd0; w_gap <= 0;
             wr_active <= 1'b0; wr_beats_left <= 0;
         end else begin
             // ---- read address ----
@@ -163,13 +175,20 @@ module tb_burst_integration;
 
             // ---- write data ----
             if (wr_active && wvalid && wready) begin
+                WBEAT[w_beats] <= wdata;          // captured for the data check
                 w_beats       <= w_beats + 1;
                 wr_beats_left <= wr_beats_left - 1;
                 if (wlast || wr_beats_left == 1) begin
                     wready    <= 1'b0;
                     wr_active <= 1'b0;
                     bvalid    <= 1'b1;
+                end else if (`WGAP != 0) begin
+                    wready <= 1'b0;               // stall mid-line, legally
+                    w_gap  <= 0;
                 end
+            end else if (wr_active && !wready && !bvalid) begin
+                if (w_gap >= `WGAP) wready <= 1'b1;
+                else                w_gap  <= w_gap + 1;
             end
 
             // ---- write response ----
@@ -192,6 +211,17 @@ module tb_burst_integration;
     integer errors = 0;
     integer lines_seen;
     integer i;
+    integer ar_base;      // ar_seen counts every read in the run, so tests
+                          // after the first must compare against a baseline
+
+    // ARLEN is only meaningful during the address phase; checking it later
+    // reads whatever the adapter happens to be driving. Latch it when the
+    // slave accepts the address.
+    reg [7:0] arlen_seen;
+    always @(posedge clk) begin
+        if (rst) arlen_seen <= 8'hFF;
+        else if (arvalid && arready) arlen_seen <= arlen;
+    end
 
     task check(input cond, input [8*72-1:0] msg);
         begin
@@ -295,6 +325,108 @@ module tb_burst_integration;
         #1;
         check(!mem_req_valid, "Port released after the write");
         check(aw_seen == 1,   "Write used exactly ONE AXI transaction");
+
+        @(negedge clk); clr_flags = 1'b1; @(posedge clk);
+        @(negedge clk); clr_flags = 1'b0;
+
+        // ---- Test 4: 32-line read burst ----
+        // What maxK=64 actually issues: a whole operand panel is dim*(maxK/16)
+        // = 32 lines, four times the 8-line burst maxK=16 produced. That makes
+        // ARLEN 63 rather than 15, and `saved_lines * BEATS_PER_LINE - 1` is
+        // computed in 8 bits - so the longest burst the design can ask for is
+        // the one worth testing, not the shortest.
+        $display("--- Test 4: 32-line read burst (maxK=64 operand panel) ---");
+        lines_seen = 0;
+        ar_base    = ar_seen;
+        @(negedge clk);
+        accel_req_valid = 1'b1;
+        accel_req_write = 1'b0;
+        accel_req_lines = 8'd32;
+        accel_req_addr  = 32'h4000_0200;   // 512-byte aligned: see note below
+
+        fork
+            begin : count_lines32
+                integer guard;
+                for (guard = 0; guard < 2000 && lines_seen < 32; guard = guard + 1) begin
+                    @(posedge clk);
+                    #1;
+                    if (accel_ready) begin
+                        lines_seen = lines_seen + 1;
+                        if (lines_seen == 31) accel_req_valid = 1'b0;
+                    end
+                end
+            end
+        join
+
+        check(lines_seen == 32,          "32-line read burst delivered every line");
+        check(ar_seen - ar_base == 1,    "32-line burst used ONE AXI transaction");
+        check(arlen_seen == (32*BEATS - 1),
+                                         "ARLEN was 63, covering all 64 beats");
+        repeat (4) @(posedge clk);
+        #1;
+        check(!mem_req_valid,            "Port released after the 32-line burst");
+
+        // NOTE: a 32-line burst spans 512 bytes, and AXI4 forbids an INCR burst
+        // from crossing a 4 KB boundary. This model does not enforce that, so
+        // the alignment is a SOFTWARE contract the driver has to keep - staging
+        // buffers aligned to the panel size. It is not visible in simulation.
+
+        @(negedge clk); clr_flags = 1'b1; @(posedge clk);
+        @(negedge clk); clr_flags = 1'b0;
+
+        // ---- Test 5: multi-line write, DISTINCT data per line ----
+        //
+        // Test 3 writes a single line, which the adapter slices from a latched
+        // copy - a different path entirely. A multi-line burst reads the
+        // requester's line live, so this is the case that can pick up the
+        // wrong bytes, and only if each line differs can that be seen at all.
+        // Every earlier result-DMA test used uniform operands, where each line
+        // is identical and a beat taken from the neighbouring line writes the
+        // same value.
+        $display("--- Test 5: 4-line write, distinct data, WREADY gaps ---");
+        w_beats = 0;
+        @(negedge clk);
+        accel_req_valid = 1'b1;
+        accel_req_write = 1'b1;
+        accel_req_lines = 8'd4;
+        accel_req_addr  = 32'h7000_0000;
+        accel_wline     = 128'd0;
+
+        fork
+            begin : feed_lines
+                integer guard;
+                reg [15:0] ln;
+                ln = 16'd0;
+                accel_wline = {16'h1111, ln, 16'h2222, ln,
+                               16'h3333, ln, 16'h4444, ln};
+                for (guard = 0; guard < 800 && !saw_accel_ready; guard = guard + 1) begin
+                    @(posedge clk);
+                    #1;
+                    if (accel_wnext) begin        // requester advances a line
+                        ln = ln + 16'd1;
+                        accel_wline = {16'h1111, ln, 16'h2222, ln,
+                                       16'h3333, ln, 16'h4444, ln};
+                    end
+                    if (accel_ready) accel_req_valid = 1'b0;
+                end
+            end
+        join
+        @(negedge clk); accel_req_valid = 1'b0; accel_req_write = 1'b0;
+        repeat (4) @(posedge clk);
+
+        check(w_beats == 8, "4-line write delivered 8 beats");
+        begin : chk5
+            integer n, bad5;
+            reg [15:0] nn;
+            bad5 = 0;
+            for (n = 0; n < 4; n = n + 1) begin
+                nn = n[15:0];
+                // a 128-bit line goes out low half first
+                if (WBEAT[2*n]   !== {16'h3333, nn, 16'h4444, nn}) bad5 = bad5 + 1;
+                if (WBEAT[2*n+1] !== {16'h1111, nn, 16'h2222, nn}) bad5 = bad5 + 1;
+            end
+            check(bad5 == 0, "every beat carried its OWN line's bytes");
+        end
 
         $display("");
         if (errors == 0) $display("=== BURST INTEGRATION PASSED ===");

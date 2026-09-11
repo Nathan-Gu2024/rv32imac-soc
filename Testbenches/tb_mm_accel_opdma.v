@@ -32,7 +32,9 @@
   `define MEM_LATENCY 3
 `endif
 `ifndef STRIDE
-  `define STRIDE 32
+  // Two lanes wide, whatever a lane is: the point is a GAP between lanes, and
+  // a fixed 32 stopped meaning that as soon as KLEN reached 32.
+  `define STRIDE (2*`KLEN)
 `endif
 
 module tb_mm_accel_opdma;
@@ -48,6 +50,7 @@ module tb_mm_accel_opdma;
     // single INCR burst. Anything larger leaves gaps between lanes and forces
     // the per-line fallback. Both paths must produce identical results.
     localparam STRIDE = `STRIDE;
+    localparam LPL    = (KLEN + 15) / 16;   // 128-bit lines per lane
 
     reg clk = 1'b0, rst = 1'b1;
     always #5 clk = ~clk;
@@ -184,7 +187,7 @@ module tb_mm_accel_opdma;
     reg signed [7:0]  B [0:DIM-1][0:KLEN-1];
     reg signed [31:0] CREF [0:DIM-1][0:DIM-1];
 
-    integer i, j, k, g, errors, acc, maxk, exp_reads;
+    integer i, j, k, c, g, errors, acc, maxk, exp_reads;
     integer t0, c_push, c_dma;
     reg [31:0] rd, pw;
     reg [127:0] lineword;
@@ -224,14 +227,18 @@ module tb_mm_accel_opdma;
         // Place the panels in line memory at their strided lane addresses. This
         // is the same data the push path sends, so the two paths are compared
         // on identical operands.
-        for (i = 0; i < DIM; i = i + 1) begin
-            for (k = 0; k < 16; k = k + 1)
-                lineword[8*k +: 8] = (k < KLEN) ? A[i][k][7:0] : 8'h00;
-            LMEM[(A_SRC + i*STRIDE) >> 4] = lineword;
-            for (k = 0; k < 16; k = k + 1)
-                lineword[8*k +: 8] = (k < KLEN) ? B[i][k][7:0] : 8'h00;
-            LMEM[(B_SRC + i*STRIDE) >> 4] = lineword;
-        end
+        // A lane is KLEN bytes, i.e. LPL = ceil(KLEN/16) lines - not one. Filling
+        // a single line per lane left 3 of every 4 lines X at KLEN=64, which
+        // presents as an accelerator fault rather than as a bench gap.
+        for (i = 0; i < DIM; i = i + 1)
+            for (c = 0; c < LPL; c = c + 1) begin
+                for (k = 0; k < 16; k = k + 1)
+                    lineword[8*k +: 8] = ((c*16 + k) < KLEN) ? A[i][c*16 + k][7:0] : 8'h00;
+                LMEM[(A_SRC + i*STRIDE + c*16) >> 4] = lineword;
+                for (k = 0; k < 16; k = k + 1)
+                    lineword[8*k +: 8] = ((c*16 + k) < KLEN) ? B[i][c*16 + k][7:0] : 8'h00;
+                LMEM[(B_SRC + i*STRIDE + c*16) >> 4] = lineword;
+            end
 
         repeat (3) @(posedge clk);
         rst = 0;
@@ -304,7 +311,7 @@ module tb_mm_accel_opdma;
             $display("  speedup x100         %0d", (c_push * 100) / c_dma);
         $display("  line reads %0d, line writes %0d, stride %0d (%0s)",
                  nread, nwrite, STRIDE,
-                 (STRIDE == 16) ? "burst" : "per-line");
+                 (STRIDE == KLEN) ? "burst   " : "per-line");
         if (nwrite != 0) begin
             $display("  FAIL: operand fetch issued WRITE requests");
             errors = errors + 1;
@@ -312,7 +319,11 @@ module tb_mm_accel_opdma;
         // Lines per lane is maxK/16, not 1: at maxK=32 a lane spans two lines
         // and the fetch issues twice as many reads. Hardcoding 2*DIM here
         // reported a hardware failure when the hardware was correct.
-        exp_reads = 2 * DIM * ((maxk > 16) ? (maxk/16) : 1);
+        // Lines fetched follow the RUN's K_LEN, not the build's maxK: a
+        // maxK=64 build running K=16 must move 16 lines, not 64. Deriving this
+        // from maxk asserted the old behaviour, where raising maxK quadrupled
+        // operand traffic for every run that did not use the extra depth.
+        exp_reads = 2 * DIM * LPL;
         if (nread != exp_reads) begin
             $display("  FAIL: expected %0d line reads, saw %0d", exp_reads, nread);
             errors = errors + 1;

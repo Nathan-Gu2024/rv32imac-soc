@@ -39,7 +39,11 @@ module tb_mm_accel_db;
     localparam A_SRC  = 32'h0004_0000;
     localparam B0_SRC = 32'h0005_0000;
     localparam B1_SRC = 32'h0006_0000;
-    localparam STRIDE = 16;
+    // A lane is KLEN bytes = LPL lines, and "packed" means a stride of one
+    // LANE, not a fixed 16. Both were hardcoded for KLEN=16, so at KLEN=64 the
+    // bench staged a quarter of each panel and overlapped the rest.
+    localparam STRIDE = KLEN;
+    localparam LPL    = (KLEN + 15) / 16;
 
     reg clk = 1'b0, rst = 1'b1;
     always #5 clk = ~clk;
@@ -159,7 +163,7 @@ module tb_mm_accel_db;
     reg signed [7:0]  B [0:1][0:DIM-1][0:KLEN-1];
     reg signed [31:0] CREF [0:1][0:DIM-1][0:DIM-1];
 
-    integer i, j, k, p, errors, acc;
+    integer i, j, k, c, p, errors, acc;
     integer t0, c_serial, c_overlap;
     reg [31:0] rd;
     reg [127:0] lw;
@@ -199,14 +203,18 @@ module tb_mm_accel_db;
                     CREF[p][i][j] = acc;
                 end
 
-        for (i = 0; i < DIM; i = i + 1) begin
-            for (k = 0; k < 16; k = k + 1) lw[8*k +: 8] = (k < KLEN) ? A[i][k][7:0] : 8'h0;
-            LMEM[(A_SRC + i*STRIDE) >> 4] = lw;
-            for (k = 0; k < 16; k = k + 1) lw[8*k +: 8] = (k < KLEN) ? B[0][i][k][7:0] : 8'h0;
-            LMEM[(B0_SRC + i*STRIDE) >> 4] = lw;
-            for (k = 0; k < 16; k = k + 1) lw[8*k +: 8] = (k < KLEN) ? B[1][i][k][7:0] : 8'h0;
-            LMEM[(B1_SRC + i*STRIDE) >> 4] = lw;
-        end
+        for (i = 0; i < DIM; i = i + 1)
+            for (c = 0; c < LPL; c = c + 1) begin
+                for (k = 0; k < 16; k = k + 1)
+                    lw[8*k +: 8] = ((c*16+k) < KLEN) ? A[i][c*16+k][7:0] : 8'h0;
+                LMEM[(A_SRC + i*STRIDE + c*16) >> 4] = lw;
+                for (k = 0; k < 16; k = k + 1)
+                    lw[8*k +: 8] = ((c*16+k) < KLEN) ? B[0][i][c*16+k][7:0] : 8'h0;
+                LMEM[(B0_SRC + i*STRIDE + c*16) >> 4] = lw;
+                for (k = 0; k < 16; k = k + 1)
+                    lw[8*k +: 8] = ((c*16+k) < KLEN) ? B[1][i][c*16+k][7:0] : 8'h0;
+                LMEM[(B1_SRC + i*STRIDE + c*16) >> 4] = lw;
+            end
 
         repeat (3) @(posedge clk);
         rst = 0;
