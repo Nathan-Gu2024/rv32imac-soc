@@ -38,9 +38,18 @@ fpga/tests/build_*/
 
 # Chisel / Scala build artifacts - regenerate with:
 #   cd chisel && scala-cli run src/MmAccel.scala
-chisel/.scala-build/
+#
+# scala-cli puts its cache next to the SOURCE file, i.e. chisel/src/.scala-build,
+# so the chisel/.scala-build/ pattern never matched and ~4,000 lines of .class
+# files were tracked and churned on every elaboration.
+**/.scala-build/
 chisel/generated/
 chisel/out/
 .bloop/
 .metals/
 .bsp/
+
+# Accelerator simulation artifacts
+Testbenches/*.vvp
+Testbenches/sim_*
+!Testbenches/sim_*.v

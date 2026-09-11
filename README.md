@@ -3,11 +3,13 @@
 A from-scratch RV32IMAC_Zba RISC-V system-on-chip in Verilog, running on a
 Xilinx Zynq-7020 FPGA and taken through an open-source ASIC flow. Includes a
 5-stage pipelined core with dynamic branch prediction, BRAM-backed L1 caches,
-an AXI4-Lite INT8 systolic-array accelerator, and a Zephyr RTOS board port.
+a Chisel-generated 8×8 INT8 systolic-array GEMM accelerator, and a Zephyr RTOS
+board port.
 
-**190.5 CoreMark @ 60 MHz — 3.17 CoreMark/MHz** on FPGA, using 13% of the
-device's LUTs and 6% of its flip-flops; and a **signed-off 10.58 mm² Sky130
-GDSII** with eleven SRAM macros, LVS-clean and XOR-clean.
+**190.5 CoreMark @ 60 MHz — 3.17 CoreMark/MHz** on FPGA; a **105× measured
+speedup** on INT8 GEMM against the same core running the same kernel; and a
+**signed-off 10.58 mm² Sky130 GDSII** with eleven SRAM macros, LVS-clean and
+XOR-clean.
 
 ---
 
@@ -23,6 +25,35 @@ GDSII** with eleven SRAM macros, LVS-clean and XOR-clean.
 | Utilization | 13% LUT · 6% FF · 22% BRAM · 2% DSP |
 | On-chip power | 1.51 W |
 | ISA | RV32IMAC + Zicsr + Zba, machine mode |
+
+### GEMM accelerator — measured on the Zynq board
+
+INT8 GEMM, 8×8 tile, K=64, against the same GEMM compiled for the scalar RV32
+core. Every figure is a hardware measurement, not a projection.
+
+| Stage | cyc/tile | MACs/cycle | vs scalar |
+|---|---|---|---|
+| Register-window baseline | 1622 | 0.63 | 5.7× |
+| \+ operand DMA, scratchpad, double buffering | 1001 | 1.02 | 10.0× |
+| \+ read bursts | 696 | 1.47 | 15.3× |
+| \+ descriptor queue | 594 | 1.72 | 16.8× |
+| \+ write bursts | 273 | 3.74 | 36.4× |
+| \+ `K_LEN` 16 → 64 | 444 | 9.22 | 77.8× |
+| \+ A-panel reuse | 346 | 11.8 | 99.8× |
+| **\+ INT8 requantized output** | **327** | **12.5** | **105×** |
+
+Rows after `K_LEN` 16 → 64 do four times the arithmetic per tile, which is why
+cycles per tile rise while throughput does.
+
+**The comparison is MAC-for-MAC** — 4096 multiply-accumulates either way — but
+the final row writes INT8 where the scalar reference writes INT32, so it is a
+*requantized* INT8 GEMM, not a bare speedup over an identical computation.
+
+The array is busy 78 of those 327 cycles. What remains is memory: an operand
+panel and a result tile share one 128-bit port with both caches, and the port
+is idle while the array computes. Closing that needs two tiles in flight —
+issuing the next panel fetch before the current store — which is the largest
+remaining item and is not implemented.
 
 ### ASIC — OpenLane / Sky130, RTL-to-GDSII
 
@@ -167,9 +198,47 @@ that the output registers hold across stalls.
 keeps floorplan iteration to ~10 minutes instead of ~4 hours in the full CPU.
 
 ### Accelerator
-A 2×2 output-stationary INT8 systolic array with INT32 accumulation, mapped
-as an AXI4-Lite slave. Skewed operand feed, `K_LEN + 2·(DIM−1)` cycle
-schedule, driven from C on the core.
+An **8×8 output-stationary INT8 systolic array** with INT32 accumulation,
+generated from Chisel (`chisel/src/MmAccel.scala`) and emitted as Verilog-2001
+that drops into the same SoC as the hand-written RTL. Skewed operand feed,
+`K_LEN + 2·(DIM−1)` cycle schedule, `K_LEN` up to 64.
+
+It has two interfaces, and the split is the whole design:
+
+- an **AXI4-Lite slave** for control — a constant-size 23-word register map
+  indexed by lane and accumulator rather than one word per element, so the
+  window does not grow with `DIM`
+- a **128-bit line port** as a third requester on `mem_arbiter`, sharing the
+  cache path to DRAM, over which it fetches its own operands and writes its own
+  results
+
+Everything that mattered for throughput lives on the second one. Driving 64
+accumulators out through a 32-bit register window costs ~5 cycles of protocol
+per 4 bytes, which made result readback 70% of runtime before the line port
+existed.
+
+| Feature | What it buys |
+|---|---|
+| Operand DMA over the line port | the array fetches its own panels; no CPU in the loop |
+| INCR bursts, up to 32 lines | one AXI round trip per panel instead of per line |
+| 4-panel B scratchpad | a strip of tiles reloads nothing |
+| Double-buffered panel load | the next panel fills while the current one feeds a run |
+| Descriptor queue (8 deep) | a batch of tiles runs with one kick and one poll |
+| A-panel reuse (`bOnly`) | a row of tiles shares one A panel — half the operand traffic |
+| INT8 requantized output | shift/round/saturate on the way out; a tile is 4 lines, not 16 |
+
+**Operand buffers are 16-byte rows in synchronous-read memories**, addressed one
+cycle ahead — the same trick both L1 caches use. Read combinationally as flat
+registers they were 20 Kbit behind a 64:1 mux per lane per panel, and firtool
+emitted 102,735 lines of Verilog for one accelerator; as 1R1W byte-masked RAM
+the same design is 3,618 lines and **79% fewer flip-flops**.
+
+**Coherence** is handled by set-displacement eviction. The D-cache is
+write-back and this SoC has no cache-maintenance instruction, no maintenance
+CSR and no uncached DRAM window, so software touches one address in every set
+of the direct-mapped cache to force dirty operand lines out before the
+accelerator reads them from DRAM. It costs ~17k cycles and is paid once per
+upload, not per tile.
 
 ### Software
 - **Zephyr RTOS** board port: custom SoC/board definition, devicetree,
@@ -187,6 +256,13 @@ schedule, driven from C on the core.
 | `tb_dcache.v`, `tb_icache.v` | Standalone cache unit tests |
 | `tb_sram_wrapper.v` | SRAM macro wrapper against the PDK behavioural model (12 checks) |
 | `tb_mm_accel.v` | Accelerator + AXI4-Lite bridge |
+| `tb_mm_accel_opdma.v` | Operand DMA: correctness, stride, direction, cost vs the register window |
+| `tb_mm_accel_pad.v` | B scratchpad — each panel gets distinct operands, so a stuck panel select fails |
+| `tb_mm_accel_db.v` | Double buffering — prefetch during compute must not corrupt the run |
+| `tb_mm_accel_queue.v` | Descriptor queue, and A-panel reuse with the A source **poisoned** in memory |
+| `tb_mem_arbiter.v` | Three-port arbitration, round-robin, burst passthrough |
+| `tb_burst_integration.v` | `mem_arbiter` + `axi_cache_adapter` + an AXI slave, multi-line both directions |
+| `tb_result_dma.v` | Real accelerator through real arbiter and adapter, against a slave with configurable latency and WREADY stalls |
 
 The cache benches run in **both** memory configurations — inferred Block RAM
 and SRAM macros — from one source, via `-DUSE_SRAM`. At matched geometry the
@@ -201,6 +277,17 @@ because the OpenRAM model resolves the undefined same-address read-during-write
 as write-first in simulation. The Block RAM mutation is the only mechanised
 proof, and it has to cover both targets.
 
+**Uniform test data hides whole classes of bug.** Every accelerator bench
+originally drove operands where each result came out identical, and a DMA that
+reordered lines, or took a beat from its neighbour, wrote the same bytes either
+way. Rebuilding the checks around `C[i][j] = K·(i+1)(j+1)` — distinct in every
+position — immediately exposed an AXI protocol violation that had survived a
+bitstream, a board run and every existing test: `axi_cache_adapter` sliced
+`mem_wline` live on multi-line bursts while `mem_wnext` advanced the requester
+a beat early, so any slave that deasserted `WREADY` mid-line got the next
+line's bytes. `tb_burst_integration.v` now stalls `WREADY` deliberately, and
+that test was checked to **fail without the fix**.
+
 Correctness is anchored on CoreMark's golden CRCs
 (`0xe714`/`0x1fd7`/`0x8e3a`/`0x4983`) — any mismatch means real data
 corruption, not a tuning regression. The dcache hazard bench was
@@ -211,6 +298,7 @@ stale-data signature, confirming the test detects the bug it targets.
 
 ```
 src/          RTL — core, caches, TCM, peripherals, accelerator, AXI
+chisel/       Chisel generator for the accelerator (src/mm_accel.v is its output)
 Testbenches/  Simulation benches, directed assembly tests, CoreMark harness
 fpga/         Zynq top level, linker scripts, bare-metal tests, CoreMark port
 constraints/  Vivado XDC
@@ -232,6 +320,22 @@ iverilog -g2012 -o sim_amo      tb_amo_test.v     && vvp sim_amo
 ```sh
 bash fpga/coremark/build.sh 2000     # ITERATIONS=2000
 ```
+
+**Accelerator RTL** (Chisel → Verilog-2001, needs `scala-cli`):
+```sh
+cd chisel
+MM_DIM=8 MM_MAXK=64 MM_BPANELS=4 MM_OUT=generated scala-cli run src/MmAccel.scala
+cp generated/mm_accel.sv ../src/mm_accel.v
+```
+`MM_DIM`, `MM_MAXK` and `MM_BPANELS` are the only knobs; the emitted file is
+Verilog-2001 (`disallowPackedArrays,disallowLocalVariables,noAlwaysComb`) so
+one artifact drops into Vivado, Icarus and OpenLane alike. Sweep it with
+`openlane/mm_accel/sweep.sh`.
+
+> `MM_BPANELS` was reachable only as a Scala default for a while, so every
+> sweep silently built the same 4-panel design. When it was finally wired
+> through, `bPanels=2` failed to elaborate — a packed-array lowering that
+> happened to survive at 1, 4 and 8. Sweep a parameter before trusting it.
 
 **FPGA**: build `fpga/rtl/fpga_top.v` in Vivado as a module reference inside
 a block design containing the ZYNQ7 PS (FCLK_CLK0 = 60 MHz, AXI HP0 to DDR).
