@@ -37,12 +37,26 @@
 #define ACCEL_SRC_STRIDE  ACCEL_REG(14)
 #define ACCEL_B_PANEL_USE  ACCEL_REG(15)
 #define ACCEL_B_PANEL_LOAD ACCEL_REG(16)
+#define ACCEL_DESC_A_SRC  ACCEL_REG(17)
+#define ACCEL_DESC_B_SRC  ACCEL_REG(18)
+#define ACCEL_DESC_DEST   ACCEL_REG(19)
+#define ACCEL_DESC_PUSH   ACCEL_REG(20)   /* writing this commits a descriptor */
+/* Descriptor ctl bit 16: fetch only the B panel, leave A resident from the
+ * previous tile. C[ti][tj] = A[ti]*B[tj], so a row of tiles shares one A
+ * panel; without this the queue re-fetches it per tile, which at dim=8,
+ * maxK=64 is 32 of the 80 lines a tile moves. */
+#define DESC_BONLY        0x10000u
+
+#define ACCEL_OUT_CTRL    ACCEL_REG(22)   /* {int8[8], shift[4:0]} */
+#define OUT_INT8          0x100u
+#define ACCEL_QUEUE_FREE  ACCEL_REG(21)
 
 #define CTRL_START     0x1
 #define CTRL_SOFT_RST  0x2
 #define CTRL_START_DMA 0x4
 #define CTRL_START_LOAD   0x8    /* fetch A and B panels over the line port */
 #define CTRL_START_LOAD_B 0x10   /* B panel only - safe during compute */
+#define CTRL_START_QUEUE  0x20   /* run every queued descriptor */
 
 #define ST_BUSY     0x1
 #define ST_DONE     0x2
@@ -50,6 +64,8 @@
 #define ST_DMA_DONE 0x8
 #define ST_LOAD_BUSY 0x10
 #define ST_LOAD_DONE 0x20
+#define ST_QUEUE_BUSY 0x40
+#define ST_QUEUE_DONE 0x80
 
 /* Where the DMA drops results. Must be 16-byte aligned. */
 #define RESULT_BUF 0x00180000
@@ -135,8 +151,31 @@ static void push_panel(volatile uint32_t *port, const uint8_t *val,
  * merely similar. Kept in .bss (DDR) rather than on the stack so operands start
  * where a real workload would keep them.
  */
-static int8_t  gemm_a[16 * 16];
-static int8_t  gemm_b[16 * 16];
+/* Freestanding build, no libc. At K=64 the staging loops are long enough that
+ * gcc recognises them and emits calls to memset, which then has nothing to
+ * link against - so provide it.
+ *
+ * The attribute is NOT optional. -O2 enables -ftree-loop-distribute-patterns,
+ * which recognises the byte-fill loop BELOW as a memset and rewrites it into a
+ * call to memset - that is, to itself. The result links cleanly and runs until
+ * the recursion walks the stack down through DRAM: on hardware it reached
+ * ~121 MB below __stack_top, showing up as endless D-cache writeback/refill
+ * pairs at descending addresses. Disabling the pattern pass for this one
+ * function keeps the fix with the code rather than in a build flag that a
+ * future rebuild can drop. */
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *memset(void *d, int c, unsigned int n) {
+    unsigned char *p = (unsigned char *)d;
+    while (n--) *p++ = (unsigned char)c;
+    return d;
+}
+
+/* Deepest reduction any build here stages. maxK is read from INFO at run time;
+ * this only bounds the static buffers. */
+#define KSTAGE 64
+
+static int8_t  gemm_a[16 * KSTAGE];
+static int8_t  gemm_b[16 * KSTAGE];
 static int32_t gemm_c[16 * 16];
 
 static void scalar_gemm(const int8_t *A, const int8_t *B, int32_t *C,
@@ -151,11 +190,23 @@ static void scalar_gemm(const int8_t *A, const int8_t *B, int32_t *C,
     }
 }
 
-/* Operand panels staged for the DMA: one lane per 16-byte line, packed, so
- * the fetch covers a whole panel in a single INCR burst. 16-byte aligned
- * because the line port addresses lines, not bytes. */
-static int8_t dma_a[16 * 16] __attribute__((aligned(16)));
-static int8_t dma_b[16 * 16] __attribute__((aligned(16)));
+/* Operand panels staged for the DMA: lanes packed back to back, so the fetch
+ * covers a whole panel in a single INCR burst.
+ *
+ * Aligned to a whole panel, not just to a line. At maxK=64 a panel is
+ * dim*64 = 512 bytes and the burst is 32 lines; AXI4 forbids an INCR burst
+ * from crossing a 4 KB boundary, and a panel-aligned base cannot, because the
+ * panel size divides 4096. At maxK=16 the burst was 128 bytes and this rarely
+ * bit - it is a real constraint now, and simulation cannot see it. */
+#define PANEL_ALIGN 1024
+static int8_t dma_a[16 * KSTAGE] __attribute__((aligned(PANEL_ALIGN)));
+static int8_t dma_b[16 * KSTAGE] __attribute__((aligned(PANEL_ALIGN)));
+
+/* One B panel per queued tile, each with distinct operands so a dropped or
+ * reordered descriptor shows up as a wrong answer. */
+#define QTILES 4
+#define QRESULT_BUF 0x00190000
+static int8_t dma_bq[QTILES][16 * KSTAGE] __attribute__((aligned(PANEL_ALIGN)));
 
 /* Eviction buffer: one line per set of the direct-mapped D-cache
  * (1024 sets x 16 B = 16 KB). */
@@ -268,19 +319,11 @@ int main() {
      * true once a cache-sized buffer joined .bss. */
     dcache_evict();
 
-    uart_print("buf ptr = ");
-    uart_print_int32((int32_t)(uintptr_t)buf);
-    uart_print("  RESULT_BUF = ");
-    uart_print_int32((int32_t)RESULT_BUF);
-    uart_print("\r\n");
-
-    uart_print("cpu reads buf[0..3]:");
-    for (int q = 0; q < 4; q++) {
-        uart_print(" ");
-        uart_print_int32(buf[q]);
-    }
-    uart_print("\r\n");
-
+    /* The pointer dump and the buf[0..3] trace that used to sit here were for
+     * diagnosing the coherence failure described above, which is now fixed and
+     * documented. The check below covers the same ground: a stale cache line
+     * makes these values wrong, and the expected set (4..256) is distinctive
+     * enough that stale or uninitialised memory cannot match by chance. */
     int dma_bad = 0;
     for (int i = 0; i < dim; i++)
         for (int j = 0; j < dim; j++)
@@ -324,8 +367,15 @@ int main() {
     uart_print("probe overhead      "); uart_print_int32(probe); uart_print("\r\n");
 
     /* klen=4 above keeps the correctness check readable; a representative
-     * operand load needs the full depth the array supports. */
-    const int kperf = (maxk < 16) ? maxk : 16;
+     * operand load needs the full depth the array supports.
+     *
+     * A deeper reduction is what makes the fixed per-tile costs pay: result
+     * writeback is dim*dim accumulators whatever K is, and so is the control
+     * traffic, so both amortise over 4x the arithmetic at K=64. */
+    const int kperf = (maxk < KSTAGE) ? maxk : KSTAGE;
+    /* Bytes per lane in the staged panels. maxK is a power of two >= 16, so a
+     * lane is a whole number of 16-byte lines and lanes stay line-aligned. */
+    const int lane_pitch = kperf;
     ACCEL_KLEN = kperf;
 
     t0 = CLINT_MTIME;
@@ -361,10 +411,82 @@ int main() {
     t1 = CLINT_MTIME;
     uint32_t c_dma = t1 - t0 - probe;
 
+    /* Same 16 lines, STRIDED destination - the discriminator for why a result
+     * write costs ~3x more per line than an operand read.
+     *
+     * A non-contiguous destination makes the DMA issue dim/4 lines per burst
+     * instead of the whole tile, so the identical payload crosses AXI as 8
+     * transactions rather than 1. Simulation reproduces the measured
+     * contiguous cost under either of two very different assumptions, and
+     * those two disagree sharply here:
+     *
+     *   slow write RESPONSE   -> cost follows TRANSACTIONS, ratio about 6.4x
+     *   slow write ACCEPTANCE -> cost follows BEATS, ratio about 2.3x
+     *
+     * The first is an acknowledgment the accelerator merely waits on and could
+     * overlap; the second is bandwidth that simply is not there. Measuring
+     * only the contiguous case cannot separate them, which is exactly why this
+     * second measurement exists. */
+    t0 = CLINT_MTIME;
+    ACCEL_DEST_ADDR   = RESULT_BUF;
+    ACCEL_DEST_STRIDE = dim * 4 * 2;
+    ACCEL_CTRL        = CTRL_START_DMA;
+    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_dma_strided = t1 - t0 - probe;
+    ACCEL_DEST_STRIDE = dim * 4;      /* restore contiguous for later tests */
+
+    /* Requantized INT8 writeback of the SAME accumulators.
+     *
+     * Accumulate wide, scale down, clamp on the way out - the ordinary output
+     * stage of a quantized INT8 GEMM, and what Gemmini and OpenGeMM both do
+     * before anything reaches memory. Here it is also the largest remaining
+     * lever: results are half the bytes a tile moves but 61% of its memory
+     * time, because this platform accepts writes at roughly a third the rate
+     * it serves reads. One byte per result instead of four turns a dim=8 tile
+     * from 16 lines into 4.
+     *
+     * C[i][j] = kperf*(i+1)*(j+1), so shift 6 divides out kperf=64 exactly and
+     * the expected value is (i+1)*(j+1) - 1..64, inside INT8 with no clipping,
+     * and different in every position so a mis-packed line cannot pass. */
+    ACCEL_OUT_CTRL    = OUT_INT8 | 6u;
+    t0 = CLINT_MTIME;
+    ACCEL_DEST_ADDR   = RESULT_BUF;
+    ACCEL_DEST_STRIDE = 0;
+    ACCEL_CTRL        = CTRL_START_DMA;
+    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_dma8 = t1 - t0 - probe;
+    ACCEL_OUT_CTRL    = 0;                /* back to INT32 for what follows */
+    ACCEL_DEST_STRIDE = dim * 4;
+
+    dcache_evict();
+    volatile int8_t *r8 = (volatile int8_t *)RESULT_BUF;
+    int bad_q = 0;
+    for (int i = 0; i < dim; i++)
+        for (int j = 0; j < dim; j++)
+            if (r8[i * dim + j] != (int8_t)((i + 1) * (j + 1))) bad_q++;
+    if (bad_q == 0) uart_print("PASS: INT8 requantized writeback correct\r\n");
+    else {
+        uart_print("FAIL: INT8 requantized results wrong: ");
+        uart_print_int32(bad_q); uart_print("\r\n");
+    }
+
     uart_print("operand load        "); uart_print_int32((int32_t)c_load); uart_print("\r\n");
     uart_print("compute             "); uart_print_int32((int32_t)c_comp); uart_print("\r\n");
     uart_print("readback (MMIO)     "); uart_print_int32((int32_t)c_mmio); uart_print("\r\n");
     uart_print("readback (DMA)      "); uart_print_int32((int32_t)c_dma);  uart_print("\r\n");
+
+    uart_print("readback (DMA,int8)  "); uart_print_int32((int32_t)c_dma8);
+    uart_print("\r\n");
+    uart_print("  int8 writeback speedup x100  ");
+    uart_print_int32(c_dma8 ? (int32_t)((c_dma * 100) / c_dma8) : 0);
+    uart_print("\r\n");
+    uart_print("readback (DMA,strided) ");
+    uart_print_int32((int32_t)c_dma_strided); uart_print("\r\n");
+    uart_print("  strided/contig x100  ");
+    uart_print_int32(c_dma ? (int32_t)((c_dma_strided * 100) / c_dma) : 0);
+    uart_print("   >=500 response-bound, <=300 acceptance-bound\r\n");
 
     /* Derived costs. These are the figures the simulation put at ~5.0 cycles
      * per AXI4-Lite beat and ~7.4 per 128-bit line, and from which the
@@ -500,12 +622,12 @@ int main() {
      */
     uart_print("\r\n--- operand DMA / scratchpad / double buffering ---\r\n");
 
-    /* Panels are staged with one lane per 16-byte line, which is what makes
-     * the burst possible. maxK is 16, so a lane is exactly one line. */
+    /* Panels are staged with lanes packed back to back, which is what makes
+     * the burst possible: a lane is lane_pitch bytes = kperf/16 lines. */
     for (int lane = 0; lane < dim; lane++)
-        for (int k = 0; k < 16; k++) {
-            dma_a[lane * 16 + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
-            dma_b[lane * 16 + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
+        for (int k = 0; k < lane_pitch; k++) {
+            dma_a[lane * lane_pitch + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
+            dma_b[lane * lane_pitch + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
         }
 
     t0 = CLINT_MTIME;
@@ -515,7 +637,7 @@ int main() {
 
     ACCEL_A_SRC      = (uint32_t)(uintptr_t)dma_a;
     ACCEL_B_SRC      = (uint32_t)(uintptr_t)dma_b;
-    ACCEL_SRC_STRIDE = 16;              /* packed -> single burst per panel */
+    ACCEL_SRC_STRIDE = lane_pitch;      /* packed -> single burst per panel */
     ACCEL_B_PANEL_LOAD = 0;
     ACCEL_B_PANEL_USE  = 0;
 
@@ -599,8 +721,139 @@ int main() {
         uart_print("\r\n");
     }
 
+    /* ============ descriptor queue: a batch of tiles, one kick ============
+     *
+     * Each tile has cost ~10 MMIO transactions of control - program the source
+     * and destination addresses, select panels, kick each of the three phases,
+     * poll each for completion. At the ~16 cycles a write costs on this SoC
+     * that is ~160 cycles, which becomes most of a tile once burst DMA cuts the
+     * data movement.
+     *
+     * A descriptor carries everything a tile needs. Software pushes a batch and
+     * kicks ONCE; the accelerator walks the queue itself, so there is no CPU
+     * round trip between load, compute and store, and no per-tile polling.
+     *
+     * Both schedules below run the SAME operands and are checked against the
+     * same closed form, so the difference is control overhead alone. Each tile
+     * uses a distinct B panel and its own destination, which means a sequencer
+     * that dropped, repeated or reordered a descriptor produces wrong answers
+     * rather than merely a different time.
+     */
+    uart_print("\r\n--- descriptor queue (batch of tiles) ---\r\n");
+
+    /* B panel p holds lane value (lane+1+p), so every tile has distinct
+     * operands and therefore a distinct expected result. */
+    for (int p = 0; p < QTILES; p++)
+        for (int lane = 0; lane < dim; lane++)
+            for (int k = 0; k < lane_pitch; k++)
+                dma_bq[p][lane * lane_pitch + k] =
+                    (int8_t)((k < kperf) ? (lane + 1 + p) : 0);
+
+    dcache_evict();
+
+    /* ---- STEPPED: software drives every phase, as before ---- */
+    t0 = CLINT_MTIME;
+    for (int p = 0; p < QTILES; p++) {
+        ACCEL_KLEN         = kperf;
+        ACCEL_A_SRC        = (uint32_t)(uintptr_t)dma_a;
+        ACCEL_B_SRC        = (uint32_t)(uintptr_t)dma_bq[p];
+        ACCEL_B_PANEL_LOAD = p;
+        /* B-only after the first tile, matching what the queued path does.
+         * If this stayed a full load, the stepped-vs-queued delta would mix
+         * the control saving with a bandwidth saving and the "control
+         * speedup" number would not mean what it says. */
+        ACCEL_CTRL         = p ? CTRL_START_LOAD_B : CTRL_START_LOAD;
+        while (!(ACCEL_STATUS & ST_LOAD_DONE)) {}
+        ACCEL_B_PANEL_USE  = p;
+        ACCEL_CTRL         = CTRL_START;
+        while (!(ACCEL_STATUS & ST_DONE)) {}
+        ACCEL_DEST_ADDR    = QRESULT_BUF + p * 0x1000;
+        ACCEL_DEST_STRIDE  = dim * 4;
+        ACCEL_CTRL         = CTRL_START_DMA;
+        while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    }
+    t1 = CLINT_MTIME;
+    uint32_t c_stepped = t1 - t0 - probe;
+
+    /* ---- QUEUED: push descriptors, kick once, poll once ----
+     *
+     * Requantized output for the batch too. C[i][j] = kperf*(i+1)*(j+1+p), so
+     * shift 6 divides out kperf=64 and leaves (i+1)*(j+1+p) - at most 8*11=88
+     * for the last tile, inside INT8 without clipping, and distinct in every
+     * position so a mis-packed line cannot pass.
+     *
+     * A requantized tile is dim*dim contiguous BYTES, so DEST_STRIDE must be 0
+     * here: a line spans 16/dim result rows and there is no row boundary to
+     * stride at. */
+    ACCEL_OUT_CTRL    = OUT_INT8 | 6u;
+    ACCEL_DEST_STRIDE = 0;
+    t0 = CLINT_MTIME;
+    for (int p = 0; p < QTILES; p++) {
+        ACCEL_DESC_A_SRC = (uint32_t)(uintptr_t)dma_a;
+        ACCEL_DESC_B_SRC = (uint32_t)(uintptr_t)dma_bq[p];
+        ACCEL_DESC_DEST  = QRESULT_BUF + p * 0x1000;
+        /* {bOnly[16], panelLoad[15:12], panelUse[11:8], kLen[7:0]}
+         *
+         * Every tile here shares dma_a, so only the first needs to fetch it.
+         * This is the ordinary shape of a tiled GEMM inner loop, not a
+         * property of this test: walking a row of C holds A fixed. */
+        ACCEL_DESC_PUSH  = (p ? DESC_BONLY : 0u)          |
+                           ((uint32_t)(p & 0xF) << 12)    |
+                           ((uint32_t)(p & 0xF) << 8)     |
+                           (uint32_t)kperf;
+    }
+    ACCEL_CTRL = CTRL_START_QUEUE;
+    while (!(ACCEL_STATUS & ST_QUEUE_DONE)) {}
+    t1 = CLINT_MTIME;
+    uint32_t c_queued = t1 - t0 - probe;
+
+    /* The DMA wrote DRAM behind the cache, so evict before reading it back. */
+    dcache_evict();
+
+    int q_bad = 0;
+    for (int p = 0; p < QTILES; p++) {
+        volatile int8_t *qb = (volatile int8_t *)(QRESULT_BUF + p * 0x1000);
+        for (int i = 0; i < dim; i++)
+            for (int j = 0; j < dim; j++)
+                if (qb[i * dim + j] != (int8_t)((i + 1) * (j + 1 + p)))
+                    q_bad++;
+    }
+
+    if (q_bad) {
+        fail_count++;
+        uart_print("FAIL: queue mismatches=");
+        uart_print_int32(q_bad);
+        uart_print("\r\n");
+    } else {
+        uart_print("PASS: queue ran ");
+        uart_print_int32(QTILES);
+        uart_print(" tiles correctly\r\n");
+    }
+
+    uart_print("stepped (per-phase MMIO) "); uart_print_int32((int32_t)c_stepped); uart_print("\r\n");
+    uart_print("queued  (one kick)       "); uart_print_int32((int32_t)c_queued);  uart_print("\r\n");
+    if (c_queued > 0) {
+        uart_print("  control speedup x100   ");
+        uart_print_int32((int32_t)((c_stepped * 100) / c_queued));
+        uart_print("\r\n");
+    }
+    uart_print("per tile: stepped "); uart_print_int32((int32_t)(c_stepped / QTILES));
+    uart_print(", queued ");          uart_print_int32((int32_t)(c_queued / QTILES));
+    uart_print("\r\n");
+
+    if (c_queued > 0) {
+        uart_print("queued MACs/cyc x100     ");
+        uart_print_int32((int32_t)(((uint32_t)QTILES * macs * 100) / c_queued));
+        uart_print("\r\n");
+        uart_print("vs scalar x100           ");
+        uart_print_int32((int32_t)((c_scalar * (uint32_t)QTILES * 100) / c_queued));
+        uart_print("\r\n");
+    }
+
     if (fail_count == 0) {
-        uart_print("=== ALL MATMUL CHECKS PASSED ===\r\n");
+        ACCEL_OUT_CTRL    = 0;
+    ACCEL_DEST_STRIDE = dim * 4;
+    uart_print("=== ALL MATMUL CHECKS PASSED ===\r\n");
     } else {
         uart_print("=== MATMUL FAILURES: ");
         uart_print_int32(fail_count);
