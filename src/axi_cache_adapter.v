@@ -82,6 +82,8 @@ module axi_cache_adapter #(
 
     (* mark_debug = "true" *) reg [ADDR_WIDTH-1:0] saved_addr;
     reg [LINE_BITS-1:0] saved_wline;
+    // Snapshot of the line currently being transmitted on a multi-line burst.
+    reg [LINE_BITS-1:0] wline_hold;
     (* mark_debug = "true" *) reg saved_write;
     (* mark_debug = "true" *) reg [7:0] saved_lines;
     // Registered per-line completion pulse. mem_rline is written on the beat
@@ -151,6 +153,7 @@ module axi_cache_adapter #(
             mem_wnext <= 1'b0;
             saved_addr <= {ADDR_WIDTH{1'b0}};
             saved_wline <= {LINE_BITS{1'b0}};
+            wline_hold <= {LINE_BITS{1'b0}};
             saved_write <= 1'b0;
             mem_rline <= {LINE_BITS{1'b0}};
             timeout_cnt <= 16'd0;
@@ -188,6 +191,25 @@ module axi_cache_adapter #(
                     beat_count <= beat_count + 8'd1;
                 end
             end
+
+            // Freeze the line being transmitted.
+            //
+            // m_axi_wdata sliced mem_wline LIVE on multi-line bursts, which is
+            // only safe while mem_wline holds still for a whole line. It does
+            // not: mem_wnext is pulsed one beat EARLY so the requester's FIFO
+            // can present the next line in time, so mem_wline changes while
+            // this line's last beat is still outstanding. Against a slave that
+            // accepts a beat every cycle that beat has already gone and
+            // nothing shows - which is why this survived a bitstream, a board
+            // run and every existing testbench. Deassert WREADY for a single
+            // cycle, which AXI4 permits a slave to do at any time, and the
+            // last beat of every line carries the NEXT line's bytes.
+            //
+            // Beat 0 keeps slicing mem_wline directly: beat_count wraps to 0 on
+            // the same edge the next line appears, so the latch is one cycle
+            // behind at exactly that point.
+            if (state == WRITE_DATA && beat_count == 8'd0)
+                wline_hold <= mem_wline;
 
             // Advance the write beat counter, wrapping per LINE so a burst
             // reuses the same slicing. mem_wnext pulses on each wrap so the
@@ -315,11 +337,15 @@ module axi_cache_adapter #(
                 begin
                     m_axi_wvalid = 1'b1;
                     // Single-line writes slice the latched copy, keeping the
-                    // cache path bit-identical. Multi-line bursts read mem_wline
-                    // live, which the requester advances on each mem_wnext.
+                    // cache path bit-identical. Multi-line bursts take beat 0
+                    // from mem_wline and every later beat from the frozen copy,
+                    // so a slave that stalls mid-line cannot pull in bytes from
+                    // the line the requester has already advanced to.
                     m_axi_wdata = (saved_lines == 8'd1)
                         ? saved_wline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH]
-                        : mem_wline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH];
+                        : (beat_count == 8'd0
+                            ? mem_wline[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH]
+                            : wline_hold[beat_count*AXI_DATA_WIDTH +: AXI_DATA_WIDTH]);
                     // WLAST marks the end of the whole burst, not of a line.
                     m_axi_wlast = (beat_count == AXI_LEN) &&
                                   (line_sent == saved_lines - 8'd1);
