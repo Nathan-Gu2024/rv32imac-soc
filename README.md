@@ -6,7 +6,7 @@ Xilinx Zynq-7020 FPGA and taken through an open-source ASIC flow. Includes a
 a Chisel-generated 8×8 INT8 systolic-array GEMM accelerator, and a Zephyr RTOS
 board port.
 
-**190.5 CoreMark @ 60 MHz — 3.17 CoreMark/MHz** on FPGA; a **105× measured
+**190.5 CoreMark @ 60 MHz — 3.18 CoreMark/MHz** on FPGA; a **105× measured
 speedup** on INT8 GEMM against the same core running the same kernel; and a
 **signed-off 10.58 mm² Sky130 GDSII** with eleven SRAM macros, LVS-clean and
 XOR-clean.
