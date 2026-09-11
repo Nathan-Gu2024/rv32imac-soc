@@ -34,6 +34,14 @@
 //   word 10 DEST_ADDR  (RW) byte address the result DMA writes to. Must be
 //                           16-byte aligned; the burst is dim*dim/4 lines of
 //                           128 bits, written in row-major accumulator order.
+//   word 20 DESC_PUSH  (W)  commits a descriptor. Layout:
+//                           {bOnly[16], panelLoad[15:12], panelUse[11:8], kLen[7:0]}
+//                           bOnly=1 fetches ONLY the B panel, leaving the A
+//                           panel resident from the previous tile. In a tiled
+//                           GEMM C[ti][tj] = A[ti]*B[tj], a row of tiles holds
+//                           ti fixed, so A is identical across all of them and
+//                           re-fetching it is pure waste: at dim=8,maxK=64 the
+//                           A panel is 32 of the 80 lines a tile moves.
 //   word 15 B_PANEL_USE (RW) which B scratchpad panel the ARRAY reads
 //   word 16 B_PANEL_LOAD(RW) which B panel a push or operand DMA WRITES.
 //                           Split from B_PANEL_USE so the next panel can be
@@ -106,11 +114,16 @@ class SystolicPE(width: Int = 8, accWidth: Int = 32) extends Module {
 class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
               val fifoDepth: Int = 8,
               val enableReadBursts: Boolean = true,
-              val enableWriteBursts: Boolean = true) extends RawModule {
+              val enableWriteBursts: Boolean = true,
+              val descDepth: Int = 8) extends RawModule {
   require(dim >= 1, "dim must be positive")
   require(maxK % 4 == 0, "maxK must be a multiple of 4: operands pack 4 INT8 per write")
   require(isPow2(maxK), "maxK is used as an index width; keep it a power of two")
   require(bPanels >= 1 && isPow2(bPanels), "bPanels must be a power of two")
+  // The operand DMA moves whole 128-bit lines and a lane is stored as 16-byte
+  // rows, so a lane shorter than one line has never been representable on that
+  // path - the byte guard that used to hide this just dropped the surplus.
+  require(maxK >= 16, "maxK must be at least 16: an operand row is one 128-bit line")
   require(fifoDepth >= 2, "the result FIFO needs at least two entries to run ahead")
 
   override def desiredName = "mm_accel"
@@ -120,6 +133,14 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
   val laneBits = log2Ceil(dim) max 1
   val accBits  = log2Ceil(dim * dim) max 1
   val panBits  = log2Ceil(bPanels) max 1
+  // 128-bit lines per lane: the unit both the DMA and the operand buffers work
+  // in. Hoisted here because the buffer declaration now needs it too.
+  val linesPerLane = maxK / 16
+  val lplBits      = log2Ceil(linesPerLane) max 1
+
+  // A k index splits into (row, byte) over the 16-byte operand rows.
+  private def kRow(k: UInt): UInt  = if (linesPerLane == 1) 0.U else k(kBits - 1, 4)
+  private def kByte(k: UInt): UInt = k(3, 0)
 
   val clk = IO(Input(Clock()))
   val rst = IO(Input(Bool()))
@@ -180,9 +201,56 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     val nGroups   = (dim * dim) / lineWords
     val grpBits   = log2Ceil(nGroups) max 1
 
+    // The result FIFO must hold an ENTIRE tile, not merely enough to run ahead.
+    // It is what frees the accumulators: once every line has been pushed, the
+    // array can start the next run while the FIFO drains to memory at whatever
+    // rate the platform accepts writes. At depth 8 against 16 lines per tile
+    // the accumulators stayed live for the whole ~178-cycle store, so the array
+    // sat idle through it; at nGroups they are free after nGroups cycles.
+    val fifoLines = fifoDepth max nGroups
+
+    // ---- INT8 requantized output geometry ----
+    //
+    // A raw INT32 accumulator is four bytes; a requantized result is one. That
+    // turns a dim=8 tile from 16 lines into 4, and result writeback was 61% of
+    // the tile's memory time because this platform accepts writes at roughly
+    // 1.4 B/cycle against 4.5 for reads. Accumulating wide and scaling down on
+    // the way out is also simply what a quantized INT8 GEMM does - Gemmini and
+    // OpenGeMM both requantize before anything reaches memory.
+    //
+    // A 16-byte line now holds 16 results, i.e. 16/dim whole result ROWS, so
+    // this needs dim to divide 16 and a tile to fill at least one line. dim=2
+    // gives a 4-byte tile and cannot: the line port has no byte strobes, so a
+    // partial line is not writable.
+    val int8Capable = (dim * dim) >= 16 && (16 % dim == 0)
+    val rowsPerLine = if (int8Capable) 16 / dim else 1
+    val nGroups8    = if (int8Capable) (dim * dim) / 16 else 1
+    val grp8Bits    = log2Ceil(nGroups8) max 1
+
     // FIFO fill pointer and remaining-group count.
     val fillGrp  = RegInit(0.U(grpBits.W))
     val fillLeft = RegInit(0.U(9.W))
+
+    // ---- descriptor queue ----
+    // One descriptor fully describes a tile: where A and B come from, where the
+    // result goes, and the geometry. Software stages the first three words and
+    // the write to DESC_PUSH commits the entry.
+    class Descriptor extends Bundle {
+      val aSrc = UInt(32.W)
+      val bSrc = UInt(32.W)
+      val dest = UInt(32.W)
+      val ctl  = UInt(32.W)
+    }
+    val descQ  = Module(new Queue(new Descriptor, descDepth))
+    val descA  = RegInit(0.U(32.W))
+    val descB  = RegInit(0.U(32.W))
+    val descD  = RegInit(0.U(32.W))
+    val qRun   = RegInit(false.B)
+    val qBusy  = RegInit(false.B)
+    val qDone  = RegInit(false.B)
+    // Set from the current descriptor: fetch only the B panel and leave A
+    // resident. See DESC_PUSH in the register map above.
+    val qBOnly = RegInit(false.B)
 
     val destAddr = RegInit(0.U(32.W))
     val dmaAddr  = RegInit(0.U(32.W))
@@ -234,18 +302,28 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // re-fetched identically for every tile in the strip.
     val ldBOnly   = RegInit(false.B)
 
-    // Operand buffers: registers rather than Mem, indexed [lane][k].
+    // Operand buffers: one synchronous-read memory per lane, 16-byte rows.
     //
-    // Mem would be the obvious choice, but the operand DMA fills these a whole
-    // 128-bit LINE at a time - 16 bytes, which at maxK=16 is one entire lane.
-    // Writing a byte-addressed Mem would take 16 cycles per lane against a
-    // ~9-cycle line fetch, making the buffer write the bottleneck instead of
-    // the memory. As registers a line lands in one cycle.
+    // These were flat registers indexed [lane][k], read COMBINATIONALLY at a
+    // dynamic k. That is exactly the structure the L1 caches were converted
+    // away from: an earlier revision read those arrays combinationally, could
+    // not infer block RAM, and cost ~11K LUTs and ~20K flops in distributed RAM
+    // plus F7/F8 mux trees. At maxK=16 the operand buffers were small enough
+    // that it never showed. At maxK=64 they are 20,480 bits behind a 64:1 mux
+    // per lane per panel, and firtool emitted 102K lines of Verilog for one
+    // accelerator - 17x the maxK=16 build.
     //
-    // Cost is dim*maxK bytes per buffer (128 B per buffer at dim=8, maxK=16),
-    // small next to the array itself, and Mem at this size lowers to flops or
-    // distributed RAM anyway.
-    val aRowBuf = Reg(Vec(dim, Vec(maxK, SInt(8.W))))
+    // A 16-byte row is the natural width: the operand DMA delivers a 128-bit
+    // LINE, so a whole row still lands in ONE cycle, which is the property the
+    // registers existed to provide. Byte-granular MMIO pushes survive through
+    // the write mask, so that path is unchanged.
+    //
+    // The read is synchronous, so the address is driven one cycle ahead - the
+    // same trick both caches use (the icache from the next PC, the dcache from
+    // a dedicated EX-stage adder). Within a run k advances by exactly one per
+    // cycle, so the next address is always known: no stall, no schedule change,
+    // and cycle counts stay identical to the register version.
+    val aMem = Seq.fill(dim)(SyncReadMem(linesPerLane, Vec(16, UInt(8.W))))
 
     // B SCRATCHPAD: bPanels column-panels held locally instead of one.
     //
@@ -263,12 +341,47 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     //
     // Cost is bPanels*dim*maxK bytes (512 B at dim=8, maxK=16, bPanels=4) -
     // cheap next to 64 PEs, and the FPGA build has 88% of its flops free.
-    val bColBuf = Reg(Vec(bPanels, Vec(dim, Vec(maxK, SInt(8.W)))))
+    // The panel index is folded into the ROW ADDRESS rather than selected by a
+    // mux after the read. That removes the bPanels-way mux on the array's
+    // critical path entirely - and with it the packed-array lowering that made
+    // bPanels=2 fail to elaborate while 1, 4 and 8 happened to survive.
+    val bMem = Seq.fill(dim)(SyncReadMem(bPanels * linesPerLane, Vec(16, UInt(8.W))))
+
+    // Panel p occupies rows [p*linesPerLane, (p+1)*linesPerLane). The multiply
+    // is by a power-of-two constant, so it lowers to a concatenation.
+    def bAddr(panel: UInt, row: UInt): UInt =
+      if (bPanels == 1) row else (panel * linesPerLane.U) + row
+
+    // ONE write port per buffer, shared by the MMIO push path and the operand
+    // DMA. They cannot collide - a push is an AXI transaction and the DMA
+    // writes only while ldBusy - but written as two separate .write() sites
+    // firtool emitted a 1R2W memory, which no block RAM or SRAM macro can
+    // implement, so the whole point of moving off registers would have been
+    // lost. Driving shared wires keeps each buffer a plain 1R1W.
+    val aRowW = log2Ceil(linesPerLane) max 1
+    val bRowW = log2Ceil(bPanels * linesPerLane) max 1
+    val aWen  = WireDefault(VecInit(Seq.fill(dim)(false.B)))
+    val bWen  = WireDefault(VecInit(Seq.fill(dim)(false.B)))
+    val aWrow = WireDefault(VecInit(Seq.fill(dim)(0.U(aRowW.W))))
+    val bWrow = WireDefault(VecInit(Seq.fill(dim)(0.U(bRowW.W))))
+    val wData = WireDefault(VecInit(Seq.fill(dim)(VecInit(Seq.fill(16)(0.U(8.W))))))
+    val wMask = WireDefault(VecInit(Seq.fill(dim)(VecInit(Seq.fill(16)(false.B)))))
+    for (i <- 0 until dim) {
+      when(aWen(i)) { aMem(i).write(aWrow(i), wData(i), wMask(i)) }
+      when(bWen(i)) { bMem(i).write(bWrow(i), wData(i), wMask(i)) }
+    }
 
     // Which panel the ARRAY reads during a run, and which the DMA/push WRITES.
     // Separate registers on purpose: that split is what allows the next panel
     // to be filled while the current one feeds a run - double buffering, once
     // the fill no longer has to be serialised behind compute.
+    // OUT_CTRL: {int8[8], shift[4:0]}. Default 0 keeps the INT32 behaviour
+    // every existing driver and testbench depends on - requantization is
+    // opt-in, because it changes the output TYPE, not merely its encoding.
+    val outShift = RegInit(0.U(5.W))
+    val int8Req  = RegInit(false.B)
+    val int8Mode = if (int8Capable) int8Req else false.B
+
     val bPanelUse  = RegInit(0.U(panBits.W))
     val bPanelLoad = RegInit(0.U(panBits.W))
 
@@ -374,6 +487,78 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // run concurrently with compute. Safe only when B_PANEL_LOAD differs from
     // B_PANEL_USE - software's responsibility, and what double buffering means.
     val ldStartB     = doWrite && (waddrWord === 0.U) && s_axi_wdata(4) && !ldBusy && !dmaBusy
+    // CTRL bit5 starts the queue. Writing DESC_PUSH (word 20) commits a
+    // descriptor built from the three staged words plus this one.
+    val qStartPulse  = doWrite && (waddrWord === 0.U) && s_axi_wdata(5) && !qBusy
+    val descPush     = doWrite && (waddrWord === 20.U)
+
+    descQ.io.enq.valid     := descPush
+    descQ.io.enq.bits.aSrc := descA
+    descQ.io.enq.bits.bSrc := descB
+    descQ.io.enq.bits.dest := descD
+    descQ.io.enq.bits.ctl  := s_axi_wdata
+    descQ.io.deq.ready     := false.B
+
+    // ---- queue sequencer ----
+    // Per descriptor: fetch operands, compute, write results back - with no CPU
+    // round trip between phases. Each phase has a one-cycle issue state and a
+    // wait state, so the pulses below are naturally single-cycle.
+    val qIdle :: qLoad :: qLoadW :: qComp :: qCompW :: qStore :: qStoreW :: Nil = Enum(7)
+    val qState = RegInit(qIdle)
+
+    when(qStartPulse) {
+      qRun  := true.B
+      qBusy := true.B
+      qDone := false.B
+    }
+
+    switch(qState) {
+      is(qIdle) {
+        when(qRun && descQ.io.deq.valid) {
+          // Adopt the descriptor's geometry, then retire it immediately: the
+          // config registers hold everything the phases need from here on.
+          aSrcAddr   := descQ.io.deq.bits.aSrc
+          bSrcAddr   := descQ.io.deq.bits.bSrc
+          destAddr   := descQ.io.deq.bits.dest
+          kLen       := descQ.io.deq.bits.ctl(7, 0)
+          bPanelUse  := descQ.io.deq.bits.ctl(8 + panBits - 1, 8)
+          bPanelLoad := descQ.io.deq.bits.ctl(12 + panBits - 1, 12)
+          qBOnly     := descQ.io.deq.bits.ctl(16)
+          descQ.io.deq.ready := true.B
+          qState := qLoad
+        }.elsewhen(qRun && !descQ.io.deq.valid && !dmaBusy) {
+          // Queue drained AND the last store has completed. The !dmaBusy term
+          // is load-bearing now that qStoreW releases on the drain rather than
+          // on completion: without it the batch could report DONE with a write
+          // still in flight, and software would read the destination early.
+          qRun  := false.B
+          qBusy := false.B
+          qDone := true.B
+        }
+      }
+      is(qLoad)   { qState := qLoadW }
+      is(qLoadW)  { when(ldDone)  { qState := qComp  } }
+      is(qComp)   { qState := qCompW }
+      // Only one result DMA may be in flight: entering qStore asserts
+      // dmaStartAny, which reloads dmaAddr and fillLeft, so doing that while
+      // the previous store is still draining would redirect it mid-transfer.
+      is(qCompW)  { when(done && !dmaBusy) { qState := qStore } }
+      is(qStore)  { qState := qStoreW }
+      // Release the array as soon as the accumulators are DRAINED, not when
+      // the write completes. A store is two separate things: pushing nGroups
+      // lines into the result FIFO, which takes nGroups cycles, and getting
+      // those lines into memory, which takes ~178 on hardware because the
+      // write port accepts roughly a beat every five cycles. Only the first
+      // needs the accumulators. Waiting for dmaDone held the entire array idle
+      // through a transfer it had already finished contributing to.
+      //
+      // The next tile's load then overlaps the tail of this store; the port
+      // arbitration keeps them from colliding, so the load waits for the port
+      // while the rest of its sequencing proceeds.
+      is(qStoreW) {
+        when(dmaDone || (dmaBusy && fillLeft === 0.U)) { qState := qIdle }
+      }
+    }
 
     val pushA = doWrite && !busy && (waddrWord === 5.U)
     val pushB = doWrite && !busy && (waddrWord === 6.U)
@@ -385,8 +570,15 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       when(waddrWord === 12.U) { aSrcAddr   := s_axi_wdata } // A_SRC_ADDR
       when(waddrWord === 13.U) { bSrcAddr   := s_axi_wdata } // B_SRC_ADDR
       when(waddrWord === 14.U) { srcStride  := s_axi_wdata } // SRC_STRIDE
+      when(waddrWord === 22.U) {                      // OUT_CTRL
+        outShift := s_axi_wdata(4, 0)
+        int8Req  := s_axi_wdata(8)
+      }
       when(waddrWord === 15.U) { bPanelUse  := s_axi_wdata(panBits - 1, 0) }
       when(waddrWord === 16.U) { bPanelLoad := s_axi_wdata(panBits - 1, 0) }
+      when(waddrWord === 17.U) { descA := s_axi_wdata }   // DESC_A_SRC
+      when(waddrWord === 18.U) { descB := s_axi_wdata }   // DESC_B_SRC
+      when(waddrWord === 19.U) { descD := s_axi_wdata }   // DESC_DEST
       when(waddrWord === 3.U) { loadK := s_axi_wdata(kGrpBits - 1, 0) }
       when(waddrWord === 4.U) {
         loadLane := s_axi_wdata(laneBits - 1, 0)
@@ -399,11 +591,18 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       // rewrite between them.
       for (i <- 0 until dim) {
         when(loadLane === i.U) {
-          for (b <- 0 until 4) {
-            val addr = Cat(loadK, b.U(2.W))
-            val byte = s_axi_wdata(8 * b + 7, 8 * b).asSInt
-            when(pushA) { aRowBuf(i)(addr) := byte }
-            when(pushB) { bColBuf(bPanelLoad)(i)(addr) := byte }
+          // A push carries 4 packed bytes at a 4-byte-aligned k, so they always
+          // land in the same 16-byte row: one masked write, not four.
+          val row = if (linesPerLane == 1) 0.U else loadK(kGrpBits - 1, 2)
+          val grp = loadK(1, 0)
+          when(pushA || pushB) {
+            wData(i) := VecInit(Seq.tabulate(16)(b =>
+                          s_axi_wdata(8 * (b % 4) + 7, 8 * (b % 4))))
+            wMask(i) := VecInit(Seq.tabulate(16)(b => (b / 4).U === grp))
+            aWrow(i) := row
+            bWrow(i) := bAddr(bPanelLoad, row)
+            aWen(i)  := pushA
+            bWen(i)  := pushB
           }
         }
       }
@@ -433,9 +632,12 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // Total length K_LEN + 2*(dim-1): a value fed to row i needs j more hops to
     // reach PE(i,j), so PE(i,j)'s last term (k = K_LEN-1) lands at t = k+i+j.
     val lastT = kLen + (2 * (dim - 1)).U - 1.U
+    // The sequencer issues the same phase starts software would, so both paths
+    // share one implementation rather than duplicating the run logic.
+    val startAny = startPulse || (qState === qComp)
     when(softRstPulse) {
       busy := false.B; done := false.B; t := 0.U
-    }.elsewhen(startPulse) {
+    }.elsewhen(startAny) {
       busy := true.B; done := false.B; t := 0.U
     }.elsewhen(busy) {
       when(t === lastT) { busy := false.B; done := true.B }
@@ -443,23 +645,30 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     }
 
     // ---- skewed edge feed: row i's k-th value enters at t = k+i ----
+    //
+    // The operand rows are read SYNCHRONOUSLY, so each lane's address is driven
+    // one cycle early. Lane i needs k = t-i in cycle t, and t is a counter, so
+    // the address to present now is simply the row holding k = (t+1)-i.
+    //
+    // On the start pulse t has not been reset yet, so the general expression
+    // would use the OLD t. Row 0 is forced instead: at t=0 lane 0 is the only
+    // lane with a valid k, and it needs k=0. Every later lane i first becomes
+    // valid at t=i, whose address was computed normally at t=i-1.
     val aEdge = Wire(Vec(dim, SInt(8.W)))
     val bEdge = Wire(Vec(dim, SInt(8.W)))
     for (i <- 0 until dim) {
+      val kNext  = Mux(startAny, 0.S, t.zext + 1.S - i.S)
+      // Past the end of a run kNext can exceed maxK; the row wraps and the data
+      // is discarded by kValid, so only the width needs bounding here.
+      val rowNext = kRow(Mux(kNext < 0.S, 0.S, kNext).asUInt.pad(kBits))
+      val aRd = aMem(i).read(rowNext)
+      val bRd = bMem(i).read(bAddr(bPanelUse, rowNext))
+
       val kIdx   = t.zext - i.S                    // goes negative early in a run
       val kValid = (kIdx >= 0.S) && (kIdx < kLen.zext)
       val kSel   = kIdx.asUInt(kBits - 1, 0)
-      aEdge(i) := Mux(kValid, aRowBuf(i)(kSel), 0.S)
-      // Panel select as an explicit mux over STATIC panel indices.
-      //
-      // The natural form, bColBuf(bPanelUse)(i)(kSel), is a dynamic index into
-      // a Vec of Vec of Vec, which firtool lowers to a packed-array expression
-      // that our disallowPackedArrays option rejects. It happened to lower
-      // cleanly at bPanels 1, 4 and 8 and failed only at 2, so the whole class
-      // of bug was invisible until bPanels was actually swept.
-      bEdge(i) := Mux(kValid,
-                      VecInit((0 until bPanels).map(p => bColBuf(p)(i)(kSel)))(bPanelUse),
-                      0.S)
+      aEdge(i) := Mux(kValid, aRd(kByte(kSel)).asSInt, 0.S)
+      bEdge(i) := Mux(kValid, bRd(kByte(kSel)).asSInt, 0.S)
     }
 
     // ---- PE array ----
@@ -518,31 +727,84 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       lineData := rowLineReg(rowSelDma)
     }
 
+    // ---- requantized line: 16 results instead of 4 ----
+    //
+    // Round-half-up, arithmetic shift, saturate to INT8. The accumulator stays
+    // 32-bit - that is the whole point of accumulating wide - and only the
+    // value that LEAVES is narrowed.
+    //
+    // Saturation is not optional. At K=64 an INT8 dot product reaches
+    // 64*127*127, which needs 21 bits, so any shift small enough to preserve
+    // precision on typical data will still clip on outliers. Wrapping there
+    // would turn a large positive result into a large negative one silently.
+    def requant(acc: SInt): SInt = {
+      val half    = Mux(outShift === 0.U, 0.U(32.W), (1.U(32.W) << (outShift - 1.U))(31, 0))
+      val rounded = acc +& half.zext
+      val shifted = rounded >> outShift
+      Mux(shifted > 127.S, 127.S(8.W),
+        Mux(shifted < -128.S, (-128).S(8.W), shifted(7, 0).asSInt))
+    }
+
+    val lineData8 = Wire(UInt(128.W))
+    if (int8Capable) {
+      // A result ROW becomes dim bytes, and rowsPerLine of them fill a line.
+      // Requantizing at the PE output means the selection mux downstream runs
+      // on bytes rather than 32-bit words - a quarter of the wires that made
+      // global routing fail at dim=16, so this path needs no two-stage trick.
+      val rowBytes = VecInit(pes.map(row =>
+        Cat(row.map(pe => requant(pe.io.acc).asUInt).reverse)))
+      val lines8 = VecInit((0 until nGroups8).map { g =>
+        Cat((0 until rowsPerLine).map(r => rowBytes(g * rowsPerLine + r)).reverse)
+      })
+      // Registered to match the INT32 path's latency exactly, so dmaSettle
+      // stays correct for both.
+      lineData8 := RegNext(
+        if (nGroups8 == 1) lines8(0) else lines8(fillGrp(grp8Bits - 1, 0)))
+    } else {
+      lineData8 := 0.U
+    }
+
+    // How many lines a tile occupies, and which line feed the FIFO takes.
+    val nGroupsEff = if (int8Capable) Mux(int8Mode, nGroups8.U, nGroups.U)
+                     else nGroups.U
+    val lineOut    = if (int8Capable) Mux(int8Mode, lineData8, lineData)
+                     else lineData
+
     // ---- operand load: fetch A and B panels as 128-bit lines ----
     //
-    // A lane is kLen bytes. At maxK=16 that is exactly one line, so linesPerLane
-    // is 1 and a whole lane lands in a single cycle - which is why the operand
-    // buffers became registers. The general form is kept so a larger maxK only
-    // changes a constant.
-    val linesPerLane = if (maxK > 16) maxK / 16 else 1
-    val lplBits      = log2Ceil(linesPerLane) max 1
-    val ldTotal      = 2 * dim * linesPerLane        // both panels
-    val ldIdxBits    = log2Ceil(ldTotal) max 1
+    // How many 128-bit lines a lane occupies for THIS RUN - a runtime value,
+    // not the compile-time linesPerLane.
+    //
+    // Fetching linesPerLane lines unconditionally is correct but wasteful: a
+    // maxK=64 build running K_LEN=16 moved four lines per lane where one holds
+    // all the data, and measured 490 cycles per tile against the maxK=16
+    // build's 133 on identical work. Raising maxK must not penalise every run
+    // that does not use it.
+    val ldLines = if (linesPerLane == 1) 1.U else {
+      val ceilLines = (kLen +& 15.U)(8, 4)               // ceil(kLen/16)
+      val clamped   = Mux(ceilLines > linesPerLane.U, linesPerLane.U, ceilLines)
+      Mux(ceilLines === 0.U, 1.U, clamped)((lplBits + 1) - 1, 0)
+    }
 
-    val ldIdx  = RegInit(0.U(ldIdxBits.W))
-    val ldAddr = RegInit(0.U(32.W))
-    val ldReq  = RegInit(false.B)
+    val ldAddr  = RegInit(0.U(32.W))
+    val ldReq   = RegInit(false.B)
 
-    // Which panel/lane/chunk this index refers to. Second half of the sequence
-    // is the B panel.
-    val ldInB   = if (dim * linesPerLane == 0) false.B else ldIdx >= (dim * linesPerLane).U
-    val ldLocal = Mux(ldInB, ldIdx - (dim * linesPerLane).U, ldIdx)
-    val ldLane  = if (linesPerLane == 1) ldLocal else (ldLocal >> lplBits)
-    val ldChunk = if (linesPerLane == 1) 0.U else ldLocal(lplBits - 1, 0)
+    // Panel / lane / chunk as three explicit counters rather than one flat
+    // index. The flat form divided by a COMPILE-TIME linesPerLane to recover
+    // the lane, which cannot express a per-run line count; counting the chunk
+    // inside the lane needs no divide at all.
+    val ldInB   = RegInit(false.B)
+    val ldLane  = RegInit(0.U(laneBits.W))
+    val ldChunk = RegInit(0.U(lplBits.W))
 
-    // Effective per-lane stride: 0 means panels are packed, one lane after
-    // another with no gap, i.e. stride = kLen bytes.
-    val effSrcStride = Mux(srcStride === 0.U, kLen, srcStride)
+    val ldLastChunk = ldChunk === (ldLines - 1.U)
+    val ldLastLane  = ldLane === (dim - 1).U
+    val ldPanelEnd  = ldLastLane && ldLastChunk
+
+    // Effective per-lane stride: 0 means lanes are packed with no gap. That is
+    // a whole number of LINES per lane, which equals kLen only when kLen is a
+    // multiple of 16 - the buffers are addressed in 16-byte rows.
+    val effSrcStride = Mux(srcStride === 0.U, (ldLines << 4).asUInt, srcStride)
 
     // ---- burst fast path ----
     //
@@ -556,55 +818,73 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // falls back to per-line requests and gains nothing. That makes packed
     // operand staging a real software contract for the fast path, not a
     // preference.
-    val linesPerPanel = dim * linesPerLane
-    // Bursting is off by default: it regressed measured hardware throughput
-    // (29.87 -> 61.18 cycles per line) while never actually engaging.
+    // dim is a power of two, so this multiply is a shift.
+    val linesPerPanel = (if (dim == 1) ldLines else (ldLines << log2Ceil(dim)).asUInt)
     // Operand fetch bursts. Safe direction: the adapter receives here, so it
     // can never stall waiting for the requester to present data.
-    val burstOK       = if (enableReadBursts) effSrcStride === (16 * linesPerLane).U
+    val burstOK       = if (enableReadBursts) effSrcStride === (ldLines << 4).asUInt
                         else false.B
     val panelBase     = Mux(ldInB, bSrcAddr, aSrcAddr)
     val ldBase       = Mux(ldInB, bSrcAddr, aSrcAddr)
     val ldNextAddr   = ldBase + (ldLane * effSrcStride) + (ldChunk << 4.U)
 
-    when(ldStart || ldStartB) {
+    val ldStartAny = ldStart || ldStartB || (qState === qLoad)
+    when(ldStartAny) {
       ldBusy  := true.B
       ldDone  := false.B
-      ldBOnly := ldStartB
-      // A B-only load starts partway through the sequence, at the first B line.
-      ldIdx   := Mux(ldStartB, (dim * linesPerLane).U, 0.U)
-      ldAddr  := Mux(ldStartB, bSrcAddr, aSrcAddr)
+      // A queue-driven load always fetches both panels; only an explicit
+      // CTRL bit4 asks for B alone.
+      // Two ways to ask for a B-only load: CTRL bit4 directly, or a queued
+      // descriptor with bOnly set. The queue used to force a full load
+      // unconditionally, so a batch walking one tile ROW re-fetched the same A
+      // panel for every tile - half the operand traffic, discarded.
+      val bOnly = (ldStartB && (qState =/= qLoad)) || ((qState === qLoad) && qBOnly)
+      ldBOnly := bOnly
+      ldInB   := bOnly
+      ldLane  := 0.U
+      ldChunk := 0.U
+      ldAddr  := Mux(bOnly, bSrcAddr, aSrcAddr)
       ldReq   := true.B
     }.elsewhen(ldBusy) {
-      when(mem_ready) {
+      // mem_ready belongs to whoever owns the port. With a store in flight it
+      // is the store's completion, and consuming it here would advance the
+      // load by a line it never received.
+      when(mem_ready && !dmaBusy) {
         // Capture the returned line into its lane. 16 bytes at a time; the
         // buffers are registers precisely so this costs one cycle.
         for (i <- 0 until dim) {
           when(ldLane === i.U) {
-            for (b <- 0 until 16) {
-              val kOff = if (linesPerLane == 1) b.U(kBits.W)
-                         else (ldChunk << 4.U).asUInt + b.U
-              when(kOff < maxK.U) {
-                val byte = mem_rline(8 * b + 7, 8 * b).asSInt
-                when(!ldInB) { aRowBuf(i)(kOff) := byte }
-                  .otherwise { bColBuf(bPanelLoad)(i)(kOff) := byte }
-              }
-            }
+            // A returned line IS a row, so this is one full-width write rather
+            // than sixteen byte writes - the property the registers existed to
+            // provide, kept intact by the row layout.
+            val row = if (linesPerLane == 1) 0.U else ldChunk
+            wData(i) := VecInit(Seq.tabulate(16)(b => mem_rline(8 * b + 7, 8 * b)))
+            wMask(i) := VecInit(Seq.fill(16)(true.B))
+            aWrow(i) := row
+            bWrow(i) := bAddr(bPanelLoad, row)
+            aWen(i)  := !ldInB
+            bWen(i)  := ldInB
           }
         }
-        when(ldIdx === (ldTotal - 1).U) {
+        when(ldPanelEnd && ldInB) {
           ldBusy := false.B
           ldDone := true.B
           ldReq  := false.B
         }.otherwise {
-          ldIdx := ldIdx + 1.U
+          when(ldLastChunk) {
+            ldChunk := 0.U
+            when(ldLastLane) { ldInB := true.B; ldLane := 0.U }
+              .otherwise     { ldLane := ldLane + 1.U }
+          }.otherwise {
+            ldChunk := ldChunk + 1.U
+          }
           // In burst mode the arbiter has already latched a request covering
           // the whole panel, so valid must DROP after the first line or the
           // arbiter would start a second transaction when this one retires.
           // It is re-asserted only at the A->B panel boundary, where a new
           // burst genuinely begins. Per-line mode re-requests every line.
           when(burstOK) {
-            ldReq := (ldIdx + 1.U) === linesPerPanel.U
+            ldReq := !ldInB && ldPanelEnd
           }.otherwise {
             ldReq := true.B
           }
@@ -637,9 +917,9 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // Output FIFO. The mux fills it at one line every other cycle; the burst
     // drains it at AXI rate. Depth only has to cover the difference, so a
     // handful of entries is enough - this is a rate matcher, not a store.
-    val lineFifo = Module(new Queue(UInt(128.W), fifoDepth))
+    val lineFifo = Module(new Queue(UInt(128.W), fifoLines))
     lineFifo.io.enq.valid := false.B
-    lineFifo.io.enq.bits  := lineData
+    lineFifo.io.enq.bits  := lineOut
     lineFifo.io.deq.ready := false.B
 
     // Fill pipeline: fillGrp selects, rowLineReg lands one cycle later, so a
@@ -649,7 +929,7 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // alone dropped that in-flight line whenever the queue filled in between,
     // silently skipping a result group.
     val fillFire  = dmaBusy && (fillLeft =/= 0.U) &&
-                    (lineFifo.io.count < (fifoDepth - 1).U)
+                    (lineFifo.io.count < (fifoLines - 1).U)
     val fillValid = RegNext(fillFire, false.B)
 
     when(fillFire) {
@@ -687,24 +967,33 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // Result writeback bursts stay OFF: the adapter must be fed a line per
     // BEATS_PER_LINE beats, and the registered accumulator mux cannot sustain
     // that without a deeper prefetch than the current FIFO provides.
-    val wBurstLines = if (enableWriteBursts) Mux(destContig, nGroups.U, rowLinesU)
+    // In INT8 mode a line spans rowsPerLine result rows, so there is no row
+    // boundary to stride at: the tile lands as dim*dim contiguous bytes. That
+    // is a documented constraint of the mode, not an oversight - placing a
+    // requantized tile inside a wider matrix needs either dim >= 16 (one row
+    // per line) or a software copy.
+    val destContigEff = destContig || int8Mode
+    val wBurstLines = if (enableWriteBursts)
+                        Mux(int8Mode, nGroups8.U,
+                            Mux(destContig, nGroups.U, rowLinesU))
                       else 1.U
 
     val dmaSent = RegInit(0.U(9.W))     // lines accepted by memory so far
 
-    when(dmaStart) {
+    val dmaStartAny = dmaStart || (qState === qStore)
+    when(dmaStartAny) {
       dmaBusy    := true.B
       dmaDone    := false.B
       dmaAddr    := destAddr
       dmaRowBase := destAddr
       fillGrp    := 0.U
-      fillLeft   := nGroups.U
+      fillLeft   := nGroupsEff
       dmaSent    := 0.U
     }.elsewhen(dmaBusy) {
       // mem_ready marks the END of a whole burst, not of a line.
       when(mem_ready) {
         val nextSent = dmaSent + wBurstLines
-        when(nextSent >= nGroups.U) {
+        when(nextSent >= nGroupsEff) {
           dmaBusy := false.B
           dmaDone := true.B
         }.otherwise {
@@ -715,7 +1004,7 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
           val atRowEndSent: Bool =
             if (!strideOK || perRowGrp == 1) true.B
             else nextSent(log2Ceil(perRowGrp) - 1, 0) === 0.U
-          when(destContig) {
+          when(destContigEff) {
             dmaAddr := dmaAddr + (wBurstLines << 4.U)
           }.elsewhen(atRowEndSent) {
             dmaAddr    := dmaRowBase + effStride
@@ -750,15 +1039,21 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // is started. Gated on the FIFO having a line so the burst never begins
     // ahead of its data.
     val dmaDrive = dmaBusy && lineFifo.io.deq.valid
-    mem_req_valid := dmaDrive || (ldBusy && ldReq)
-    mem_req_write := dmaDrive                          // loads are reads
+    // An operand load may now be in flight at the same time as a result store,
+    // because the queue releases the array as soon as the accumulators drain.
+    // They cannot share the port, so the DMA holds it for the WHOLE
+    // transaction - gated on dmaBusy, not dmaDrive, since a momentarily empty
+    // FIFO must not hand the port to the load mid-burst.
+    val ldDrive  = ldBusy && ldReq && !dmaBusy
+    mem_req_valid := dmaDrive || ldDrive
+    mem_req_write := dmaBusy                           // loads are reads
     // A burst addresses the PANEL BASE and covers linesPerPanel lines; the
     // per-line path addresses each line individually with a length of 1.
-    mem_req_addr  := Mux(dmaDrive, dmaAddr,
+    mem_req_addr  := Mux(dmaBusy, dmaAddr,
                          Mux(burstOK, panelBase, ldNextAddr))
     mem_wline     := lineFifo.io.deq.bits
-    mem_req_lines := Mux(dmaDrive, wBurstLines,
-                         Mux(burstOK, linesPerPanel.U, 1.U))
+    mem_req_lines := Mux(dmaBusy, wBurstLines,
+                         Mux(burstOK, linesPerPanel, 1.U))
 
 
     // ---- read mux ----
@@ -792,14 +1087,18 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     val results   = rowSelReg(resRow)
     val rdata     = WireDefault(0.U(32.W))
     switch(raddrWord) {
-      is(1.U)  { rdata := Cat(0.U(26.W), ldDone, ldBusy, dmaDone, dmaBusy, done, busy) }
+      is(1.U)  { rdata := Cat(0.U(24.W), qDone, qBusy, ldDone, ldBusy,
+                              dmaDone, dmaBusy, done, busy) }
       is(10.U) { rdata := destAddr }
       is(11.U) { rdata := destStride }
       is(12.U) { rdata := aSrcAddr }
       is(13.U) { rdata := bSrcAddr }
       is(14.U) { rdata := srcStride }
+      is(22.U) { rdata := Cat(0.U(23.W), int8Mode, 0.U(3.W), outShift) }
       is(15.U) { rdata := bPanelUse }
       is(16.U) { rdata := bPanelLoad }
+      // Free slots left, so software can push without overflowing.
+      is(21.U) { rdata := Cat(0.U(24.W), (descDepth.U - descQ.io.count)) }
       is(2.U) { rdata := kLen }
       is(3.U) { rdata := loadK }
       is(4.U) { rdata := loadLane }
