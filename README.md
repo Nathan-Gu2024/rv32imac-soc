@@ -20,7 +20,7 @@ XOR-clean.
 | Metric | Value |
 |---|---|
 | CoreMark | **190.49 iterations/sec** @ 60 MHz (2000 iterations, validated run) |
-| CoreMark/MHz | **3.17** |
+| CoreMark/MHz | **3.18** |
 | Fmax | 60 MHz, WNS +0.72 ns |
 | Utilization | 13% LUT · 6% FF · 22% BRAM · 2% DSP |
 | On-chip power | 1.51 W |
