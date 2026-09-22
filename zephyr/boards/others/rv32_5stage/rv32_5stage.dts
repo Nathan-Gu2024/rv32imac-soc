@@ -32,6 +32,13 @@
 			riscv,isa-extensions = "i", "m", "c", "zicsr";
 			status = "okay";
 
+			/* dcache_bram.v LINE_BYTES. The i-cache uses the same
+			 * line size, but is not described as maintainable:
+			 * icache_bram.v has no CPU-side write path, so there
+			 * is no way to invalidate it from software.
+			 */
+			d-cache-line-size = <16>;
+
 			intc0: interrupt-controller {
 				compatible = "riscv,cpu-intc";
 				interrupt-controller;
@@ -45,14 +52,28 @@
 	 * DDR3 via S_AXI_HP0 (see axi_cache_adapter.v / icache.v / dcache.v).
 	 * Zephyr's image runs entirely out of here - the CPU's reset vector
 	 * is fixed at TCM_BASE (0x4000_0000) in program_counter, so a small
-	 * hand-written boot stub baked into TCM (outside of Zephyr's own
-	 * build/devicetree, see fpga/ddr.mem) jumps here before Zephyr's own
-	 * _start ever runs. TCM itself is intentionally NOT described here
-	 * since Zephyr never touches it directly once running.
+	 * hand-written boot stub baked into TCM (fpga/ddr_fixed.mem, outside
+	 * Zephyr's own build/devicetree) jumps here before Zephyr's own _start
+	 * ever runs. TCM itself is intentionally NOT described here since
+	 * Zephyr never touches it directly once running.
+	 *
+	 * THE BASE IS 0x0010_0000, NOT 0, AND IT IS NOT FREE TO CHANGE.
+	 *
+	 * The boot stub ends in `lui t0, 0x100; jalr x0, 0(t0)` - a jump to a
+	 * hard-coded 0x0010_0000. An image linked anywhere else is never
+	 * entered: the core jumps to 0x0010_0000 regardless and executes
+	 * whatever was last left there, which presents as garbled UART output
+	 * from a previous program rather than as a failure to boot.
+	 *
+	 * 0x0010_0000 is also what fpga/linker/linker_ddr.ld uses for the
+	 * bare-metal programs, and for a second reason worth keeping: the low
+	 * 256 KB aliases with the Zynq-7000's Low OCM remap and is not
+	 * reliably reachable over the PL's AXI HP0 port. Starting at 1 MB
+	 * clears that window as well.
 	 */
-	ram0: memory@0 {
+	ram0: memory@100000 {
 		device_type = "memory";
-		reg = <0x00000000 DT_SIZE_M(512)>;
+		reg = <0x00100000 DT_SIZE_M(511)>;
 	};
 
 	soc {
@@ -101,6 +122,25 @@
 		 * or similar. Source 0 (TX-complete) and source 1 (RX-data)
 		 * on intc1.
 		 */
+		/*
+		 * GEMM accelerator. ACCEL_MMIO_BASE / ACCEL_MMIO_MASK in src/cpu.v
+		 * decode a 0x100-byte window; the register map itself is 23 words.
+		 *
+		 * interrupts = <2>, <3> are intc source numbers, matching the
+		 * irq_in concatenation in src/cpu.v. "batch" fires once per queued
+		 * batch, "dma" once per result store (so once per TILE inside a
+		 * batch) - the driver enables whichever matches how it is driving
+		 * the accelerator.
+		 */
+		gemm0: gemm@5000 {
+			compatible = "rv32_5stage,gemm";
+			reg = <0x00005000 0x100>;
+			interrupt-parent = <&intc1>;
+			interrupts = <2>, <3>;
+			interrupt-names = "batch", "dma";
+			status = "okay";
+		};
+
 		uart0: serial@40001000 {
 			compatible = "rv32_5stage,uart";
 			reg = <0x40001000 0x10>;

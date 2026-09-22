@@ -3,3 +3,5 @@
 
 rsource "drivers/serial/Kconfig"
 rsource "drivers/interrupt_controller/Kconfig"
+rsource "drivers/cache/Kconfig"
+rsource "drivers/misc/Kconfig"

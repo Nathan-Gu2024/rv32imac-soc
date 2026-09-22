@@ -21,7 +21,14 @@ module tb_csrops;
         .csr_addr(csr_addr), .csr_wdata(csr_wdata), .csr_wen(csr_wen),
         .csr_op(csr_op), .csr_use_imm(csr_use_imm), .csr_uimm(csr_uimm),
         .csr_rdata(csr_rdata),
-        .trap_taken(trap_taken), .trap_pc(trap_pc), .trap_cause(trap_cause), .mret_exec(mret_exec),
+        .trap_taken(trap_taken), .trap_pc(trap_pc), .trap_cause(trap_cause),
+        // This bench drives trap_taken directly to exercise the CSR side
+        // effects, so mtval's source has to be a real value: an unconnected
+        // trap_val reads X and latches X into mtval on every one of those
+        // traps. Harmless here only because nothing reads mtval back - which
+        // is precisely how the same omission went unnoticed in cpu.v.
+        .trap_val(32'h0),
+        .mret_exec(mret_exec),
         .timer_pending(timer_pending), .external_pending(external_pending),
         .mtvec_out(mtvec_out), .mepc_out(mepc_out),
         .mstatus_mie(mstatus_mie), .mie_mtie(mie_mtie), .mie_meie(mie_meie)

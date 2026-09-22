@@ -245,6 +245,7 @@ module tb_coremark_sim;
     // instrumentation-first approach used to size the branch/RAS wins
     // before deciding what to build next.
     integer stall_cycles = 0;          // load-use hazard (hazard_unit)
+    integer store_data_stall_cycles = 0; // subset of the above a T3.3 bypass could remove
     integer imem_stall_cycles = 0;     // icache miss
     integer dmem_stall_cycles = 0;     // dcache miss
     integer div_stall_cycles = 0;      // in-flight DIV/REM
@@ -256,6 +257,24 @@ module tb_coremark_sim;
     always @(posedge clk) begin
         if (!rst) begin
             if (DUT.stall) stall_cycles = stall_cycles + 1;
+            // How many interlock stalls could a load->store-data bypass remove?
+            //
+            // Measurement, not a fix. A store's data is not needed until
+            // partial_store in MEM, one stage later than the interlock assumes,
+            // so a stall whose ONLY dependence is the store's rs2 is
+            // architecturally unnecessary. Counting them first because the
+            // estimate for this optimisation came from the same
+            // uniform-probability model that over-predicted the rs1/rs2
+            // qualifier by 20x, and the fix needs new pipeline state (the
+            // store's rs2 INDEX carried into MEM) rather than a decode tweak.
+            //
+            // Store opcode is 5'b01000; rs2-only means rd matches [24:20] and
+            // does not match [19:15].
+            if (DUT.stall &&
+                (DUT.if_id_inst[6:2] == 5'b01000) &&
+                (DUT.id_ex_rd == DUT.if_id_inst[24:20]) &&
+                (DUT.id_ex_rd != DUT.if_id_inst[19:15]))
+                store_data_stall_cycles = store_data_stall_cycles + 1;
             if (DUT.imem_stall) imem_stall_cycles = imem_stall_cycles + 1;
             if (DUT.dmem_stall) dmem_stall_cycles = dmem_stall_cycles + 1;
             if (DUT.div_stall) div_stall_cycles = div_stall_cycles + 1;
@@ -289,7 +308,7 @@ module tb_coremark_sim;
             if (stuck_count > 200000) begin
                 $display("\n[STUCK] PC has not moved for 200000 cycles at pc=0x%08h", debug_pc);
                 $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d JALR=%0d RAS_HITS=%0d RAS_MISS=%0d", cycle_count, branch_count, mispredict_count, jalr_count, jalr_ras_hit_count, jalr_ras_mispredict_count);
-            $display("STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
+            $display("STOREDATA=%0d STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", store_data_stall_cycles, stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
             $display("ICACHE_REFILLS=%0d", icache_refills);
                 $finish;
             end
@@ -320,7 +339,7 @@ module tb_coremark_sim;
                 if (quiet_cycles > 500000) begin
                     $display("\n[DONE] UART output quiesced");
                     $display("FINAL_CYCLES=%0d BRANCHES=%0d MISPREDICTS=%0d JALR=%0d RAS_HITS=%0d RAS_MISS=%0d", cycle_count, branch_count, mispredict_count, jalr_count, jalr_ras_hit_count, jalr_ras_mispredict_count);
-            $display("STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
+            $display("STOREDATA=%0d STALL=%0d IMEM=%0d DMEM=%0d DIV=%0d UART=%0d INTC=%0d AMO=%0d ACCEL=%0d MEMSTALL_UNION=%0d", store_data_stall_cycles, stall_cycles, imem_stall_cycles, dmem_stall_cycles, div_stall_cycles, uart_stall_cycles, intc_stall_cycles, amo_stall_cycles, accel_stall_cycles, global_mem_stall_cycles);
             $display("ICACHE_REFILLS=%0d", icache_refills);
                     $finish;
                 end

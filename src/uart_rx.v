@@ -1,3 +1,6 @@
+`ifndef _UART_RX_V_
+`define _UART_RX_V_
+
 module uart_rx #(
     parameter CLK_FREQ = 50_000_000,
     parameter BAUD_RATE = 115200
@@ -15,6 +18,31 @@ module uart_rx #(
     reg [31:0] clk_count;
     reg [2:0] bit_index;
 
+    // Two-flop synchroniser on the rx PAD.
+    //
+    // rx arrives from outside the clock domain entirely - fpga_top.v wires the
+    // pin straight through - and it was previously sampled directly by the FSM
+    // below. A metastable capture can both false-trigger the start-bit detect in
+    // IDLE and corrupt a sampled data bit, and neither failure is reported: the
+    // byte simply arrives wrong, or a frame begins where there was none.
+    //
+    // Two stages is the standard minimum, and the cost here is genuinely
+    // nothing: the FSM samples at CLKS_PER_BIT/2 = 260 clocks into each bit at
+    // 115200/60 MHz, so two cycles of added latency is 0.8% of a bit period,
+    // far inside the sampling margin. rx_sync is what the FSM must use - never
+    // the raw pad.
+    reg rx_meta, rx_sync;
+    always @(posedge clk) begin
+        if (rst) begin
+            // Idle high, so a reset does not look like a start bit.
+            rx_meta <= 1'b1;
+            rx_sync <= 1'b1;
+        end else begin
+            rx_meta <= rx;
+            rx_sync <= rx_meta;
+        end
+    end
+
     always @(posedge clk) begin
         if (rst) begin
             state <= IDLE;
@@ -27,14 +55,14 @@ module uart_rx #(
             
             case (state)
                 IDLE: begin
-                    if (rx == 1'b0) begin // Start bit edge
+                    if (rx_sync == 1'b0) begin // Start bit edge
                         state <= START;
                         clk_count <= CLKS_PER_BIT / 2; // Wait half a bit period
                     end
                 end
                 START: begin
                     if (clk_count == 0) begin
-                        if (rx == 1'b0) begin // Confirm start bit
+                        if (rx_sync == 1'b0) begin // Confirm start bit
                             state <= DATA;
                             clk_count <= CLKS_PER_BIT;
                             bit_index <= 0;
@@ -47,7 +75,7 @@ module uart_rx #(
                 end
                 DATA: begin
                     if (clk_count == 0) begin
-                        rx_data[bit_index] <= rx;
+                        rx_data[bit_index] <= rx_sync;
                         clk_count <= CLKS_PER_BIT;
                         if (bit_index == 7)
                             state <= STOP;
@@ -70,3 +98,5 @@ module uart_rx #(
     end
     
 endmodule
+
+`endif // _UART_RX_V_

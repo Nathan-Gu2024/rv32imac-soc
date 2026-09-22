@@ -22,7 +22,8 @@ endmodule
 module Queue8_Descriptor(
   input         clock,
                 reset,
-                io_enq_valid,
+  output        io_enq_ready,
+  input         io_enq_valid,
   input  [31:0] io_enq_bits_aSrc,
                 io_enq_bits_bSrc,
                 io_enq_bits_dest,
@@ -33,18 +34,18 @@ module Queue8_Descriptor(
                 io_deq_bits_bSrc,
                 io_deq_bits_dest,
                 io_deq_bits_ctl,
-  output [3:0]  io_count
+  output [3:0]  io_count,
+  input         io_flush
 );
 
-  wire         io_enq_ready;
   wire [127:0] _ram_ext_R0_data;
   reg  [2:0]   enq_ptr_value;
   reg  [2:0]   deq_ptr_value;
   reg          maybe_full;
   wire         ptr_match = enq_ptr_value == deq_ptr_value;
   wire         empty = ptr_match & ~maybe_full;
-  wire         do_enq = io_enq_ready & io_enq_valid;
-  assign io_enq_ready = ~(ptr_match & maybe_full);
+  wire         full = ptr_match & maybe_full;
+  wire         do_enq = ~full & io_enq_valid;
   wire         do_deq = io_deq_ready & ~empty;
   always @(posedge clock) begin
     if (reset) begin
@@ -53,12 +54,17 @@ module Queue8_Descriptor(
       maybe_full <= 1'h0;
     end
     else begin
-      if (do_enq)
-        enq_ptr_value <= enq_ptr_value + 3'h1;
-      if (do_deq)
-        deq_ptr_value <= deq_ptr_value + 3'h1;
-      if (~(do_enq == do_deq))
-        maybe_full <= do_enq;
+      if (io_flush) begin
+        enq_ptr_value <= 3'h0;
+        deq_ptr_value <= 3'h0;
+      end
+      else begin
+        if (do_enq)
+          enq_ptr_value <= enq_ptr_value + 3'h1;
+        if (do_deq)
+          deq_ptr_value <= deq_ptr_value + 3'h1;
+      end
+      maybe_full <= ~io_flush & (do_enq == do_deq ? maybe_full : do_enq);
     end
   end // always @(posedge)
   ram_8x128 ram_ext (
@@ -71,6 +77,7 @@ module Queue8_Descriptor(
     .W0_clk  (clock),
     .W0_data ({io_enq_bits_ctl, io_enq_bits_dest, io_enq_bits_bSrc, io_enq_bits_aSrc})
   );
+  assign io_enq_ready = ~full;
   assign io_deq_valid = ~empty;
   assign io_deq_bits_aSrc = _ram_ext_R0_data[31:0];
   assign io_deq_bits_bSrc = _ram_ext_R0_data[63:32];
@@ -319,14 +326,19 @@ module mm_accel(
   output [1:0]   s_axi_rresp,
   output         s_axi_rvalid,
   input          s_axi_rready,
-  output         mem_req_valid,
-                 mem_req_write,
-  output [31:0]  mem_req_addr,
-  output [127:0] mem_wline,
-  output [7:0]   mem_req_lines,
-  input          mem_wnext,
+  output         mem_rd_req_valid,
+  output [31:0]  mem_rd_req_addr,
+  output [7:0]   mem_rd_req_lines,
   input  [127:0] mem_rline,
-  input          mem_ready
+  input          mem_rd_ready,
+  output         mem_wr_req_valid,
+  output [31:0]  mem_wr_req_addr,
+  output [7:0]   mem_wr_req_lines,
+  output [127:0] mem_wline,
+  input          mem_wnext,
+                 mem_wr_ready,
+  output         irq_batch,
+                 irq_dma
 );
 
   wire         wMask_7_15;
@@ -779,6 +791,7 @@ module mm_accel(
   wire [127:0] _aMem_2_ext_R0_data;
   wire [127:0] _aMem_1_ext_R0_data;
   wire [127:0] _aMem_0_ext_R0_data;
+  wire         _descQ_io_enq_ready;
   wire         _descQ_io_deq_valid;
   wire [31:0]  _descQ_io_deq_bits_aSrc;
   wire [31:0]  _descQ_io_deq_bits_bSrc;
@@ -800,6 +813,7 @@ module mm_accel(
   reg          qRun;
   reg          qBusy;
   reg          qDone;
+  reg          qOverflow;
   reg          qBOnly;
   reg  [31:0]  destAddr;
   reg  [31:0]  dmaAddr;
@@ -1099,752 +1113,820 @@ module mm_accel(
   reg          rvalidReg;
   wire         _GEN_15 = raddrWord == 6'h8;
   wire         _qStartPulse_T = s_axi_awaddr[7:2] == 6'h0;
-  wire         ldStartB = doWrite & _qStartPulse_T & s_axi_wdata[4] & ~ldBusy & ~dmaBusy;
-  reg  [2:0]   qState;
-  wire         _GEN_16 = qState == 3'h0;
+  wire         softRstPulse = doWrite & _qStartPulse_T & s_axi_wdata[1];
+  wire         ldStartB = doWrite & _qStartPulse_T & s_axi_wdata[4] & ~ldBusy;
+  wire         descPush = doWrite & s_axi_awaddr[7:2] == 6'h14;
+  reg  [3:0]   qState;
+  reg  [7:0]   ldKLen;
+  reg  [7:0]   stgKLen;
+  reg  [1:0]   stgPanelUse;
+  reg  [31:0]  stgDest;
+  reg          preBusy;
+  reg          preDone;
+  reg          prePend;
+  wire         _GEN_16 = qState == 4'h0;
   wire         _GEN_17 = qRun & _descQ_io_deq_valid;
-  reg  [2:0]   casez_tmp;
-  wire [2:0]   _GEN_18 =
-    qState == 3'h6 & (dmaDone | dmaBusy & fillLeft == 9'h0) ? 3'h0 : qState;
-  always @(*) begin
-    casez (qState)
-      3'b000:
-        casez_tmp = _GEN_17 ? 3'h1 : qState;
-      3'b001:
-        casez_tmp = 3'h2;
-      3'b010:
-        casez_tmp = ldDone ? 3'h3 : qState;
-      3'b011:
-        casez_tmp = 3'h4;
-      3'b100:
-        casez_tmp = done & ~dmaBusy ? 3'h5 : qState;
-      3'b101:
-        casez_tmp = 3'h6;
-      3'b110:
-        casez_tmp = _GEN_18;
-      default:
-        casez_tmp = _GEN_18;
-    endcase
-  end // always @(*)
+  wire         _GEN_18 = qState == 4'h1;
+  wire         _GEN_19 = qState == 4'h2;
+  wire         _GEN_20 = qState == 4'h8;
+  wire         _GEN_21 = ~preBusy & _descQ_io_deq_valid;
+  wire         _GEN_22 =
+    _GEN_21 & _descQ_io_deq_bits_ctl[16] & _descQ_io_deq_bits_ctl[13:12] != stgPanelUse;
+  wire         _GEN_23 = qState == 4'h3;
+  wire         _GEN_24 = qState == 4'h4;
+  wire         _GEN_25 = qState == 4'h5;
+  wire         _GEN_26 = qState == 4'h6;
+  wire         _GEN_27 = qState == 4'h7;
+  wire         _GEN_28 = _GEN_27 & preDone;
+  wire         _GEN_29 = _GEN_23 | _GEN_24 | _GEN_25 | _GEN_26;
+  wire         _GEN_30 =
+    _GEN_21 & _descQ_io_deq_bits_ctl[16] & _descQ_io_deq_bits_ctl[13:12] != stgPanelUse;
+  wire         _GEN_31 = _GEN_18 | _GEN_19;
+  reg          ldDonePrev;
   wire         pushA = doWrite & ~busy & s_axi_awaddr[7:2] == 6'h5;
   wire         pushB = doWrite & ~busy & s_axi_awaddr[7:2] == 6'h6;
-  wire         _GEN_19 = doWrite & ~busy;
-  wire         _GEN_20 = pushA | pushB;
-  wire         _GEN_21 = _GEN_19 & loadLane == 3'h0 & _GEN_20;
-  wire [7:0]   _GEN_22 = _GEN_21 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_23 = _GEN_21 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_24 = _GEN_21 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_25 = _GEN_21 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_26 = _GEN_21 & loadK[1:0] == 2'h0;
-  wire         _GEN_27 = _GEN_21 & loadK[1:0] == 2'h1;
-  wire         _GEN_28 = _GEN_21 & loadK[1:0] == 2'h2;
-  wire         _GEN_29 = _GEN_21 & (&(loadK[1:0]));
-  wire [3:0]   _GEN_30 = {bPanelLoad, 2'h0};
-  wire         _GEN_31 = _GEN_19 & loadLane == 3'h1 & _GEN_20;
-  wire [7:0]   _GEN_32 = _GEN_31 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_33 = _GEN_31 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_34 = _GEN_31 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_35 = _GEN_31 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_36 = _GEN_31 & loadK[1:0] == 2'h0;
-  wire         _GEN_37 = _GEN_31 & loadK[1:0] == 2'h1;
-  wire         _GEN_38 = _GEN_31 & loadK[1:0] == 2'h2;
-  wire         _GEN_39 = _GEN_31 & (&(loadK[1:0]));
-  wire         _GEN_40 = _GEN_19 & loadLane == 3'h2 & _GEN_20;
-  wire [7:0]   _GEN_41 = _GEN_40 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_42 = _GEN_40 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_43 = _GEN_40 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_44 = _GEN_40 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_45 = _GEN_40 & loadK[1:0] == 2'h0;
-  wire         _GEN_46 = _GEN_40 & loadK[1:0] == 2'h1;
-  wire         _GEN_47 = _GEN_40 & loadK[1:0] == 2'h2;
-  wire         _GEN_48 = _GEN_40 & (&(loadK[1:0]));
-  wire         _GEN_49 = _GEN_19 & loadLane == 3'h3 & _GEN_20;
-  wire [7:0]   _GEN_50 = _GEN_49 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_51 = _GEN_49 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_52 = _GEN_49 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_53 = _GEN_49 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_54 = _GEN_49 & loadK[1:0] == 2'h0;
-  wire         _GEN_55 = _GEN_49 & loadK[1:0] == 2'h1;
-  wire         _GEN_56 = _GEN_49 & loadK[1:0] == 2'h2;
-  wire         _GEN_57 = _GEN_49 & (&(loadK[1:0]));
-  wire         _GEN_58 = _GEN_19 & loadLane == 3'h4 & _GEN_20;
-  wire [7:0]   _GEN_59 = _GEN_58 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_60 = _GEN_58 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_61 = _GEN_58 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_62 = _GEN_58 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_63 = _GEN_58 & loadK[1:0] == 2'h0;
-  wire         _GEN_64 = _GEN_58 & loadK[1:0] == 2'h1;
-  wire         _GEN_65 = _GEN_58 & loadK[1:0] == 2'h2;
-  wire         _GEN_66 = _GEN_58 & (&(loadK[1:0]));
-  wire         _GEN_67 = _GEN_19 & loadLane == 3'h5 & _GEN_20;
-  wire [7:0]   _GEN_68 = _GEN_67 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_69 = _GEN_67 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_70 = _GEN_67 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_71 = _GEN_67 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_72 = _GEN_67 & loadK[1:0] == 2'h0;
-  wire         _GEN_73 = _GEN_67 & loadK[1:0] == 2'h1;
-  wire         _GEN_74 = _GEN_67 & loadK[1:0] == 2'h2;
-  wire         _GEN_75 = _GEN_67 & (&(loadK[1:0]));
-  wire         _GEN_76 = _GEN_19 & loadLane == 3'h6 & _GEN_20;
-  wire [7:0]   _GEN_77 = _GEN_76 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_78 = _GEN_76 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_79 = _GEN_76 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_80 = _GEN_76 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_81 = _GEN_76 & loadK[1:0] == 2'h0;
-  wire         _GEN_82 = _GEN_76 & loadK[1:0] == 2'h1;
-  wire         _GEN_83 = _GEN_76 & loadK[1:0] == 2'h2;
-  wire         _GEN_84 = _GEN_76 & (&(loadK[1:0]));
-  wire         _GEN_85 = _GEN_19 & (&loadLane) & _GEN_20;
-  wire [7:0]   _GEN_86 = _GEN_85 ? s_axi_wdata[7:0] : 8'h0;
-  wire [7:0]   _GEN_87 = _GEN_85 ? s_axi_wdata[15:8] : 8'h0;
-  wire [7:0]   _GEN_88 = _GEN_85 ? s_axi_wdata[23:16] : 8'h0;
-  wire [7:0]   _GEN_89 = _GEN_85 ? s_axi_wdata[31:24] : 8'h0;
-  wire         _GEN_90 = _GEN_85 & loadK[1:0] == 2'h0;
-  wire         _GEN_91 = _GEN_85 & loadK[1:0] == 2'h1;
-  wire         _GEN_92 = _GEN_85 & loadK[1:0] == 2'h2;
-  wire         _GEN_93 = _GEN_85 & (&(loadK[1:0]));
-  wire [8:0]   _GEN_94 = {1'h0, kLen};
+  wire         _GEN_32 = doWrite & ~busy;
+  wire         _GEN_33 = pushA | pushB;
+  wire         _GEN_34 = _GEN_32 & loadLane == 3'h0 & _GEN_33;
+  wire [7:0]   _GEN_35 = _GEN_34 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_36 = _GEN_34 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_37 = _GEN_34 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_38 = _GEN_34 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_39 = _GEN_34 & loadK[1:0] == 2'h0;
+  wire         _GEN_40 = _GEN_34 & loadK[1:0] == 2'h1;
+  wire         _GEN_41 = _GEN_34 & loadK[1:0] == 2'h2;
+  wire         _GEN_42 = _GEN_34 & (&(loadK[1:0]));
+  wire [3:0]   _GEN_43 = {bPanelLoad, 2'h0};
+  wire         _GEN_44 = _GEN_32 & loadLane == 3'h1 & _GEN_33;
+  wire [7:0]   _GEN_45 = _GEN_44 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_46 = _GEN_44 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_47 = _GEN_44 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_48 = _GEN_44 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_49 = _GEN_44 & loadK[1:0] == 2'h0;
+  wire         _GEN_50 = _GEN_44 & loadK[1:0] == 2'h1;
+  wire         _GEN_51 = _GEN_44 & loadK[1:0] == 2'h2;
+  wire         _GEN_52 = _GEN_44 & (&(loadK[1:0]));
+  wire         _GEN_53 = _GEN_32 & loadLane == 3'h2 & _GEN_33;
+  wire [7:0]   _GEN_54 = _GEN_53 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_55 = _GEN_53 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_56 = _GEN_53 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_57 = _GEN_53 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_58 = _GEN_53 & loadK[1:0] == 2'h0;
+  wire         _GEN_59 = _GEN_53 & loadK[1:0] == 2'h1;
+  wire         _GEN_60 = _GEN_53 & loadK[1:0] == 2'h2;
+  wire         _GEN_61 = _GEN_53 & (&(loadK[1:0]));
+  wire         _GEN_62 = _GEN_32 & loadLane == 3'h3 & _GEN_33;
+  wire [7:0]   _GEN_63 = _GEN_62 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_64 = _GEN_62 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_65 = _GEN_62 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_66 = _GEN_62 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_67 = _GEN_62 & loadK[1:0] == 2'h0;
+  wire         _GEN_68 = _GEN_62 & loadK[1:0] == 2'h1;
+  wire         _GEN_69 = _GEN_62 & loadK[1:0] == 2'h2;
+  wire         _GEN_70 = _GEN_62 & (&(loadK[1:0]));
+  wire         _GEN_71 = _GEN_32 & loadLane == 3'h4 & _GEN_33;
+  wire [7:0]   _GEN_72 = _GEN_71 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_73 = _GEN_71 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_74 = _GEN_71 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_75 = _GEN_71 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_76 = _GEN_71 & loadK[1:0] == 2'h0;
+  wire         _GEN_77 = _GEN_71 & loadK[1:0] == 2'h1;
+  wire         _GEN_78 = _GEN_71 & loadK[1:0] == 2'h2;
+  wire         _GEN_79 = _GEN_71 & (&(loadK[1:0]));
+  wire         _GEN_80 = _GEN_32 & loadLane == 3'h5 & _GEN_33;
+  wire [7:0]   _GEN_81 = _GEN_80 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_82 = _GEN_80 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_83 = _GEN_80 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_84 = _GEN_80 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_85 = _GEN_80 & loadK[1:0] == 2'h0;
+  wire         _GEN_86 = _GEN_80 & loadK[1:0] == 2'h1;
+  wire         _GEN_87 = _GEN_80 & loadK[1:0] == 2'h2;
+  wire         _GEN_88 = _GEN_80 & (&(loadK[1:0]));
+  wire         _GEN_89 = _GEN_32 & loadLane == 3'h6 & _GEN_33;
+  wire [7:0]   _GEN_90 = _GEN_89 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_91 = _GEN_89 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_92 = _GEN_89 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_93 = _GEN_89 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_94 = _GEN_89 & loadK[1:0] == 2'h0;
+  wire         _GEN_95 = _GEN_89 & loadK[1:0] == 2'h1;
+  wire         _GEN_96 = _GEN_89 & loadK[1:0] == 2'h2;
+  wire         _GEN_97 = _GEN_89 & (&(loadK[1:0]));
+  wire         _GEN_98 = _GEN_32 & (&loadLane) & _GEN_33;
+  wire [7:0]   _GEN_99 = _GEN_98 ? s_axi_wdata[7:0] : 8'h0;
+  wire [7:0]   _GEN_100 = _GEN_98 ? s_axi_wdata[15:8] : 8'h0;
+  wire [7:0]   _GEN_101 = _GEN_98 ? s_axi_wdata[23:16] : 8'h0;
+  wire [7:0]   _GEN_102 = _GEN_98 ? s_axi_wdata[31:24] : 8'h0;
+  wire         _GEN_103 = _GEN_98 & loadK[1:0] == 2'h0;
+  wire         _GEN_104 = _GEN_98 & loadK[1:0] == 2'h1;
+  wire         _GEN_105 = _GEN_98 & loadK[1:0] == 2'h2;
+  wire         _GEN_106 = _GEN_98 & (&(loadK[1:0]));
+  wire [8:0]   _GEN_107 = {1'h0, kLen};
   wire         startAny =
-    doWrite & _qStartPulse_T & s_axi_wdata[0] & ~busy | qState == 3'h3;
-  wire [8:0]   _GEN_95 = {1'h0, t};
-  wire [8:0]   _kNext_T_1 = _GEN_95 + 9'h1;
+    doWrite & _qStartPulse_T & s_axi_wdata[0] & ~busy | qState == 4'h3;
+  wire [8:0]   _GEN_108 = {1'h0, t};
+  wire [8:0]   _kNext_T_1 = _GEN_108 + 9'h1;
   wire [1:0]   _rowNext_T_1 =
     $signed(startAny ? 9'h0 : _kNext_T_1) < 9'sh0 | startAny ? 2'h0 : _kNext_T_1[5:4];
-  wire [3:0]   _GEN_96 = {bPanelUse, 2'h0};
-  wire         kValid = $signed(_GEN_95) > -9'sh1 & $signed(_GEN_95) < $signed(_GEN_94);
+  wire [3:0]   _GEN_109 = {bPanelUse, 2'h0};
+  wire         kValid =
+    $signed(_GEN_108) > -9'sh1 & $signed(_GEN_108) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp;
+  always @(*) begin
+    casez (t[3:0])
+      4'b0000:
+        casez_tmp = _aMem_0_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp = _aMem_0_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp = _aMem_0_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp = _aMem_0_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp = _aMem_0_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp = _aMem_0_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp = _aMem_0_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp = _aMem_0_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp = _aMem_0_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp = _aMem_0_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp = _aMem_0_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp = _aMem_0_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp = _aMem_0_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp = _aMem_0_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp = _aMem_0_ext_R0_data[119:112];
+      default:
+        casez_tmp = _aMem_0_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_0;
   always @(*) begin
     casez (t[3:0])
       4'b0000:
-        casez_tmp_0 = _aMem_0_ext_R0_data[7:0];
+        casez_tmp_0 = _bMem_0_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_0 = _aMem_0_ext_R0_data[15:8];
+        casez_tmp_0 = _bMem_0_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_0 = _aMem_0_ext_R0_data[23:16];
+        casez_tmp_0 = _bMem_0_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_0 = _aMem_0_ext_R0_data[31:24];
+        casez_tmp_0 = _bMem_0_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_0 = _aMem_0_ext_R0_data[39:32];
+        casez_tmp_0 = _bMem_0_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_0 = _aMem_0_ext_R0_data[47:40];
+        casez_tmp_0 = _bMem_0_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_0 = _aMem_0_ext_R0_data[55:48];
+        casez_tmp_0 = _bMem_0_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_0 = _aMem_0_ext_R0_data[63:56];
+        casez_tmp_0 = _bMem_0_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_0 = _aMem_0_ext_R0_data[71:64];
+        casez_tmp_0 = _bMem_0_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_0 = _aMem_0_ext_R0_data[79:72];
+        casez_tmp_0 = _bMem_0_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_0 = _aMem_0_ext_R0_data[87:80];
+        casez_tmp_0 = _bMem_0_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_0 = _aMem_0_ext_R0_data[95:88];
+        casez_tmp_0 = _bMem_0_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_0 = _aMem_0_ext_R0_data[103:96];
+        casez_tmp_0 = _bMem_0_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_0 = _aMem_0_ext_R0_data[111:104];
+        casez_tmp_0 = _bMem_0_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_0 = _aMem_0_ext_R0_data[119:112];
+        casez_tmp_0 = _bMem_0_ext_R0_data[119:112];
       default:
-        casez_tmp_0 = _aMem_0_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  reg  [7:0]   casez_tmp_1;
-  always @(*) begin
-    casez (t[3:0])
-      4'b0000:
-        casez_tmp_1 = _bMem_0_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_1 = _bMem_0_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_1 = _bMem_0_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_1 = _bMem_0_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_1 = _bMem_0_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_1 = _bMem_0_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_1 = _bMem_0_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_1 = _bMem_0_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_1 = _bMem_0_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_1 = _bMem_0_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_1 = _bMem_0_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_1 = _bMem_0_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_1 = _bMem_0_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_1 = _bMem_0_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_1 = _bMem_0_ext_R0_data[119:112];
-      default:
-        casez_tmp_1 = _bMem_0_ext_R0_data[127:120];
+        casez_tmp_0 = _bMem_0_ext_R0_data[127:120];
     endcase
   end // always @(*)
   wire [1:0]   _rowNext_T_4 =
     $signed(startAny ? 9'h0 : {1'h0, t}) < 9'sh0 | startAny ? 2'h0 : t[5:4];
-  wire [8:0]   _kIdx_T_4 = _GEN_95 - 9'h1;
+  wire [8:0]   _kIdx_T_4 = _GEN_108 - 9'h1;
   wire         kValid_1 =
-    $signed(_kIdx_T_4) > -9'sh1 & $signed(_kIdx_T_4) < $signed(_GEN_94);
+    $signed(_kIdx_T_4) > -9'sh1 & $signed(_kIdx_T_4) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_1;
+  always @(*) begin
+    casez (_kIdx_T_4[3:0])
+      4'b0000:
+        casez_tmp_1 = _aMem_1_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_1 = _aMem_1_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_1 = _aMem_1_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_1 = _aMem_1_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_1 = _aMem_1_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_1 = _aMem_1_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_1 = _aMem_1_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_1 = _aMem_1_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_1 = _aMem_1_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_1 = _aMem_1_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_1 = _aMem_1_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_1 = _aMem_1_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_1 = _aMem_1_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_1 = _aMem_1_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_1 = _aMem_1_ext_R0_data[119:112];
+      default:
+        casez_tmp_1 = _aMem_1_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_2;
   always @(*) begin
     casez (_kIdx_T_4[3:0])
       4'b0000:
-        casez_tmp_2 = _aMem_1_ext_R0_data[7:0];
+        casez_tmp_2 = _bMem_1_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_2 = _aMem_1_ext_R0_data[15:8];
+        casez_tmp_2 = _bMem_1_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_2 = _aMem_1_ext_R0_data[23:16];
+        casez_tmp_2 = _bMem_1_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_2 = _aMem_1_ext_R0_data[31:24];
+        casez_tmp_2 = _bMem_1_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_2 = _aMem_1_ext_R0_data[39:32];
+        casez_tmp_2 = _bMem_1_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_2 = _aMem_1_ext_R0_data[47:40];
+        casez_tmp_2 = _bMem_1_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_2 = _aMem_1_ext_R0_data[55:48];
+        casez_tmp_2 = _bMem_1_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_2 = _aMem_1_ext_R0_data[63:56];
+        casez_tmp_2 = _bMem_1_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_2 = _aMem_1_ext_R0_data[71:64];
+        casez_tmp_2 = _bMem_1_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_2 = _aMem_1_ext_R0_data[79:72];
+        casez_tmp_2 = _bMem_1_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_2 = _aMem_1_ext_R0_data[87:80];
+        casez_tmp_2 = _bMem_1_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_2 = _aMem_1_ext_R0_data[95:88];
+        casez_tmp_2 = _bMem_1_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_2 = _aMem_1_ext_R0_data[103:96];
+        casez_tmp_2 = _bMem_1_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_2 = _aMem_1_ext_R0_data[111:104];
+        casez_tmp_2 = _bMem_1_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_2 = _aMem_1_ext_R0_data[119:112];
+        casez_tmp_2 = _bMem_1_ext_R0_data[119:112];
       default:
-        casez_tmp_2 = _aMem_1_ext_R0_data[127:120];
+        casez_tmp_2 = _bMem_1_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_3;
-  always @(*) begin
-    casez (_kIdx_T_4[3:0])
-      4'b0000:
-        casez_tmp_3 = _bMem_1_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_3 = _bMem_1_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_3 = _bMem_1_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_3 = _bMem_1_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_3 = _bMem_1_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_3 = _bMem_1_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_3 = _bMem_1_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_3 = _bMem_1_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_3 = _bMem_1_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_3 = _bMem_1_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_3 = _bMem_1_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_3 = _bMem_1_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_3 = _bMem_1_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_3 = _bMem_1_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_3 = _bMem_1_ext_R0_data[119:112];
-      default:
-        casez_tmp_3 = _bMem_1_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  wire [8:0]   _kNext_T_18 = _GEN_95 - 9'h1;
+  wire [8:0]   _kNext_T_18 = _GEN_108 - 9'h1;
   wire [1:0]   _rowNext_T_7 =
     $signed(startAny ? 9'h0 : _kNext_T_18) < 9'sh0 | startAny ? 2'h0 : _kNext_T_18[5:4];
-  wire [8:0]   _kIdx_T_7 = _GEN_95 - 9'h2;
+  wire [8:0]   _kIdx_T_7 = _GEN_108 - 9'h2;
   wire         kValid_2 =
-    $signed(_kIdx_T_7) > -9'sh1 & $signed(_kIdx_T_7) < $signed(_GEN_94);
+    $signed(_kIdx_T_7) > -9'sh1 & $signed(_kIdx_T_7) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_3;
+  always @(*) begin
+    casez (_kIdx_T_7[3:0])
+      4'b0000:
+        casez_tmp_3 = _aMem_2_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_3 = _aMem_2_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_3 = _aMem_2_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_3 = _aMem_2_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_3 = _aMem_2_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_3 = _aMem_2_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_3 = _aMem_2_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_3 = _aMem_2_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_3 = _aMem_2_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_3 = _aMem_2_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_3 = _aMem_2_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_3 = _aMem_2_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_3 = _aMem_2_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_3 = _aMem_2_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_3 = _aMem_2_ext_R0_data[119:112];
+      default:
+        casez_tmp_3 = _aMem_2_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_4;
   always @(*) begin
     casez (_kIdx_T_7[3:0])
       4'b0000:
-        casez_tmp_4 = _aMem_2_ext_R0_data[7:0];
+        casez_tmp_4 = _bMem_2_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_4 = _aMem_2_ext_R0_data[15:8];
+        casez_tmp_4 = _bMem_2_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_4 = _aMem_2_ext_R0_data[23:16];
+        casez_tmp_4 = _bMem_2_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_4 = _aMem_2_ext_R0_data[31:24];
+        casez_tmp_4 = _bMem_2_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_4 = _aMem_2_ext_R0_data[39:32];
+        casez_tmp_4 = _bMem_2_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_4 = _aMem_2_ext_R0_data[47:40];
+        casez_tmp_4 = _bMem_2_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_4 = _aMem_2_ext_R0_data[55:48];
+        casez_tmp_4 = _bMem_2_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_4 = _aMem_2_ext_R0_data[63:56];
+        casez_tmp_4 = _bMem_2_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_4 = _aMem_2_ext_R0_data[71:64];
+        casez_tmp_4 = _bMem_2_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_4 = _aMem_2_ext_R0_data[79:72];
+        casez_tmp_4 = _bMem_2_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_4 = _aMem_2_ext_R0_data[87:80];
+        casez_tmp_4 = _bMem_2_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_4 = _aMem_2_ext_R0_data[95:88];
+        casez_tmp_4 = _bMem_2_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_4 = _aMem_2_ext_R0_data[103:96];
+        casez_tmp_4 = _bMem_2_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_4 = _aMem_2_ext_R0_data[111:104];
+        casez_tmp_4 = _bMem_2_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_4 = _aMem_2_ext_R0_data[119:112];
+        casez_tmp_4 = _bMem_2_ext_R0_data[119:112];
       default:
-        casez_tmp_4 = _aMem_2_ext_R0_data[127:120];
+        casez_tmp_4 = _bMem_2_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_5;
-  always @(*) begin
-    casez (_kIdx_T_7[3:0])
-      4'b0000:
-        casez_tmp_5 = _bMem_2_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_5 = _bMem_2_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_5 = _bMem_2_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_5 = _bMem_2_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_5 = _bMem_2_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_5 = _bMem_2_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_5 = _bMem_2_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_5 = _bMem_2_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_5 = _bMem_2_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_5 = _bMem_2_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_5 = _bMem_2_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_5 = _bMem_2_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_5 = _bMem_2_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_5 = _bMem_2_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_5 = _bMem_2_ext_R0_data[119:112];
-      default:
-        casez_tmp_5 = _bMem_2_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  wire [8:0]   _kNext_T_25 = _GEN_95 - 9'h2;
+  wire [8:0]   _kNext_T_25 = _GEN_108 - 9'h2;
   wire [1:0]   _rowNext_T_10 =
     $signed(startAny ? 9'h0 : _kNext_T_25) < 9'sh0 | startAny ? 2'h0 : _kNext_T_25[5:4];
-  wire [8:0]   _kIdx_T_10 = _GEN_95 - 9'h3;
+  wire [8:0]   _kIdx_T_10 = _GEN_108 - 9'h3;
   wire         kValid_3 =
-    $signed(_kIdx_T_10) > -9'sh1 & $signed(_kIdx_T_10) < $signed(_GEN_94);
+    $signed(_kIdx_T_10) > -9'sh1 & $signed(_kIdx_T_10) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_5;
+  always @(*) begin
+    casez (_kIdx_T_10[3:0])
+      4'b0000:
+        casez_tmp_5 = _aMem_3_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_5 = _aMem_3_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_5 = _aMem_3_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_5 = _aMem_3_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_5 = _aMem_3_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_5 = _aMem_3_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_5 = _aMem_3_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_5 = _aMem_3_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_5 = _aMem_3_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_5 = _aMem_3_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_5 = _aMem_3_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_5 = _aMem_3_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_5 = _aMem_3_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_5 = _aMem_3_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_5 = _aMem_3_ext_R0_data[119:112];
+      default:
+        casez_tmp_5 = _aMem_3_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_6;
   always @(*) begin
     casez (_kIdx_T_10[3:0])
       4'b0000:
-        casez_tmp_6 = _aMem_3_ext_R0_data[7:0];
+        casez_tmp_6 = _bMem_3_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_6 = _aMem_3_ext_R0_data[15:8];
+        casez_tmp_6 = _bMem_3_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_6 = _aMem_3_ext_R0_data[23:16];
+        casez_tmp_6 = _bMem_3_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_6 = _aMem_3_ext_R0_data[31:24];
+        casez_tmp_6 = _bMem_3_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_6 = _aMem_3_ext_R0_data[39:32];
+        casez_tmp_6 = _bMem_3_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_6 = _aMem_3_ext_R0_data[47:40];
+        casez_tmp_6 = _bMem_3_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_6 = _aMem_3_ext_R0_data[55:48];
+        casez_tmp_6 = _bMem_3_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_6 = _aMem_3_ext_R0_data[63:56];
+        casez_tmp_6 = _bMem_3_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_6 = _aMem_3_ext_R0_data[71:64];
+        casez_tmp_6 = _bMem_3_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_6 = _aMem_3_ext_R0_data[79:72];
+        casez_tmp_6 = _bMem_3_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_6 = _aMem_3_ext_R0_data[87:80];
+        casez_tmp_6 = _bMem_3_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_6 = _aMem_3_ext_R0_data[95:88];
+        casez_tmp_6 = _bMem_3_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_6 = _aMem_3_ext_R0_data[103:96];
+        casez_tmp_6 = _bMem_3_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_6 = _aMem_3_ext_R0_data[111:104];
+        casez_tmp_6 = _bMem_3_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_6 = _aMem_3_ext_R0_data[119:112];
+        casez_tmp_6 = _bMem_3_ext_R0_data[119:112];
       default:
-        casez_tmp_6 = _aMem_3_ext_R0_data[127:120];
+        casez_tmp_6 = _bMem_3_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_7;
-  always @(*) begin
-    casez (_kIdx_T_10[3:0])
-      4'b0000:
-        casez_tmp_7 = _bMem_3_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_7 = _bMem_3_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_7 = _bMem_3_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_7 = _bMem_3_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_7 = _bMem_3_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_7 = _bMem_3_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_7 = _bMem_3_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_7 = _bMem_3_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_7 = _bMem_3_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_7 = _bMem_3_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_7 = _bMem_3_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_7 = _bMem_3_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_7 = _bMem_3_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_7 = _bMem_3_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_7 = _bMem_3_ext_R0_data[119:112];
-      default:
-        casez_tmp_7 = _bMem_3_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  wire [8:0]   _kNext_T_32 = _GEN_95 - 9'h3;
+  wire [8:0]   _kNext_T_32 = _GEN_108 - 9'h3;
   wire [1:0]   _rowNext_T_13 =
     $signed(startAny ? 9'h0 : _kNext_T_32) < 9'sh0 | startAny ? 2'h0 : _kNext_T_32[5:4];
-  wire [8:0]   _kIdx_T_13 = _GEN_95 - 9'h4;
+  wire [8:0]   _kIdx_T_13 = _GEN_108 - 9'h4;
   wire         kValid_4 =
-    $signed(_kIdx_T_13) > -9'sh1 & $signed(_kIdx_T_13) < $signed(_GEN_94);
+    $signed(_kIdx_T_13) > -9'sh1 & $signed(_kIdx_T_13) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_7;
+  always @(*) begin
+    casez (_kIdx_T_13[3:0])
+      4'b0000:
+        casez_tmp_7 = _aMem_4_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_7 = _aMem_4_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_7 = _aMem_4_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_7 = _aMem_4_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_7 = _aMem_4_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_7 = _aMem_4_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_7 = _aMem_4_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_7 = _aMem_4_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_7 = _aMem_4_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_7 = _aMem_4_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_7 = _aMem_4_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_7 = _aMem_4_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_7 = _aMem_4_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_7 = _aMem_4_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_7 = _aMem_4_ext_R0_data[119:112];
+      default:
+        casez_tmp_7 = _aMem_4_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_8;
   always @(*) begin
     casez (_kIdx_T_13[3:0])
       4'b0000:
-        casez_tmp_8 = _aMem_4_ext_R0_data[7:0];
+        casez_tmp_8 = _bMem_4_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_8 = _aMem_4_ext_R0_data[15:8];
+        casez_tmp_8 = _bMem_4_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_8 = _aMem_4_ext_R0_data[23:16];
+        casez_tmp_8 = _bMem_4_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_8 = _aMem_4_ext_R0_data[31:24];
+        casez_tmp_8 = _bMem_4_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_8 = _aMem_4_ext_R0_data[39:32];
+        casez_tmp_8 = _bMem_4_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_8 = _aMem_4_ext_R0_data[47:40];
+        casez_tmp_8 = _bMem_4_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_8 = _aMem_4_ext_R0_data[55:48];
+        casez_tmp_8 = _bMem_4_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_8 = _aMem_4_ext_R0_data[63:56];
+        casez_tmp_8 = _bMem_4_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_8 = _aMem_4_ext_R0_data[71:64];
+        casez_tmp_8 = _bMem_4_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_8 = _aMem_4_ext_R0_data[79:72];
+        casez_tmp_8 = _bMem_4_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_8 = _aMem_4_ext_R0_data[87:80];
+        casez_tmp_8 = _bMem_4_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_8 = _aMem_4_ext_R0_data[95:88];
+        casez_tmp_8 = _bMem_4_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_8 = _aMem_4_ext_R0_data[103:96];
+        casez_tmp_8 = _bMem_4_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_8 = _aMem_4_ext_R0_data[111:104];
+        casez_tmp_8 = _bMem_4_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_8 = _aMem_4_ext_R0_data[119:112];
+        casez_tmp_8 = _bMem_4_ext_R0_data[119:112];
       default:
-        casez_tmp_8 = _aMem_4_ext_R0_data[127:120];
+        casez_tmp_8 = _bMem_4_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_9;
-  always @(*) begin
-    casez (_kIdx_T_13[3:0])
-      4'b0000:
-        casez_tmp_9 = _bMem_4_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_9 = _bMem_4_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_9 = _bMem_4_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_9 = _bMem_4_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_9 = _bMem_4_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_9 = _bMem_4_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_9 = _bMem_4_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_9 = _bMem_4_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_9 = _bMem_4_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_9 = _bMem_4_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_9 = _bMem_4_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_9 = _bMem_4_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_9 = _bMem_4_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_9 = _bMem_4_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_9 = _bMem_4_ext_R0_data[119:112];
-      default:
-        casez_tmp_9 = _bMem_4_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  wire [8:0]   _kNext_T_39 = _GEN_95 - 9'h4;
+  wire [8:0]   _kNext_T_39 = _GEN_108 - 9'h4;
   wire [1:0]   _rowNext_T_16 =
     $signed(startAny ? 9'h0 : _kNext_T_39) < 9'sh0 | startAny ? 2'h0 : _kNext_T_39[5:4];
-  wire [8:0]   _kIdx_T_16 = _GEN_95 - 9'h5;
+  wire [8:0]   _kIdx_T_16 = _GEN_108 - 9'h5;
   wire         kValid_5 =
-    $signed(_kIdx_T_16) > -9'sh1 & $signed(_kIdx_T_16) < $signed(_GEN_94);
+    $signed(_kIdx_T_16) > -9'sh1 & $signed(_kIdx_T_16) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_9;
+  always @(*) begin
+    casez (_kIdx_T_16[3:0])
+      4'b0000:
+        casez_tmp_9 = _aMem_5_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_9 = _aMem_5_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_9 = _aMem_5_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_9 = _aMem_5_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_9 = _aMem_5_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_9 = _aMem_5_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_9 = _aMem_5_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_9 = _aMem_5_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_9 = _aMem_5_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_9 = _aMem_5_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_9 = _aMem_5_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_9 = _aMem_5_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_9 = _aMem_5_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_9 = _aMem_5_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_9 = _aMem_5_ext_R0_data[119:112];
+      default:
+        casez_tmp_9 = _aMem_5_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_10;
   always @(*) begin
     casez (_kIdx_T_16[3:0])
       4'b0000:
-        casez_tmp_10 = _aMem_5_ext_R0_data[7:0];
+        casez_tmp_10 = _bMem_5_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_10 = _aMem_5_ext_R0_data[15:8];
+        casez_tmp_10 = _bMem_5_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_10 = _aMem_5_ext_R0_data[23:16];
+        casez_tmp_10 = _bMem_5_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_10 = _aMem_5_ext_R0_data[31:24];
+        casez_tmp_10 = _bMem_5_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_10 = _aMem_5_ext_R0_data[39:32];
+        casez_tmp_10 = _bMem_5_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_10 = _aMem_5_ext_R0_data[47:40];
+        casez_tmp_10 = _bMem_5_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_10 = _aMem_5_ext_R0_data[55:48];
+        casez_tmp_10 = _bMem_5_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_10 = _aMem_5_ext_R0_data[63:56];
+        casez_tmp_10 = _bMem_5_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_10 = _aMem_5_ext_R0_data[71:64];
+        casez_tmp_10 = _bMem_5_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_10 = _aMem_5_ext_R0_data[79:72];
+        casez_tmp_10 = _bMem_5_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_10 = _aMem_5_ext_R0_data[87:80];
+        casez_tmp_10 = _bMem_5_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_10 = _aMem_5_ext_R0_data[95:88];
+        casez_tmp_10 = _bMem_5_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_10 = _aMem_5_ext_R0_data[103:96];
+        casez_tmp_10 = _bMem_5_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_10 = _aMem_5_ext_R0_data[111:104];
+        casez_tmp_10 = _bMem_5_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_10 = _aMem_5_ext_R0_data[119:112];
+        casez_tmp_10 = _bMem_5_ext_R0_data[119:112];
       default:
-        casez_tmp_10 = _aMem_5_ext_R0_data[127:120];
+        casez_tmp_10 = _bMem_5_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_11;
-  always @(*) begin
-    casez (_kIdx_T_16[3:0])
-      4'b0000:
-        casez_tmp_11 = _bMem_5_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_11 = _bMem_5_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_11 = _bMem_5_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_11 = _bMem_5_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_11 = _bMem_5_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_11 = _bMem_5_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_11 = _bMem_5_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_11 = _bMem_5_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_11 = _bMem_5_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_11 = _bMem_5_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_11 = _bMem_5_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_11 = _bMem_5_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_11 = _bMem_5_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_11 = _bMem_5_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_11 = _bMem_5_ext_R0_data[119:112];
-      default:
-        casez_tmp_11 = _bMem_5_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  wire [8:0]   _kNext_T_46 = _GEN_95 - 9'h5;
+  wire [8:0]   _kNext_T_46 = _GEN_108 - 9'h5;
   wire [1:0]   _rowNext_T_19 =
     $signed(startAny ? 9'h0 : _kNext_T_46) < 9'sh0 | startAny ? 2'h0 : _kNext_T_46[5:4];
-  wire [8:0]   _kIdx_T_19 = _GEN_95 - 9'h6;
+  wire [8:0]   _kIdx_T_19 = _GEN_108 - 9'h6;
   wire         kValid_6 =
-    $signed(_kIdx_T_19) > -9'sh1 & $signed(_kIdx_T_19) < $signed(_GEN_94);
+    $signed(_kIdx_T_19) > -9'sh1 & $signed(_kIdx_T_19) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_11;
+  always @(*) begin
+    casez (_kIdx_T_19[3:0])
+      4'b0000:
+        casez_tmp_11 = _aMem_6_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_11 = _aMem_6_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_11 = _aMem_6_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_11 = _aMem_6_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_11 = _aMem_6_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_11 = _aMem_6_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_11 = _aMem_6_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_11 = _aMem_6_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_11 = _aMem_6_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_11 = _aMem_6_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_11 = _aMem_6_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_11 = _aMem_6_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_11 = _aMem_6_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_11 = _aMem_6_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_11 = _aMem_6_ext_R0_data[119:112];
+      default:
+        casez_tmp_11 = _aMem_6_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_12;
   always @(*) begin
     casez (_kIdx_T_19[3:0])
       4'b0000:
-        casez_tmp_12 = _aMem_6_ext_R0_data[7:0];
+        casez_tmp_12 = _bMem_6_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_12 = _aMem_6_ext_R0_data[15:8];
+        casez_tmp_12 = _bMem_6_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_12 = _aMem_6_ext_R0_data[23:16];
+        casez_tmp_12 = _bMem_6_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_12 = _aMem_6_ext_R0_data[31:24];
+        casez_tmp_12 = _bMem_6_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_12 = _aMem_6_ext_R0_data[39:32];
+        casez_tmp_12 = _bMem_6_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_12 = _aMem_6_ext_R0_data[47:40];
+        casez_tmp_12 = _bMem_6_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_12 = _aMem_6_ext_R0_data[55:48];
+        casez_tmp_12 = _bMem_6_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_12 = _aMem_6_ext_R0_data[63:56];
+        casez_tmp_12 = _bMem_6_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_12 = _aMem_6_ext_R0_data[71:64];
+        casez_tmp_12 = _bMem_6_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_12 = _aMem_6_ext_R0_data[79:72];
+        casez_tmp_12 = _bMem_6_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_12 = _aMem_6_ext_R0_data[87:80];
+        casez_tmp_12 = _bMem_6_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_12 = _aMem_6_ext_R0_data[95:88];
+        casez_tmp_12 = _bMem_6_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_12 = _aMem_6_ext_R0_data[103:96];
+        casez_tmp_12 = _bMem_6_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_12 = _aMem_6_ext_R0_data[111:104];
+        casez_tmp_12 = _bMem_6_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_12 = _aMem_6_ext_R0_data[119:112];
+        casez_tmp_12 = _bMem_6_ext_R0_data[119:112];
       default:
-        casez_tmp_12 = _aMem_6_ext_R0_data[127:120];
+        casez_tmp_12 = _bMem_6_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_13;
-  always @(*) begin
-    casez (_kIdx_T_19[3:0])
-      4'b0000:
-        casez_tmp_13 = _bMem_6_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_13 = _bMem_6_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_13 = _bMem_6_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_13 = _bMem_6_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_13 = _bMem_6_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_13 = _bMem_6_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_13 = _bMem_6_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_13 = _bMem_6_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_13 = _bMem_6_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_13 = _bMem_6_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_13 = _bMem_6_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_13 = _bMem_6_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_13 = _bMem_6_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_13 = _bMem_6_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_13 = _bMem_6_ext_R0_data[119:112];
-      default:
-        casez_tmp_13 = _bMem_6_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
-  wire [8:0]   _kNext_T_53 = _GEN_95 - 9'h6;
+  wire [8:0]   _kNext_T_53 = _GEN_108 - 9'h6;
   wire [1:0]   _rowNext_T_22 =
     $signed(startAny ? 9'h0 : _kNext_T_53) < 9'sh0 | startAny ? 2'h0 : _kNext_T_53[5:4];
-  wire [8:0]   _kIdx_T_22 = _GEN_95 - 9'h7;
+  wire [8:0]   _kIdx_T_22 = _GEN_108 - 9'h7;
   wire         kValid_7 =
-    $signed(_kIdx_T_22) > -9'sh1 & $signed(_kIdx_T_22) < $signed(_GEN_94);
+    $signed(_kIdx_T_22) > -9'sh1 & $signed(_kIdx_T_22) < $signed(_GEN_107);
+  reg  [7:0]   casez_tmp_13;
+  always @(*) begin
+    casez (_kIdx_T_22[3:0])
+      4'b0000:
+        casez_tmp_13 = _aMem_7_ext_R0_data[7:0];
+      4'b0001:
+        casez_tmp_13 = _aMem_7_ext_R0_data[15:8];
+      4'b0010:
+        casez_tmp_13 = _aMem_7_ext_R0_data[23:16];
+      4'b0011:
+        casez_tmp_13 = _aMem_7_ext_R0_data[31:24];
+      4'b0100:
+        casez_tmp_13 = _aMem_7_ext_R0_data[39:32];
+      4'b0101:
+        casez_tmp_13 = _aMem_7_ext_R0_data[47:40];
+      4'b0110:
+        casez_tmp_13 = _aMem_7_ext_R0_data[55:48];
+      4'b0111:
+        casez_tmp_13 = _aMem_7_ext_R0_data[63:56];
+      4'b1000:
+        casez_tmp_13 = _aMem_7_ext_R0_data[71:64];
+      4'b1001:
+        casez_tmp_13 = _aMem_7_ext_R0_data[79:72];
+      4'b1010:
+        casez_tmp_13 = _aMem_7_ext_R0_data[87:80];
+      4'b1011:
+        casez_tmp_13 = _aMem_7_ext_R0_data[95:88];
+      4'b1100:
+        casez_tmp_13 = _aMem_7_ext_R0_data[103:96];
+      4'b1101:
+        casez_tmp_13 = _aMem_7_ext_R0_data[111:104];
+      4'b1110:
+        casez_tmp_13 = _aMem_7_ext_R0_data[119:112];
+      default:
+        casez_tmp_13 = _aMem_7_ext_R0_data[127:120];
+    endcase
+  end // always @(*)
   reg  [7:0]   casez_tmp_14;
   always @(*) begin
     casez (_kIdx_T_22[3:0])
       4'b0000:
-        casez_tmp_14 = _aMem_7_ext_R0_data[7:0];
+        casez_tmp_14 = _bMem_7_ext_R0_data[7:0];
       4'b0001:
-        casez_tmp_14 = _aMem_7_ext_R0_data[15:8];
+        casez_tmp_14 = _bMem_7_ext_R0_data[15:8];
       4'b0010:
-        casez_tmp_14 = _aMem_7_ext_R0_data[23:16];
+        casez_tmp_14 = _bMem_7_ext_R0_data[23:16];
       4'b0011:
-        casez_tmp_14 = _aMem_7_ext_R0_data[31:24];
+        casez_tmp_14 = _bMem_7_ext_R0_data[31:24];
       4'b0100:
-        casez_tmp_14 = _aMem_7_ext_R0_data[39:32];
+        casez_tmp_14 = _bMem_7_ext_R0_data[39:32];
       4'b0101:
-        casez_tmp_14 = _aMem_7_ext_R0_data[47:40];
+        casez_tmp_14 = _bMem_7_ext_R0_data[47:40];
       4'b0110:
-        casez_tmp_14 = _aMem_7_ext_R0_data[55:48];
+        casez_tmp_14 = _bMem_7_ext_R0_data[55:48];
       4'b0111:
-        casez_tmp_14 = _aMem_7_ext_R0_data[63:56];
+        casez_tmp_14 = _bMem_7_ext_R0_data[63:56];
       4'b1000:
-        casez_tmp_14 = _aMem_7_ext_R0_data[71:64];
+        casez_tmp_14 = _bMem_7_ext_R0_data[71:64];
       4'b1001:
-        casez_tmp_14 = _aMem_7_ext_R0_data[79:72];
+        casez_tmp_14 = _bMem_7_ext_R0_data[79:72];
       4'b1010:
-        casez_tmp_14 = _aMem_7_ext_R0_data[87:80];
+        casez_tmp_14 = _bMem_7_ext_R0_data[87:80];
       4'b1011:
-        casez_tmp_14 = _aMem_7_ext_R0_data[95:88];
+        casez_tmp_14 = _bMem_7_ext_R0_data[95:88];
       4'b1100:
-        casez_tmp_14 = _aMem_7_ext_R0_data[103:96];
+        casez_tmp_14 = _bMem_7_ext_R0_data[103:96];
       4'b1101:
-        casez_tmp_14 = _aMem_7_ext_R0_data[111:104];
+        casez_tmp_14 = _bMem_7_ext_R0_data[111:104];
       4'b1110:
-        casez_tmp_14 = _aMem_7_ext_R0_data[119:112];
+        casez_tmp_14 = _bMem_7_ext_R0_data[119:112];
       default:
-        casez_tmp_14 = _aMem_7_ext_R0_data[127:120];
+        casez_tmp_14 = _bMem_7_ext_R0_data[127:120];
     endcase
   end // always @(*)
-  reg  [7:0]   casez_tmp_15;
-  always @(*) begin
-    casez (_kIdx_T_22[3:0])
-      4'b0000:
-        casez_tmp_15 = _bMem_7_ext_R0_data[7:0];
-      4'b0001:
-        casez_tmp_15 = _bMem_7_ext_R0_data[15:8];
-      4'b0010:
-        casez_tmp_15 = _bMem_7_ext_R0_data[23:16];
-      4'b0011:
-        casez_tmp_15 = _bMem_7_ext_R0_data[31:24];
-      4'b0100:
-        casez_tmp_15 = _bMem_7_ext_R0_data[39:32];
-      4'b0101:
-        casez_tmp_15 = _bMem_7_ext_R0_data[47:40];
-      4'b0110:
-        casez_tmp_15 = _bMem_7_ext_R0_data[55:48];
-      4'b0111:
-        casez_tmp_15 = _bMem_7_ext_R0_data[63:56];
-      4'b1000:
-        casez_tmp_15 = _bMem_7_ext_R0_data[71:64];
-      4'b1001:
-        casez_tmp_15 = _bMem_7_ext_R0_data[79:72];
-      4'b1010:
-        casez_tmp_15 = _bMem_7_ext_R0_data[87:80];
-      4'b1011:
-        casez_tmp_15 = _bMem_7_ext_R0_data[95:88];
-      4'b1100:
-        casez_tmp_15 = _bMem_7_ext_R0_data[103:96];
-      4'b1101:
-        casez_tmp_15 = _bMem_7_ext_R0_data[111:104];
-      4'b1110:
-        casez_tmp_15 = _bMem_7_ext_R0_data[119:112];
-      default:
-        casez_tmp_15 = _bMem_7_ext_R0_data[127:120];
-    endcase
-  end // always @(*)
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_0_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_1_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_2_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_3_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_4_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_5_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_6_7;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_0;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_1;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_2;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_3;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_4;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_5;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_6;
+  (* dont_touch = "yes" *) (* keep = "true" *) reg          peEn_7_7;
   wire         _pes_1_0_io_clearAcc_T = t == 8'h1;
   wire         _pes_2_0_io_clearAcc_T = t == 8'h2;
   wire         _pes_3_0_io_clearAcc_T = t == 8'h3;
@@ -1867,356 +1949,356 @@ module mm_accel(
   reg  [127:0] rowLineReg_6;
   reg  [127:0] rowLineReg_7;
   reg  [3:0]   fillGrpD;
-  reg  [127:0] casez_tmp_16;
+  reg  [127:0] casez_tmp_15;
   always @(*) begin
     casez (fillGrpD[3:1])
       3'b000:
-        casez_tmp_16 = rowLineReg_0;
+        casez_tmp_15 = rowLineReg_0;
       3'b001:
-        casez_tmp_16 = rowLineReg_1;
+        casez_tmp_15 = rowLineReg_1;
       3'b010:
-        casez_tmp_16 = rowLineReg_2;
+        casez_tmp_15 = rowLineReg_2;
       3'b011:
-        casez_tmp_16 = rowLineReg_3;
+        casez_tmp_15 = rowLineReg_3;
       3'b100:
-        casez_tmp_16 = rowLineReg_4;
+        casez_tmp_15 = rowLineReg_4;
       3'b101:
-        casez_tmp_16 = rowLineReg_5;
+        casez_tmp_15 = rowLineReg_5;
       3'b110:
-        casez_tmp_16 = rowLineReg_6;
+        casez_tmp_15 = rowLineReg_6;
       default:
-        casez_tmp_16 = rowLineReg_7;
+        casez_tmp_15 = rowLineReg_7;
     endcase
   end // always @(*)
   reg  [127:0] lineData8_REG;
-  reg  [127:0] casez_tmp_17;
+  reg  [127:0] casez_tmp_16;
   wire         _rowBytes_half_T_315 = outShift == 5'h0;
-  wire [62:0]  _GEN_97 = {58'h0, outShift - 5'h1};
-  wire [33:0]  _GEN_98 = {29'h0, outShift};
-  wire [62:0]  _rowBytes_half_T_3 = 63'h1 << _GEN_97;
+  wire [62:0]  _GEN_110 = {58'h0, outShift - 5'h1};
+  wire [33:0]  _GEN_111 = {29'h0, outShift};
+  wire [62:0]  _rowBytes_half_T_3 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted =
     $signed($signed({{2{_pes_0_0_io_acc[31]}}, _pes_0_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_3[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_8 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_8 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_1 =
     $signed($signed({{2{_pes_0_1_io_acc[31]}}, _pes_0_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_8[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_13 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_13 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_2 =
     $signed($signed({{2{_pes_0_2_io_acc[31]}}, _pes_0_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_13[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_18 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_18 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_3 =
     $signed($signed({{2{_pes_0_3_io_acc[31]}}, _pes_0_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_18[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_23 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_23 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_4 =
     $signed($signed({{2{_pes_0_4_io_acc[31]}}, _pes_0_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_23[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_28 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_28 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_5 =
     $signed($signed({{2{_pes_0_5_io_acc[31]}}, _pes_0_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_28[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_33 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_33 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_6 =
     $signed($signed({{2{_pes_0_6_io_acc[31]}}, _pes_0_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_33[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_38 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_38 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_7 =
     $signed($signed({{2{_pes_0_7_io_acc[31]}}, _pes_0_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_38[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_43 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_43 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_8 =
     $signed($signed({{2{_pes_1_0_io_acc[31]}}, _pes_1_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_43[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_48 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_48 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_9 =
     $signed($signed({{2{_pes_1_1_io_acc[31]}}, _pes_1_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_48[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_53 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_53 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_10 =
     $signed($signed({{2{_pes_1_2_io_acc[31]}}, _pes_1_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_53[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_58 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_58 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_11 =
     $signed($signed({{2{_pes_1_3_io_acc[31]}}, _pes_1_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_58[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_63 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_63 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_12 =
     $signed($signed({{2{_pes_1_4_io_acc[31]}}, _pes_1_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_63[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_68 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_68 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_13 =
     $signed($signed({{2{_pes_1_5_io_acc[31]}}, _pes_1_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_68[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_73 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_73 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_14 =
     $signed($signed({{2{_pes_1_6_io_acc[31]}}, _pes_1_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_73[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_78 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_78 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_15 =
     $signed($signed({{2{_pes_1_7_io_acc[31]}}, _pes_1_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_78[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_83 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_83 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_16 =
     $signed($signed({{2{_pes_2_0_io_acc[31]}}, _pes_2_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_83[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_88 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_88 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_17 =
     $signed($signed({{2{_pes_2_1_io_acc[31]}}, _pes_2_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_88[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_93 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_93 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_18 =
     $signed($signed({{2{_pes_2_2_io_acc[31]}}, _pes_2_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_93[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_98 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_98 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_19 =
     $signed($signed({{2{_pes_2_3_io_acc[31]}}, _pes_2_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_98[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_103 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_103 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_20 =
     $signed($signed({{2{_pes_2_4_io_acc[31]}}, _pes_2_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_103[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_108 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_108 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_21 =
     $signed($signed({{2{_pes_2_5_io_acc[31]}}, _pes_2_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_108[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_113 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_113 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_22 =
     $signed($signed({{2{_pes_2_6_io_acc[31]}}, _pes_2_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_113[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_118 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_118 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_23 =
     $signed($signed({{2{_pes_2_7_io_acc[31]}}, _pes_2_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_118[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_123 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_123 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_24 =
     $signed($signed({{2{_pes_3_0_io_acc[31]}}, _pes_3_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_123[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_128 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_128 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_25 =
     $signed($signed({{2{_pes_3_1_io_acc[31]}}, _pes_3_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_128[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_133 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_133 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_26 =
     $signed($signed({{2{_pes_3_2_io_acc[31]}}, _pes_3_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_133[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_138 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_138 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_27 =
     $signed($signed({{2{_pes_3_3_io_acc[31]}}, _pes_3_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_138[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_143 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_143 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_28 =
     $signed($signed({{2{_pes_3_4_io_acc[31]}}, _pes_3_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_143[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_148 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_148 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_29 =
     $signed($signed({{2{_pes_3_5_io_acc[31]}}, _pes_3_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_148[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_153 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_153 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_30 =
     $signed($signed({{2{_pes_3_6_io_acc[31]}}, _pes_3_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_153[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_158 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_158 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_31 =
     $signed($signed({{2{_pes_3_7_io_acc[31]}}, _pes_3_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_158[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_163 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_163 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_32 =
     $signed($signed({{2{_pes_4_0_io_acc[31]}}, _pes_4_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_163[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_168 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_168 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_33 =
     $signed($signed({{2{_pes_4_1_io_acc[31]}}, _pes_4_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_168[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_173 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_173 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_34 =
     $signed($signed({{2{_pes_4_2_io_acc[31]}}, _pes_4_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_173[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_178 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_178 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_35 =
     $signed($signed({{2{_pes_4_3_io_acc[31]}}, _pes_4_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_178[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_183 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_183 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_36 =
     $signed($signed({{2{_pes_4_4_io_acc[31]}}, _pes_4_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_183[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_188 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_188 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_37 =
     $signed($signed({{2{_pes_4_5_io_acc[31]}}, _pes_4_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_188[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_193 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_193 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_38 =
     $signed($signed({{2{_pes_4_6_io_acc[31]}}, _pes_4_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_193[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_198 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_198 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_39 =
     $signed($signed({{2{_pes_4_7_io_acc[31]}}, _pes_4_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_198[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_203 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_203 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_40 =
     $signed($signed({{2{_pes_5_0_io_acc[31]}}, _pes_5_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_203[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_208 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_208 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_41 =
     $signed($signed({{2{_pes_5_1_io_acc[31]}}, _pes_5_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_208[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_213 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_213 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_42 =
     $signed($signed({{2{_pes_5_2_io_acc[31]}}, _pes_5_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_213[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_218 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_218 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_43 =
     $signed($signed({{2{_pes_5_3_io_acc[31]}}, _pes_5_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_218[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_223 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_223 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_44 =
     $signed($signed({{2{_pes_5_4_io_acc[31]}}, _pes_5_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_223[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_228 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_228 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_45 =
     $signed($signed({{2{_pes_5_5_io_acc[31]}}, _pes_5_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_228[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_233 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_233 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_46 =
     $signed($signed({{2{_pes_5_6_io_acc[31]}}, _pes_5_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_233[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_238 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_238 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_47 =
     $signed($signed({{2{_pes_5_7_io_acc[31]}}, _pes_5_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_238[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_243 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_243 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_48 =
     $signed($signed({{2{_pes_6_0_io_acc[31]}}, _pes_6_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_243[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_248 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_248 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_49 =
     $signed($signed({{2{_pes_6_1_io_acc[31]}}, _pes_6_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_248[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_253 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_253 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_50 =
     $signed($signed({{2{_pes_6_2_io_acc[31]}}, _pes_6_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_253[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_258 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_258 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_51 =
     $signed($signed({{2{_pes_6_3_io_acc[31]}}, _pes_6_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_258[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_263 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_263 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_52 =
     $signed($signed({{2{_pes_6_4_io_acc[31]}}, _pes_6_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_263[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_268 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_268 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_53 =
     $signed($signed({{2{_pes_6_5_io_acc[31]}}, _pes_6_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_268[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_273 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_273 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_54 =
     $signed($signed({{2{_pes_6_6_io_acc[31]}}, _pes_6_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_273[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_278 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_278 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_55 =
     $signed($signed({{2{_pes_6_7_io_acc[31]}}, _pes_6_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_278[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_283 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_283 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_56 =
     $signed($signed({{2{_pes_7_0_io_acc[31]}}, _pes_7_0_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_283[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_288 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_288 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_57 =
     $signed($signed({{2{_pes_7_1_io_acc[31]}}, _pes_7_1_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_288[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_293 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_293 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_58 =
     $signed($signed({{2{_pes_7_2_io_acc[31]}}, _pes_7_2_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_293[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_298 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_298 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_59 =
     $signed($signed({{2{_pes_7_3_io_acc[31]}}, _pes_7_3_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_298[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_303 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_303 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_60 =
     $signed($signed({{2{_pes_7_4_io_acc[31]}}, _pes_7_4_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_303[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_308 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_308 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_61 =
     $signed($signed({{2{_pes_7_5_io_acc[31]}}, _pes_7_5_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_308[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_313 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_313 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_62 =
     $signed($signed({{2{_pes_7_6_io_acc[31]}}, _pes_7_6_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_313[31:0]})
-            >>> _GEN_98);
-  wire [62:0]  _rowBytes_half_T_318 = 63'h1 << _GEN_97;
+            >>> _GEN_111);
+  wire [62:0]  _rowBytes_half_T_318 = 63'h1 << _GEN_110;
   wire [33:0]  rowBytes_shifted_63 =
     $signed($signed({{2{_pes_7_7_io_acc[31]}}, _pes_7_7_io_acc}
                     + {2'h0, _rowBytes_half_T_315 ? 32'h0 : _rowBytes_half_T_318[31:0]})
-            >>> _GEN_98);
+            >>> _GEN_111);
   always @(*) begin
     casez (fillGrp[1:0])
       2'b00:
-        casez_tmp_17 =
+        casez_tmp_16 =
           {$signed(rowBytes_shifted_15) > 34'sh7F
              ? 8'h7F
              : $signed(rowBytes_shifted_15) < -34'sh80 ? 8'h80 : rowBytes_shifted_15[7:0],
@@ -2266,7 +2348,7 @@ module mm_accel(
              ? 8'h7F
              : $signed(rowBytes_shifted) < -34'sh80 ? 8'h80 : rowBytes_shifted[7:0]};
       2'b01:
-        casez_tmp_17 =
+        casez_tmp_16 =
           {$signed(rowBytes_shifted_31) > 34'sh7F
              ? 8'h7F
              : $signed(rowBytes_shifted_31) < -34'sh80 ? 8'h80 : rowBytes_shifted_31[7:0],
@@ -2318,7 +2400,7 @@ module mm_accel(
                  ? 8'h80
                  : rowBytes_shifted_16[7:0]};
       2'b10:
-        casez_tmp_17 =
+        casez_tmp_16 =
           {$signed(rowBytes_shifted_47) > 34'sh7F
              ? 8'h7F
              : $signed(rowBytes_shifted_47) < -34'sh80 ? 8'h80 : rowBytes_shifted_47[7:0],
@@ -2370,7 +2452,7 @@ module mm_accel(
                  ? 8'h80
                  : rowBytes_shifted_32[7:0]};
       default:
-        casez_tmp_17 =
+        casez_tmp_16 =
           {$signed(rowBytes_shifted_63) > 34'sh7F
              ? 8'h7F
              : $signed(rowBytes_shifted_63) < -34'sh80 ? 8'h80 : rowBytes_shifted_63[7:0],
@@ -2423,7 +2505,7 @@ module mm_accel(
                  : rowBytes_shifted_48[7:0]};
     endcase
   end // always @(*)
-  wire [8:0]   _ldLines_ceilLines_T = _GEN_94 + 9'hF;
+  wire [8:0]   _ldLines_ceilLines_T = {1'h0, ldKLen} + 9'hF;
   wire [2:0]   _ldLines_T_1 =
     _ldLines_ceilLines_T[8:4] == 5'h0
       ? 3'h1
@@ -2432,467 +2514,466 @@ module mm_accel(
   reg          ldInB;
   reg  [2:0]   ldLane;
   reg  [1:0]   ldChunk;
-  wire [31:0]  _GEN_99 = {25'h0, _ldLines_T_1, 4'h0};
-  wire [31:0]  effSrcStride = srcStride == 32'h0 ? _GEN_99 : srcStride;
-  wire         burstOK = effSrcStride == _GEN_99;
+  wire [31:0]  _GEN_112 = {25'h0, _ldLines_T_1, 4'h0};
+  wire [31:0]  effSrcStride = srcStride == 32'h0 ? _GEN_112 : srcStride;
+  wire         burstOK = effSrcStride == _GEN_112;
   wire [31:0]  ldBase = ldInB ? bSrcAddr : aSrcAddr;
-  wire         _bOnly_T_2 = qState == 3'h1;
+  wire         _fromQueue_T = qState == 4'h1;
   wire         ldStartAny =
-    doWrite & _qStartPulse_T & s_axi_wdata[3] & ~ldBusy & ~dmaBusy | ldStartB
-    | _bOnly_T_2;
-  wire         _GEN_100 = mem_ready & ~dmaBusy;
-  wire         _GEN_101 = ldBusy & _GEN_100 & ldLane == 3'h0;
-  wire         _GEN_102 = ldStartAny | ~_GEN_101;
-  assign wData_0_0 = _GEN_102 ? _GEN_22 : mem_rline[7:0];
-  assign wData_0_1 = _GEN_102 ? _GEN_23 : mem_rline[15:8];
-  assign wData_0_2 = _GEN_102 ? _GEN_24 : mem_rline[23:16];
-  assign wData_0_3 = _GEN_102 ? _GEN_25 : mem_rline[31:24];
-  assign wData_0_4 = _GEN_102 ? _GEN_22 : mem_rline[39:32];
-  assign wData_0_5 = _GEN_102 ? _GEN_23 : mem_rline[47:40];
-  assign wData_0_6 = _GEN_102 ? _GEN_24 : mem_rline[55:48];
-  assign wData_0_7 = _GEN_102 ? _GEN_25 : mem_rline[63:56];
-  assign wData_0_8 = _GEN_102 ? _GEN_22 : mem_rline[71:64];
-  assign wData_0_9 = _GEN_102 ? _GEN_23 : mem_rline[79:72];
-  assign wData_0_10 = _GEN_102 ? _GEN_24 : mem_rline[87:80];
-  assign wData_0_11 = _GEN_102 ? _GEN_25 : mem_rline[95:88];
-  assign wData_0_12 = _GEN_102 ? _GEN_22 : mem_rline[103:96];
-  assign wData_0_13 = _GEN_102 ? _GEN_23 : mem_rline[111:104];
-  assign wData_0_14 = _GEN_102 ? _GEN_24 : mem_rline[119:112];
-  assign wData_0_15 = _GEN_102 ? _GEN_25 : mem_rline[127:120];
-  wire         _GEN_103 = ~ldStartAny & _GEN_101;
-  assign wMask_0_0 = _GEN_103 | _GEN_26;
-  assign wMask_0_1 = _GEN_103 | _GEN_26;
-  assign wMask_0_2 = _GEN_103 | _GEN_26;
-  assign wMask_0_3 = _GEN_103 | _GEN_26;
-  assign wMask_0_4 = _GEN_103 | _GEN_27;
-  assign wMask_0_5 = _GEN_103 | _GEN_27;
-  assign wMask_0_6 = _GEN_103 | _GEN_27;
-  assign wMask_0_7 = _GEN_103 | _GEN_27;
-  assign wMask_0_8 = _GEN_103 | _GEN_28;
-  assign wMask_0_9 = _GEN_103 | _GEN_28;
-  assign wMask_0_10 = _GEN_103 | _GEN_28;
-  assign wMask_0_11 = _GEN_103 | _GEN_28;
-  assign wMask_0_12 = _GEN_103 | _GEN_29;
-  assign wMask_0_13 = _GEN_103 | _GEN_29;
-  assign wMask_0_14 = _GEN_103 | _GEN_29;
-  assign wMask_0_15 = _GEN_103 | _GEN_29;
-  wire [3:0]   _GEN_104 = {2'h0, ldChunk};
-  wire         _GEN_105 = ldBusy & _GEN_100 & ldLane == 3'h1;
-  wire         _GEN_106 = ldStartAny | ~_GEN_105;
-  assign wData_1_0 = _GEN_106 ? _GEN_32 : mem_rline[7:0];
-  assign wData_1_1 = _GEN_106 ? _GEN_33 : mem_rline[15:8];
-  assign wData_1_2 = _GEN_106 ? _GEN_34 : mem_rline[23:16];
-  assign wData_1_3 = _GEN_106 ? _GEN_35 : mem_rline[31:24];
-  assign wData_1_4 = _GEN_106 ? _GEN_32 : mem_rline[39:32];
-  assign wData_1_5 = _GEN_106 ? _GEN_33 : mem_rline[47:40];
-  assign wData_1_6 = _GEN_106 ? _GEN_34 : mem_rline[55:48];
-  assign wData_1_7 = _GEN_106 ? _GEN_35 : mem_rline[63:56];
-  assign wData_1_8 = _GEN_106 ? _GEN_32 : mem_rline[71:64];
-  assign wData_1_9 = _GEN_106 ? _GEN_33 : mem_rline[79:72];
-  assign wData_1_10 = _GEN_106 ? _GEN_34 : mem_rline[87:80];
-  assign wData_1_11 = _GEN_106 ? _GEN_35 : mem_rline[95:88];
-  assign wData_1_12 = _GEN_106 ? _GEN_32 : mem_rline[103:96];
-  assign wData_1_13 = _GEN_106 ? _GEN_33 : mem_rline[111:104];
-  assign wData_1_14 = _GEN_106 ? _GEN_34 : mem_rline[119:112];
-  assign wData_1_15 = _GEN_106 ? _GEN_35 : mem_rline[127:120];
-  wire         _GEN_107 = ~ldStartAny & _GEN_105;
-  assign wMask_1_0 = _GEN_107 | _GEN_36;
-  assign wMask_1_1 = _GEN_107 | _GEN_36;
-  assign wMask_1_2 = _GEN_107 | _GEN_36;
-  assign wMask_1_3 = _GEN_107 | _GEN_36;
-  assign wMask_1_4 = _GEN_107 | _GEN_37;
-  assign wMask_1_5 = _GEN_107 | _GEN_37;
-  assign wMask_1_6 = _GEN_107 | _GEN_37;
-  assign wMask_1_7 = _GEN_107 | _GEN_37;
-  assign wMask_1_8 = _GEN_107 | _GEN_38;
-  assign wMask_1_9 = _GEN_107 | _GEN_38;
-  assign wMask_1_10 = _GEN_107 | _GEN_38;
-  assign wMask_1_11 = _GEN_107 | _GEN_38;
-  assign wMask_1_12 = _GEN_107 | _GEN_39;
-  assign wMask_1_13 = _GEN_107 | _GEN_39;
-  assign wMask_1_14 = _GEN_107 | _GEN_39;
-  assign wMask_1_15 = _GEN_107 | _GEN_39;
-  wire         _GEN_108 = ldBusy & _GEN_100 & ldLane == 3'h2;
-  wire         _GEN_109 = ldStartAny | ~_GEN_108;
-  assign wData_2_0 = _GEN_109 ? _GEN_41 : mem_rline[7:0];
-  assign wData_2_1 = _GEN_109 ? _GEN_42 : mem_rline[15:8];
-  assign wData_2_2 = _GEN_109 ? _GEN_43 : mem_rline[23:16];
-  assign wData_2_3 = _GEN_109 ? _GEN_44 : mem_rline[31:24];
-  assign wData_2_4 = _GEN_109 ? _GEN_41 : mem_rline[39:32];
-  assign wData_2_5 = _GEN_109 ? _GEN_42 : mem_rline[47:40];
-  assign wData_2_6 = _GEN_109 ? _GEN_43 : mem_rline[55:48];
-  assign wData_2_7 = _GEN_109 ? _GEN_44 : mem_rline[63:56];
-  assign wData_2_8 = _GEN_109 ? _GEN_41 : mem_rline[71:64];
-  assign wData_2_9 = _GEN_109 ? _GEN_42 : mem_rline[79:72];
-  assign wData_2_10 = _GEN_109 ? _GEN_43 : mem_rline[87:80];
-  assign wData_2_11 = _GEN_109 ? _GEN_44 : mem_rline[95:88];
-  assign wData_2_12 = _GEN_109 ? _GEN_41 : mem_rline[103:96];
-  assign wData_2_13 = _GEN_109 ? _GEN_42 : mem_rline[111:104];
-  assign wData_2_14 = _GEN_109 ? _GEN_43 : mem_rline[119:112];
-  assign wData_2_15 = _GEN_109 ? _GEN_44 : mem_rline[127:120];
-  wire         _GEN_110 = ~ldStartAny & _GEN_108;
-  assign wMask_2_0 = _GEN_110 | _GEN_45;
-  assign wMask_2_1 = _GEN_110 | _GEN_45;
-  assign wMask_2_2 = _GEN_110 | _GEN_45;
-  assign wMask_2_3 = _GEN_110 | _GEN_45;
-  assign wMask_2_4 = _GEN_110 | _GEN_46;
-  assign wMask_2_5 = _GEN_110 | _GEN_46;
-  assign wMask_2_6 = _GEN_110 | _GEN_46;
-  assign wMask_2_7 = _GEN_110 | _GEN_46;
-  assign wMask_2_8 = _GEN_110 | _GEN_47;
-  assign wMask_2_9 = _GEN_110 | _GEN_47;
-  assign wMask_2_10 = _GEN_110 | _GEN_47;
-  assign wMask_2_11 = _GEN_110 | _GEN_47;
-  assign wMask_2_12 = _GEN_110 | _GEN_48;
-  assign wMask_2_13 = _GEN_110 | _GEN_48;
-  assign wMask_2_14 = _GEN_110 | _GEN_48;
-  assign wMask_2_15 = _GEN_110 | _GEN_48;
-  wire         _GEN_111 = ldBusy & _GEN_100 & ldLane == 3'h3;
-  wire         _GEN_112 = ldStartAny | ~_GEN_111;
-  assign wData_3_0 = _GEN_112 ? _GEN_50 : mem_rline[7:0];
-  assign wData_3_1 = _GEN_112 ? _GEN_51 : mem_rline[15:8];
-  assign wData_3_2 = _GEN_112 ? _GEN_52 : mem_rline[23:16];
-  assign wData_3_3 = _GEN_112 ? _GEN_53 : mem_rline[31:24];
-  assign wData_3_4 = _GEN_112 ? _GEN_50 : mem_rline[39:32];
-  assign wData_3_5 = _GEN_112 ? _GEN_51 : mem_rline[47:40];
-  assign wData_3_6 = _GEN_112 ? _GEN_52 : mem_rline[55:48];
-  assign wData_3_7 = _GEN_112 ? _GEN_53 : mem_rline[63:56];
-  assign wData_3_8 = _GEN_112 ? _GEN_50 : mem_rline[71:64];
-  assign wData_3_9 = _GEN_112 ? _GEN_51 : mem_rline[79:72];
-  assign wData_3_10 = _GEN_112 ? _GEN_52 : mem_rline[87:80];
-  assign wData_3_11 = _GEN_112 ? _GEN_53 : mem_rline[95:88];
-  assign wData_3_12 = _GEN_112 ? _GEN_50 : mem_rline[103:96];
-  assign wData_3_13 = _GEN_112 ? _GEN_51 : mem_rline[111:104];
-  assign wData_3_14 = _GEN_112 ? _GEN_52 : mem_rline[119:112];
-  assign wData_3_15 = _GEN_112 ? _GEN_53 : mem_rline[127:120];
-  wire         _GEN_113 = ~ldStartAny & _GEN_111;
-  assign wMask_3_0 = _GEN_113 | _GEN_54;
-  assign wMask_3_1 = _GEN_113 | _GEN_54;
-  assign wMask_3_2 = _GEN_113 | _GEN_54;
-  assign wMask_3_3 = _GEN_113 | _GEN_54;
-  assign wMask_3_4 = _GEN_113 | _GEN_55;
-  assign wMask_3_5 = _GEN_113 | _GEN_55;
-  assign wMask_3_6 = _GEN_113 | _GEN_55;
-  assign wMask_3_7 = _GEN_113 | _GEN_55;
-  assign wMask_3_8 = _GEN_113 | _GEN_56;
-  assign wMask_3_9 = _GEN_113 | _GEN_56;
-  assign wMask_3_10 = _GEN_113 | _GEN_56;
-  assign wMask_3_11 = _GEN_113 | _GEN_56;
-  assign wMask_3_12 = _GEN_113 | _GEN_57;
-  assign wMask_3_13 = _GEN_113 | _GEN_57;
-  assign wMask_3_14 = _GEN_113 | _GEN_57;
-  assign wMask_3_15 = _GEN_113 | _GEN_57;
-  wire         _GEN_114 = ldBusy & _GEN_100 & ldLane == 3'h4;
-  wire         _GEN_115 = ldStartAny | ~_GEN_114;
-  assign wData_4_0 = _GEN_115 ? _GEN_59 : mem_rline[7:0];
-  assign wData_4_1 = _GEN_115 ? _GEN_60 : mem_rline[15:8];
-  assign wData_4_2 = _GEN_115 ? _GEN_61 : mem_rline[23:16];
-  assign wData_4_3 = _GEN_115 ? _GEN_62 : mem_rline[31:24];
-  assign wData_4_4 = _GEN_115 ? _GEN_59 : mem_rline[39:32];
-  assign wData_4_5 = _GEN_115 ? _GEN_60 : mem_rline[47:40];
-  assign wData_4_6 = _GEN_115 ? _GEN_61 : mem_rline[55:48];
-  assign wData_4_7 = _GEN_115 ? _GEN_62 : mem_rline[63:56];
-  assign wData_4_8 = _GEN_115 ? _GEN_59 : mem_rline[71:64];
-  assign wData_4_9 = _GEN_115 ? _GEN_60 : mem_rline[79:72];
-  assign wData_4_10 = _GEN_115 ? _GEN_61 : mem_rline[87:80];
-  assign wData_4_11 = _GEN_115 ? _GEN_62 : mem_rline[95:88];
-  assign wData_4_12 = _GEN_115 ? _GEN_59 : mem_rline[103:96];
-  assign wData_4_13 = _GEN_115 ? _GEN_60 : mem_rline[111:104];
-  assign wData_4_14 = _GEN_115 ? _GEN_61 : mem_rline[119:112];
-  assign wData_4_15 = _GEN_115 ? _GEN_62 : mem_rline[127:120];
-  wire         _GEN_116 = ~ldStartAny & _GEN_114;
-  assign wMask_4_0 = _GEN_116 | _GEN_63;
-  assign wMask_4_1 = _GEN_116 | _GEN_63;
-  assign wMask_4_2 = _GEN_116 | _GEN_63;
-  assign wMask_4_3 = _GEN_116 | _GEN_63;
-  assign wMask_4_4 = _GEN_116 | _GEN_64;
-  assign wMask_4_5 = _GEN_116 | _GEN_64;
-  assign wMask_4_6 = _GEN_116 | _GEN_64;
-  assign wMask_4_7 = _GEN_116 | _GEN_64;
-  assign wMask_4_8 = _GEN_116 | _GEN_65;
-  assign wMask_4_9 = _GEN_116 | _GEN_65;
-  assign wMask_4_10 = _GEN_116 | _GEN_65;
-  assign wMask_4_11 = _GEN_116 | _GEN_65;
-  assign wMask_4_12 = _GEN_116 | _GEN_66;
-  assign wMask_4_13 = _GEN_116 | _GEN_66;
-  assign wMask_4_14 = _GEN_116 | _GEN_66;
-  assign wMask_4_15 = _GEN_116 | _GEN_66;
-  wire         _GEN_117 = ldBusy & _GEN_100 & ldLane == 3'h5;
+    doWrite & _qStartPulse_T & s_axi_wdata[3] & ~ldBusy | ldStartB | _fromQueue_T
+    | prePend;
+  wire         _GEN_113 = ldBusy & mem_rd_ready & ldLane == 3'h0;
+  wire         _GEN_114 = ldStartAny | ~_GEN_113;
+  assign wData_0_0 = _GEN_114 ? _GEN_35 : mem_rline[7:0];
+  assign wData_0_1 = _GEN_114 ? _GEN_36 : mem_rline[15:8];
+  assign wData_0_2 = _GEN_114 ? _GEN_37 : mem_rline[23:16];
+  assign wData_0_3 = _GEN_114 ? _GEN_38 : mem_rline[31:24];
+  assign wData_0_4 = _GEN_114 ? _GEN_35 : mem_rline[39:32];
+  assign wData_0_5 = _GEN_114 ? _GEN_36 : mem_rline[47:40];
+  assign wData_0_6 = _GEN_114 ? _GEN_37 : mem_rline[55:48];
+  assign wData_0_7 = _GEN_114 ? _GEN_38 : mem_rline[63:56];
+  assign wData_0_8 = _GEN_114 ? _GEN_35 : mem_rline[71:64];
+  assign wData_0_9 = _GEN_114 ? _GEN_36 : mem_rline[79:72];
+  assign wData_0_10 = _GEN_114 ? _GEN_37 : mem_rline[87:80];
+  assign wData_0_11 = _GEN_114 ? _GEN_38 : mem_rline[95:88];
+  assign wData_0_12 = _GEN_114 ? _GEN_35 : mem_rline[103:96];
+  assign wData_0_13 = _GEN_114 ? _GEN_36 : mem_rline[111:104];
+  assign wData_0_14 = _GEN_114 ? _GEN_37 : mem_rline[119:112];
+  assign wData_0_15 = _GEN_114 ? _GEN_38 : mem_rline[127:120];
+  wire         _GEN_115 = ~ldStartAny & _GEN_113;
+  assign wMask_0_0 = _GEN_115 | _GEN_39;
+  assign wMask_0_1 = _GEN_115 | _GEN_39;
+  assign wMask_0_2 = _GEN_115 | _GEN_39;
+  assign wMask_0_3 = _GEN_115 | _GEN_39;
+  assign wMask_0_4 = _GEN_115 | _GEN_40;
+  assign wMask_0_5 = _GEN_115 | _GEN_40;
+  assign wMask_0_6 = _GEN_115 | _GEN_40;
+  assign wMask_0_7 = _GEN_115 | _GEN_40;
+  assign wMask_0_8 = _GEN_115 | _GEN_41;
+  assign wMask_0_9 = _GEN_115 | _GEN_41;
+  assign wMask_0_10 = _GEN_115 | _GEN_41;
+  assign wMask_0_11 = _GEN_115 | _GEN_41;
+  assign wMask_0_12 = _GEN_115 | _GEN_42;
+  assign wMask_0_13 = _GEN_115 | _GEN_42;
+  assign wMask_0_14 = _GEN_115 | _GEN_42;
+  assign wMask_0_15 = _GEN_115 | _GEN_42;
+  wire [3:0]   _GEN_116 = {2'h0, ldChunk};
+  wire         _GEN_117 = ldBusy & mem_rd_ready & ldLane == 3'h1;
   wire         _GEN_118 = ldStartAny | ~_GEN_117;
-  assign wData_5_0 = _GEN_118 ? _GEN_68 : mem_rline[7:0];
-  assign wData_5_1 = _GEN_118 ? _GEN_69 : mem_rline[15:8];
-  assign wData_5_2 = _GEN_118 ? _GEN_70 : mem_rline[23:16];
-  assign wData_5_3 = _GEN_118 ? _GEN_71 : mem_rline[31:24];
-  assign wData_5_4 = _GEN_118 ? _GEN_68 : mem_rline[39:32];
-  assign wData_5_5 = _GEN_118 ? _GEN_69 : mem_rline[47:40];
-  assign wData_5_6 = _GEN_118 ? _GEN_70 : mem_rline[55:48];
-  assign wData_5_7 = _GEN_118 ? _GEN_71 : mem_rline[63:56];
-  assign wData_5_8 = _GEN_118 ? _GEN_68 : mem_rline[71:64];
-  assign wData_5_9 = _GEN_118 ? _GEN_69 : mem_rline[79:72];
-  assign wData_5_10 = _GEN_118 ? _GEN_70 : mem_rline[87:80];
-  assign wData_5_11 = _GEN_118 ? _GEN_71 : mem_rline[95:88];
-  assign wData_5_12 = _GEN_118 ? _GEN_68 : mem_rline[103:96];
-  assign wData_5_13 = _GEN_118 ? _GEN_69 : mem_rline[111:104];
-  assign wData_5_14 = _GEN_118 ? _GEN_70 : mem_rline[119:112];
-  assign wData_5_15 = _GEN_118 ? _GEN_71 : mem_rline[127:120];
+  assign wData_1_0 = _GEN_118 ? _GEN_45 : mem_rline[7:0];
+  assign wData_1_1 = _GEN_118 ? _GEN_46 : mem_rline[15:8];
+  assign wData_1_2 = _GEN_118 ? _GEN_47 : mem_rline[23:16];
+  assign wData_1_3 = _GEN_118 ? _GEN_48 : mem_rline[31:24];
+  assign wData_1_4 = _GEN_118 ? _GEN_45 : mem_rline[39:32];
+  assign wData_1_5 = _GEN_118 ? _GEN_46 : mem_rline[47:40];
+  assign wData_1_6 = _GEN_118 ? _GEN_47 : mem_rline[55:48];
+  assign wData_1_7 = _GEN_118 ? _GEN_48 : mem_rline[63:56];
+  assign wData_1_8 = _GEN_118 ? _GEN_45 : mem_rline[71:64];
+  assign wData_1_9 = _GEN_118 ? _GEN_46 : mem_rline[79:72];
+  assign wData_1_10 = _GEN_118 ? _GEN_47 : mem_rline[87:80];
+  assign wData_1_11 = _GEN_118 ? _GEN_48 : mem_rline[95:88];
+  assign wData_1_12 = _GEN_118 ? _GEN_45 : mem_rline[103:96];
+  assign wData_1_13 = _GEN_118 ? _GEN_46 : mem_rline[111:104];
+  assign wData_1_14 = _GEN_118 ? _GEN_47 : mem_rline[119:112];
+  assign wData_1_15 = _GEN_118 ? _GEN_48 : mem_rline[127:120];
   wire         _GEN_119 = ~ldStartAny & _GEN_117;
-  assign wMask_5_0 = _GEN_119 | _GEN_72;
-  assign wMask_5_1 = _GEN_119 | _GEN_72;
-  assign wMask_5_2 = _GEN_119 | _GEN_72;
-  assign wMask_5_3 = _GEN_119 | _GEN_72;
-  assign wMask_5_4 = _GEN_119 | _GEN_73;
-  assign wMask_5_5 = _GEN_119 | _GEN_73;
-  assign wMask_5_6 = _GEN_119 | _GEN_73;
-  assign wMask_5_7 = _GEN_119 | _GEN_73;
-  assign wMask_5_8 = _GEN_119 | _GEN_74;
-  assign wMask_5_9 = _GEN_119 | _GEN_74;
-  assign wMask_5_10 = _GEN_119 | _GEN_74;
-  assign wMask_5_11 = _GEN_119 | _GEN_74;
-  assign wMask_5_12 = _GEN_119 | _GEN_75;
-  assign wMask_5_13 = _GEN_119 | _GEN_75;
-  assign wMask_5_14 = _GEN_119 | _GEN_75;
-  assign wMask_5_15 = _GEN_119 | _GEN_75;
-  wire         _GEN_120 = ldBusy & _GEN_100 & ldLane == 3'h6;
+  assign wMask_1_0 = _GEN_119 | _GEN_49;
+  assign wMask_1_1 = _GEN_119 | _GEN_49;
+  assign wMask_1_2 = _GEN_119 | _GEN_49;
+  assign wMask_1_3 = _GEN_119 | _GEN_49;
+  assign wMask_1_4 = _GEN_119 | _GEN_50;
+  assign wMask_1_5 = _GEN_119 | _GEN_50;
+  assign wMask_1_6 = _GEN_119 | _GEN_50;
+  assign wMask_1_7 = _GEN_119 | _GEN_50;
+  assign wMask_1_8 = _GEN_119 | _GEN_51;
+  assign wMask_1_9 = _GEN_119 | _GEN_51;
+  assign wMask_1_10 = _GEN_119 | _GEN_51;
+  assign wMask_1_11 = _GEN_119 | _GEN_51;
+  assign wMask_1_12 = _GEN_119 | _GEN_52;
+  assign wMask_1_13 = _GEN_119 | _GEN_52;
+  assign wMask_1_14 = _GEN_119 | _GEN_52;
+  assign wMask_1_15 = _GEN_119 | _GEN_52;
+  wire         _GEN_120 = ldBusy & mem_rd_ready & ldLane == 3'h2;
   wire         _GEN_121 = ldStartAny | ~_GEN_120;
-  assign wData_6_0 = _GEN_121 ? _GEN_77 : mem_rline[7:0];
-  assign wData_6_1 = _GEN_121 ? _GEN_78 : mem_rline[15:8];
-  assign wData_6_2 = _GEN_121 ? _GEN_79 : mem_rline[23:16];
-  assign wData_6_3 = _GEN_121 ? _GEN_80 : mem_rline[31:24];
-  assign wData_6_4 = _GEN_121 ? _GEN_77 : mem_rline[39:32];
-  assign wData_6_5 = _GEN_121 ? _GEN_78 : mem_rline[47:40];
-  assign wData_6_6 = _GEN_121 ? _GEN_79 : mem_rline[55:48];
-  assign wData_6_7 = _GEN_121 ? _GEN_80 : mem_rline[63:56];
-  assign wData_6_8 = _GEN_121 ? _GEN_77 : mem_rline[71:64];
-  assign wData_6_9 = _GEN_121 ? _GEN_78 : mem_rline[79:72];
-  assign wData_6_10 = _GEN_121 ? _GEN_79 : mem_rline[87:80];
-  assign wData_6_11 = _GEN_121 ? _GEN_80 : mem_rline[95:88];
-  assign wData_6_12 = _GEN_121 ? _GEN_77 : mem_rline[103:96];
-  assign wData_6_13 = _GEN_121 ? _GEN_78 : mem_rline[111:104];
-  assign wData_6_14 = _GEN_121 ? _GEN_79 : mem_rline[119:112];
-  assign wData_6_15 = _GEN_121 ? _GEN_80 : mem_rline[127:120];
+  assign wData_2_0 = _GEN_121 ? _GEN_54 : mem_rline[7:0];
+  assign wData_2_1 = _GEN_121 ? _GEN_55 : mem_rline[15:8];
+  assign wData_2_2 = _GEN_121 ? _GEN_56 : mem_rline[23:16];
+  assign wData_2_3 = _GEN_121 ? _GEN_57 : mem_rline[31:24];
+  assign wData_2_4 = _GEN_121 ? _GEN_54 : mem_rline[39:32];
+  assign wData_2_5 = _GEN_121 ? _GEN_55 : mem_rline[47:40];
+  assign wData_2_6 = _GEN_121 ? _GEN_56 : mem_rline[55:48];
+  assign wData_2_7 = _GEN_121 ? _GEN_57 : mem_rline[63:56];
+  assign wData_2_8 = _GEN_121 ? _GEN_54 : mem_rline[71:64];
+  assign wData_2_9 = _GEN_121 ? _GEN_55 : mem_rline[79:72];
+  assign wData_2_10 = _GEN_121 ? _GEN_56 : mem_rline[87:80];
+  assign wData_2_11 = _GEN_121 ? _GEN_57 : mem_rline[95:88];
+  assign wData_2_12 = _GEN_121 ? _GEN_54 : mem_rline[103:96];
+  assign wData_2_13 = _GEN_121 ? _GEN_55 : mem_rline[111:104];
+  assign wData_2_14 = _GEN_121 ? _GEN_56 : mem_rline[119:112];
+  assign wData_2_15 = _GEN_121 ? _GEN_57 : mem_rline[127:120];
   wire         _GEN_122 = ~ldStartAny & _GEN_120;
-  assign wMask_6_0 = _GEN_122 | _GEN_81;
-  assign wMask_6_1 = _GEN_122 | _GEN_81;
-  assign wMask_6_2 = _GEN_122 | _GEN_81;
-  assign wMask_6_3 = _GEN_122 | _GEN_81;
-  assign wMask_6_4 = _GEN_122 | _GEN_82;
-  assign wMask_6_5 = _GEN_122 | _GEN_82;
-  assign wMask_6_6 = _GEN_122 | _GEN_82;
-  assign wMask_6_7 = _GEN_122 | _GEN_82;
-  assign wMask_6_8 = _GEN_122 | _GEN_83;
-  assign wMask_6_9 = _GEN_122 | _GEN_83;
-  assign wMask_6_10 = _GEN_122 | _GEN_83;
-  assign wMask_6_11 = _GEN_122 | _GEN_83;
-  assign wMask_6_12 = _GEN_122 | _GEN_84;
-  assign wMask_6_13 = _GEN_122 | _GEN_84;
-  assign wMask_6_14 = _GEN_122 | _GEN_84;
-  assign wMask_6_15 = _GEN_122 | _GEN_84;
-  wire         _GEN_123 = ldBusy & _GEN_100 & (&ldLane);
+  assign wMask_2_0 = _GEN_122 | _GEN_58;
+  assign wMask_2_1 = _GEN_122 | _GEN_58;
+  assign wMask_2_2 = _GEN_122 | _GEN_58;
+  assign wMask_2_3 = _GEN_122 | _GEN_58;
+  assign wMask_2_4 = _GEN_122 | _GEN_59;
+  assign wMask_2_5 = _GEN_122 | _GEN_59;
+  assign wMask_2_6 = _GEN_122 | _GEN_59;
+  assign wMask_2_7 = _GEN_122 | _GEN_59;
+  assign wMask_2_8 = _GEN_122 | _GEN_60;
+  assign wMask_2_9 = _GEN_122 | _GEN_60;
+  assign wMask_2_10 = _GEN_122 | _GEN_60;
+  assign wMask_2_11 = _GEN_122 | _GEN_60;
+  assign wMask_2_12 = _GEN_122 | _GEN_61;
+  assign wMask_2_13 = _GEN_122 | _GEN_61;
+  assign wMask_2_14 = _GEN_122 | _GEN_61;
+  assign wMask_2_15 = _GEN_122 | _GEN_61;
+  wire         _GEN_123 = ldBusy & mem_rd_ready & ldLane == 3'h3;
   wire         _GEN_124 = ldStartAny | ~_GEN_123;
-  assign wData_7_0 = _GEN_124 ? _GEN_86 : mem_rline[7:0];
-  assign wData_7_1 = _GEN_124 ? _GEN_87 : mem_rline[15:8];
-  assign wData_7_2 = _GEN_124 ? _GEN_88 : mem_rline[23:16];
-  assign wData_7_3 = _GEN_124 ? _GEN_89 : mem_rline[31:24];
-  assign wData_7_4 = _GEN_124 ? _GEN_86 : mem_rline[39:32];
-  assign wData_7_5 = _GEN_124 ? _GEN_87 : mem_rline[47:40];
-  assign wData_7_6 = _GEN_124 ? _GEN_88 : mem_rline[55:48];
-  assign wData_7_7 = _GEN_124 ? _GEN_89 : mem_rline[63:56];
-  assign wData_7_8 = _GEN_124 ? _GEN_86 : mem_rline[71:64];
-  assign wData_7_9 = _GEN_124 ? _GEN_87 : mem_rline[79:72];
-  assign wData_7_10 = _GEN_124 ? _GEN_88 : mem_rline[87:80];
-  assign wData_7_11 = _GEN_124 ? _GEN_89 : mem_rline[95:88];
-  assign wData_7_12 = _GEN_124 ? _GEN_86 : mem_rline[103:96];
-  assign wData_7_13 = _GEN_124 ? _GEN_87 : mem_rline[111:104];
-  assign wData_7_14 = _GEN_124 ? _GEN_88 : mem_rline[119:112];
-  assign wData_7_15 = _GEN_124 ? _GEN_89 : mem_rline[127:120];
+  assign wData_3_0 = _GEN_124 ? _GEN_63 : mem_rline[7:0];
+  assign wData_3_1 = _GEN_124 ? _GEN_64 : mem_rline[15:8];
+  assign wData_3_2 = _GEN_124 ? _GEN_65 : mem_rline[23:16];
+  assign wData_3_3 = _GEN_124 ? _GEN_66 : mem_rline[31:24];
+  assign wData_3_4 = _GEN_124 ? _GEN_63 : mem_rline[39:32];
+  assign wData_3_5 = _GEN_124 ? _GEN_64 : mem_rline[47:40];
+  assign wData_3_6 = _GEN_124 ? _GEN_65 : mem_rline[55:48];
+  assign wData_3_7 = _GEN_124 ? _GEN_66 : mem_rline[63:56];
+  assign wData_3_8 = _GEN_124 ? _GEN_63 : mem_rline[71:64];
+  assign wData_3_9 = _GEN_124 ? _GEN_64 : mem_rline[79:72];
+  assign wData_3_10 = _GEN_124 ? _GEN_65 : mem_rline[87:80];
+  assign wData_3_11 = _GEN_124 ? _GEN_66 : mem_rline[95:88];
+  assign wData_3_12 = _GEN_124 ? _GEN_63 : mem_rline[103:96];
+  assign wData_3_13 = _GEN_124 ? _GEN_64 : mem_rline[111:104];
+  assign wData_3_14 = _GEN_124 ? _GEN_65 : mem_rline[119:112];
+  assign wData_3_15 = _GEN_124 ? _GEN_66 : mem_rline[127:120];
   wire         _GEN_125 = ~ldStartAny & _GEN_123;
-  assign wMask_7_0 = _GEN_125 | _GEN_90;
-  assign wMask_7_1 = _GEN_125 | _GEN_90;
-  assign wMask_7_2 = _GEN_125 | _GEN_90;
-  assign wMask_7_3 = _GEN_125 | _GEN_90;
-  assign wMask_7_4 = _GEN_125 | _GEN_91;
-  assign wMask_7_5 = _GEN_125 | _GEN_91;
-  assign wMask_7_6 = _GEN_125 | _GEN_91;
-  assign wMask_7_7 = _GEN_125 | _GEN_91;
-  assign wMask_7_8 = _GEN_125 | _GEN_92;
-  assign wMask_7_9 = _GEN_125 | _GEN_92;
-  assign wMask_7_10 = _GEN_125 | _GEN_92;
-  assign wMask_7_11 = _GEN_125 | _GEN_92;
-  assign wMask_7_12 = _GEN_125 | _GEN_93;
-  assign wMask_7_13 = _GEN_125 | _GEN_93;
-  assign wMask_7_14 = _GEN_125 | _GEN_93;
-  assign wMask_7_15 = _GEN_125 | _GEN_93;
+  assign wMask_3_0 = _GEN_125 | _GEN_67;
+  assign wMask_3_1 = _GEN_125 | _GEN_67;
+  assign wMask_3_2 = _GEN_125 | _GEN_67;
+  assign wMask_3_3 = _GEN_125 | _GEN_67;
+  assign wMask_3_4 = _GEN_125 | _GEN_68;
+  assign wMask_3_5 = _GEN_125 | _GEN_68;
+  assign wMask_3_6 = _GEN_125 | _GEN_68;
+  assign wMask_3_7 = _GEN_125 | _GEN_68;
+  assign wMask_3_8 = _GEN_125 | _GEN_69;
+  assign wMask_3_9 = _GEN_125 | _GEN_69;
+  assign wMask_3_10 = _GEN_125 | _GEN_69;
+  assign wMask_3_11 = _GEN_125 | _GEN_69;
+  assign wMask_3_12 = _GEN_125 | _GEN_70;
+  assign wMask_3_13 = _GEN_125 | _GEN_70;
+  assign wMask_3_14 = _GEN_125 | _GEN_70;
+  assign wMask_3_15 = _GEN_125 | _GEN_70;
+  wire         _GEN_126 = ldBusy & mem_rd_ready & ldLane == 3'h4;
+  wire         _GEN_127 = ldStartAny | ~_GEN_126;
+  assign wData_4_0 = _GEN_127 ? _GEN_72 : mem_rline[7:0];
+  assign wData_4_1 = _GEN_127 ? _GEN_73 : mem_rline[15:8];
+  assign wData_4_2 = _GEN_127 ? _GEN_74 : mem_rline[23:16];
+  assign wData_4_3 = _GEN_127 ? _GEN_75 : mem_rline[31:24];
+  assign wData_4_4 = _GEN_127 ? _GEN_72 : mem_rline[39:32];
+  assign wData_4_5 = _GEN_127 ? _GEN_73 : mem_rline[47:40];
+  assign wData_4_6 = _GEN_127 ? _GEN_74 : mem_rline[55:48];
+  assign wData_4_7 = _GEN_127 ? _GEN_75 : mem_rline[63:56];
+  assign wData_4_8 = _GEN_127 ? _GEN_72 : mem_rline[71:64];
+  assign wData_4_9 = _GEN_127 ? _GEN_73 : mem_rline[79:72];
+  assign wData_4_10 = _GEN_127 ? _GEN_74 : mem_rline[87:80];
+  assign wData_4_11 = _GEN_127 ? _GEN_75 : mem_rline[95:88];
+  assign wData_4_12 = _GEN_127 ? _GEN_72 : mem_rline[103:96];
+  assign wData_4_13 = _GEN_127 ? _GEN_73 : mem_rline[111:104];
+  assign wData_4_14 = _GEN_127 ? _GEN_74 : mem_rline[119:112];
+  assign wData_4_15 = _GEN_127 ? _GEN_75 : mem_rline[127:120];
+  wire         _GEN_128 = ~ldStartAny & _GEN_126;
+  assign wMask_4_0 = _GEN_128 | _GEN_76;
+  assign wMask_4_1 = _GEN_128 | _GEN_76;
+  assign wMask_4_2 = _GEN_128 | _GEN_76;
+  assign wMask_4_3 = _GEN_128 | _GEN_76;
+  assign wMask_4_4 = _GEN_128 | _GEN_77;
+  assign wMask_4_5 = _GEN_128 | _GEN_77;
+  assign wMask_4_6 = _GEN_128 | _GEN_77;
+  assign wMask_4_7 = _GEN_128 | _GEN_77;
+  assign wMask_4_8 = _GEN_128 | _GEN_78;
+  assign wMask_4_9 = _GEN_128 | _GEN_78;
+  assign wMask_4_10 = _GEN_128 | _GEN_78;
+  assign wMask_4_11 = _GEN_128 | _GEN_78;
+  assign wMask_4_12 = _GEN_128 | _GEN_79;
+  assign wMask_4_13 = _GEN_128 | _GEN_79;
+  assign wMask_4_14 = _GEN_128 | _GEN_79;
+  assign wMask_4_15 = _GEN_128 | _GEN_79;
+  wire         _GEN_129 = ldBusy & mem_rd_ready & ldLane == 3'h5;
+  wire         _GEN_130 = ldStartAny | ~_GEN_129;
+  assign wData_5_0 = _GEN_130 ? _GEN_81 : mem_rline[7:0];
+  assign wData_5_1 = _GEN_130 ? _GEN_82 : mem_rline[15:8];
+  assign wData_5_2 = _GEN_130 ? _GEN_83 : mem_rline[23:16];
+  assign wData_5_3 = _GEN_130 ? _GEN_84 : mem_rline[31:24];
+  assign wData_5_4 = _GEN_130 ? _GEN_81 : mem_rline[39:32];
+  assign wData_5_5 = _GEN_130 ? _GEN_82 : mem_rline[47:40];
+  assign wData_5_6 = _GEN_130 ? _GEN_83 : mem_rline[55:48];
+  assign wData_5_7 = _GEN_130 ? _GEN_84 : mem_rline[63:56];
+  assign wData_5_8 = _GEN_130 ? _GEN_81 : mem_rline[71:64];
+  assign wData_5_9 = _GEN_130 ? _GEN_82 : mem_rline[79:72];
+  assign wData_5_10 = _GEN_130 ? _GEN_83 : mem_rline[87:80];
+  assign wData_5_11 = _GEN_130 ? _GEN_84 : mem_rline[95:88];
+  assign wData_5_12 = _GEN_130 ? _GEN_81 : mem_rline[103:96];
+  assign wData_5_13 = _GEN_130 ? _GEN_82 : mem_rline[111:104];
+  assign wData_5_14 = _GEN_130 ? _GEN_83 : mem_rline[119:112];
+  assign wData_5_15 = _GEN_130 ? _GEN_84 : mem_rline[127:120];
+  wire         _GEN_131 = ~ldStartAny & _GEN_129;
+  assign wMask_5_0 = _GEN_131 | _GEN_85;
+  assign wMask_5_1 = _GEN_131 | _GEN_85;
+  assign wMask_5_2 = _GEN_131 | _GEN_85;
+  assign wMask_5_3 = _GEN_131 | _GEN_85;
+  assign wMask_5_4 = _GEN_131 | _GEN_86;
+  assign wMask_5_5 = _GEN_131 | _GEN_86;
+  assign wMask_5_6 = _GEN_131 | _GEN_86;
+  assign wMask_5_7 = _GEN_131 | _GEN_86;
+  assign wMask_5_8 = _GEN_131 | _GEN_87;
+  assign wMask_5_9 = _GEN_131 | _GEN_87;
+  assign wMask_5_10 = _GEN_131 | _GEN_87;
+  assign wMask_5_11 = _GEN_131 | _GEN_87;
+  assign wMask_5_12 = _GEN_131 | _GEN_88;
+  assign wMask_5_13 = _GEN_131 | _GEN_88;
+  assign wMask_5_14 = _GEN_131 | _GEN_88;
+  assign wMask_5_15 = _GEN_131 | _GEN_88;
+  wire         _GEN_132 = ldBusy & mem_rd_ready & ldLane == 3'h6;
+  wire         _GEN_133 = ldStartAny | ~_GEN_132;
+  assign wData_6_0 = _GEN_133 ? _GEN_90 : mem_rline[7:0];
+  assign wData_6_1 = _GEN_133 ? _GEN_91 : mem_rline[15:8];
+  assign wData_6_2 = _GEN_133 ? _GEN_92 : mem_rline[23:16];
+  assign wData_6_3 = _GEN_133 ? _GEN_93 : mem_rline[31:24];
+  assign wData_6_4 = _GEN_133 ? _GEN_90 : mem_rline[39:32];
+  assign wData_6_5 = _GEN_133 ? _GEN_91 : mem_rline[47:40];
+  assign wData_6_6 = _GEN_133 ? _GEN_92 : mem_rline[55:48];
+  assign wData_6_7 = _GEN_133 ? _GEN_93 : mem_rline[63:56];
+  assign wData_6_8 = _GEN_133 ? _GEN_90 : mem_rline[71:64];
+  assign wData_6_9 = _GEN_133 ? _GEN_91 : mem_rline[79:72];
+  assign wData_6_10 = _GEN_133 ? _GEN_92 : mem_rline[87:80];
+  assign wData_6_11 = _GEN_133 ? _GEN_93 : mem_rline[95:88];
+  assign wData_6_12 = _GEN_133 ? _GEN_90 : mem_rline[103:96];
+  assign wData_6_13 = _GEN_133 ? _GEN_91 : mem_rline[111:104];
+  assign wData_6_14 = _GEN_133 ? _GEN_92 : mem_rline[119:112];
+  assign wData_6_15 = _GEN_133 ? _GEN_93 : mem_rline[127:120];
+  wire         _GEN_134 = ~ldStartAny & _GEN_132;
+  assign wMask_6_0 = _GEN_134 | _GEN_94;
+  assign wMask_6_1 = _GEN_134 | _GEN_94;
+  assign wMask_6_2 = _GEN_134 | _GEN_94;
+  assign wMask_6_3 = _GEN_134 | _GEN_94;
+  assign wMask_6_4 = _GEN_134 | _GEN_95;
+  assign wMask_6_5 = _GEN_134 | _GEN_95;
+  assign wMask_6_6 = _GEN_134 | _GEN_95;
+  assign wMask_6_7 = _GEN_134 | _GEN_95;
+  assign wMask_6_8 = _GEN_134 | _GEN_96;
+  assign wMask_6_9 = _GEN_134 | _GEN_96;
+  assign wMask_6_10 = _GEN_134 | _GEN_96;
+  assign wMask_6_11 = _GEN_134 | _GEN_96;
+  assign wMask_6_12 = _GEN_134 | _GEN_97;
+  assign wMask_6_13 = _GEN_134 | _GEN_97;
+  assign wMask_6_14 = _GEN_134 | _GEN_97;
+  assign wMask_6_15 = _GEN_134 | _GEN_97;
+  wire         _GEN_135 = ldBusy & mem_rd_ready & (&ldLane);
+  wire         _GEN_136 = ldStartAny | ~_GEN_135;
+  assign wData_7_0 = _GEN_136 ? _GEN_99 : mem_rline[7:0];
+  assign wData_7_1 = _GEN_136 ? _GEN_100 : mem_rline[15:8];
+  assign wData_7_2 = _GEN_136 ? _GEN_101 : mem_rline[23:16];
+  assign wData_7_3 = _GEN_136 ? _GEN_102 : mem_rline[31:24];
+  assign wData_7_4 = _GEN_136 ? _GEN_99 : mem_rline[39:32];
+  assign wData_7_5 = _GEN_136 ? _GEN_100 : mem_rline[47:40];
+  assign wData_7_6 = _GEN_136 ? _GEN_101 : mem_rline[55:48];
+  assign wData_7_7 = _GEN_136 ? _GEN_102 : mem_rline[63:56];
+  assign wData_7_8 = _GEN_136 ? _GEN_99 : mem_rline[71:64];
+  assign wData_7_9 = _GEN_136 ? _GEN_100 : mem_rline[79:72];
+  assign wData_7_10 = _GEN_136 ? _GEN_101 : mem_rline[87:80];
+  assign wData_7_11 = _GEN_136 ? _GEN_102 : mem_rline[95:88];
+  assign wData_7_12 = _GEN_136 ? _GEN_99 : mem_rline[103:96];
+  assign wData_7_13 = _GEN_136 ? _GEN_100 : mem_rline[111:104];
+  assign wData_7_14 = _GEN_136 ? _GEN_101 : mem_rline[119:112];
+  assign wData_7_15 = _GEN_136 ? _GEN_102 : mem_rline[127:120];
+  wire         _GEN_137 = ~ldStartAny & _GEN_135;
+  assign wMask_7_0 = _GEN_137 | _GEN_103;
+  assign wMask_7_1 = _GEN_137 | _GEN_103;
+  assign wMask_7_2 = _GEN_137 | _GEN_103;
+  assign wMask_7_3 = _GEN_137 | _GEN_103;
+  assign wMask_7_4 = _GEN_137 | _GEN_104;
+  assign wMask_7_5 = _GEN_137 | _GEN_104;
+  assign wMask_7_6 = _GEN_137 | _GEN_104;
+  assign wMask_7_7 = _GEN_137 | _GEN_104;
+  assign wMask_7_8 = _GEN_137 | _GEN_105;
+  assign wMask_7_9 = _GEN_137 | _GEN_105;
+  assign wMask_7_10 = _GEN_137 | _GEN_105;
+  assign wMask_7_11 = _GEN_137 | _GEN_105;
+  assign wMask_7_12 = _GEN_137 | _GEN_106;
+  assign wMask_7_13 = _GEN_137 | _GEN_106;
+  assign wMask_7_14 = _GEN_137 | _GEN_106;
+  assign wMask_7_15 = _GEN_137 | _GEN_106;
   reg          fillValid;
   wire         _destContig_T = destStride == 32'h0;
   wire         destContig = _destContig_T | destStride == 32'h20;
   wire [4:0]   wBurstLines = int8Req ? 5'h4 : destContig ? 5'h10 : 5'h2;
   reg  [8:0]   dmaSent;
+  reg  [31:0]  casez_tmp_17;
+  always @(*) begin
+    casez (resultIdx[2:0])
+      3'b000:
+        casez_tmp_17 = _pes_0_0_io_acc;
+      3'b001:
+        casez_tmp_17 = _pes_0_1_io_acc;
+      3'b010:
+        casez_tmp_17 = _pes_0_2_io_acc;
+      3'b011:
+        casez_tmp_17 = _pes_0_3_io_acc;
+      3'b100:
+        casez_tmp_17 = _pes_0_4_io_acc;
+      3'b101:
+        casez_tmp_17 = _pes_0_5_io_acc;
+      3'b110:
+        casez_tmp_17 = _pes_0_6_io_acc;
+      default:
+        casez_tmp_17 = _pes_0_7_io_acc;
+    endcase
+  end // always @(*)
   reg  [31:0]  casez_tmp_18;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_18 = _pes_0_0_io_acc;
+        casez_tmp_18 = _pes_1_0_io_acc;
       3'b001:
-        casez_tmp_18 = _pes_0_1_io_acc;
+        casez_tmp_18 = _pes_1_1_io_acc;
       3'b010:
-        casez_tmp_18 = _pes_0_2_io_acc;
+        casez_tmp_18 = _pes_1_2_io_acc;
       3'b011:
-        casez_tmp_18 = _pes_0_3_io_acc;
+        casez_tmp_18 = _pes_1_3_io_acc;
       3'b100:
-        casez_tmp_18 = _pes_0_4_io_acc;
+        casez_tmp_18 = _pes_1_4_io_acc;
       3'b101:
-        casez_tmp_18 = _pes_0_5_io_acc;
+        casez_tmp_18 = _pes_1_5_io_acc;
       3'b110:
-        casez_tmp_18 = _pes_0_6_io_acc;
+        casez_tmp_18 = _pes_1_6_io_acc;
       default:
-        casez_tmp_18 = _pes_0_7_io_acc;
+        casez_tmp_18 = _pes_1_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  casez_tmp_19;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_19 = _pes_1_0_io_acc;
+        casez_tmp_19 = _pes_2_0_io_acc;
       3'b001:
-        casez_tmp_19 = _pes_1_1_io_acc;
+        casez_tmp_19 = _pes_2_1_io_acc;
       3'b010:
-        casez_tmp_19 = _pes_1_2_io_acc;
+        casez_tmp_19 = _pes_2_2_io_acc;
       3'b011:
-        casez_tmp_19 = _pes_1_3_io_acc;
+        casez_tmp_19 = _pes_2_3_io_acc;
       3'b100:
-        casez_tmp_19 = _pes_1_4_io_acc;
+        casez_tmp_19 = _pes_2_4_io_acc;
       3'b101:
-        casez_tmp_19 = _pes_1_5_io_acc;
+        casez_tmp_19 = _pes_2_5_io_acc;
       3'b110:
-        casez_tmp_19 = _pes_1_6_io_acc;
+        casez_tmp_19 = _pes_2_6_io_acc;
       default:
-        casez_tmp_19 = _pes_1_7_io_acc;
+        casez_tmp_19 = _pes_2_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  casez_tmp_20;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_20 = _pes_2_0_io_acc;
+        casez_tmp_20 = _pes_3_0_io_acc;
       3'b001:
-        casez_tmp_20 = _pes_2_1_io_acc;
+        casez_tmp_20 = _pes_3_1_io_acc;
       3'b010:
-        casez_tmp_20 = _pes_2_2_io_acc;
+        casez_tmp_20 = _pes_3_2_io_acc;
       3'b011:
-        casez_tmp_20 = _pes_2_3_io_acc;
+        casez_tmp_20 = _pes_3_3_io_acc;
       3'b100:
-        casez_tmp_20 = _pes_2_4_io_acc;
+        casez_tmp_20 = _pes_3_4_io_acc;
       3'b101:
-        casez_tmp_20 = _pes_2_5_io_acc;
+        casez_tmp_20 = _pes_3_5_io_acc;
       3'b110:
-        casez_tmp_20 = _pes_2_6_io_acc;
+        casez_tmp_20 = _pes_3_6_io_acc;
       default:
-        casez_tmp_20 = _pes_2_7_io_acc;
+        casez_tmp_20 = _pes_3_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  casez_tmp_21;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_21 = _pes_3_0_io_acc;
+        casez_tmp_21 = _pes_4_0_io_acc;
       3'b001:
-        casez_tmp_21 = _pes_3_1_io_acc;
+        casez_tmp_21 = _pes_4_1_io_acc;
       3'b010:
-        casez_tmp_21 = _pes_3_2_io_acc;
+        casez_tmp_21 = _pes_4_2_io_acc;
       3'b011:
-        casez_tmp_21 = _pes_3_3_io_acc;
+        casez_tmp_21 = _pes_4_3_io_acc;
       3'b100:
-        casez_tmp_21 = _pes_3_4_io_acc;
+        casez_tmp_21 = _pes_4_4_io_acc;
       3'b101:
-        casez_tmp_21 = _pes_3_5_io_acc;
+        casez_tmp_21 = _pes_4_5_io_acc;
       3'b110:
-        casez_tmp_21 = _pes_3_6_io_acc;
+        casez_tmp_21 = _pes_4_6_io_acc;
       default:
-        casez_tmp_21 = _pes_3_7_io_acc;
+        casez_tmp_21 = _pes_4_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  casez_tmp_22;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_22 = _pes_4_0_io_acc;
+        casez_tmp_22 = _pes_5_0_io_acc;
       3'b001:
-        casez_tmp_22 = _pes_4_1_io_acc;
+        casez_tmp_22 = _pes_5_1_io_acc;
       3'b010:
-        casez_tmp_22 = _pes_4_2_io_acc;
+        casez_tmp_22 = _pes_5_2_io_acc;
       3'b011:
-        casez_tmp_22 = _pes_4_3_io_acc;
+        casez_tmp_22 = _pes_5_3_io_acc;
       3'b100:
-        casez_tmp_22 = _pes_4_4_io_acc;
+        casez_tmp_22 = _pes_5_4_io_acc;
       3'b101:
-        casez_tmp_22 = _pes_4_5_io_acc;
+        casez_tmp_22 = _pes_5_5_io_acc;
       3'b110:
-        casez_tmp_22 = _pes_4_6_io_acc;
+        casez_tmp_22 = _pes_5_6_io_acc;
       default:
-        casez_tmp_22 = _pes_4_7_io_acc;
+        casez_tmp_22 = _pes_5_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  casez_tmp_23;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_23 = _pes_5_0_io_acc;
+        casez_tmp_23 = _pes_6_0_io_acc;
       3'b001:
-        casez_tmp_23 = _pes_5_1_io_acc;
+        casez_tmp_23 = _pes_6_1_io_acc;
       3'b010:
-        casez_tmp_23 = _pes_5_2_io_acc;
+        casez_tmp_23 = _pes_6_2_io_acc;
       3'b011:
-        casez_tmp_23 = _pes_5_3_io_acc;
+        casez_tmp_23 = _pes_6_3_io_acc;
       3'b100:
-        casez_tmp_23 = _pes_5_4_io_acc;
+        casez_tmp_23 = _pes_6_4_io_acc;
       3'b101:
-        casez_tmp_23 = _pes_5_5_io_acc;
+        casez_tmp_23 = _pes_6_5_io_acc;
       3'b110:
-        casez_tmp_23 = _pes_5_6_io_acc;
+        casez_tmp_23 = _pes_6_6_io_acc;
       default:
-        casez_tmp_23 = _pes_5_7_io_acc;
+        casez_tmp_23 = _pes_6_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  casez_tmp_24;
   always @(*) begin
     casez (resultIdx[2:0])
       3'b000:
-        casez_tmp_24 = _pes_6_0_io_acc;
+        casez_tmp_24 = _pes_7_0_io_acc;
       3'b001:
-        casez_tmp_24 = _pes_6_1_io_acc;
+        casez_tmp_24 = _pes_7_1_io_acc;
       3'b010:
-        casez_tmp_24 = _pes_6_2_io_acc;
+        casez_tmp_24 = _pes_7_2_io_acc;
       3'b011:
-        casez_tmp_24 = _pes_6_3_io_acc;
+        casez_tmp_24 = _pes_7_3_io_acc;
       3'b100:
-        casez_tmp_24 = _pes_6_4_io_acc;
+        casez_tmp_24 = _pes_7_4_io_acc;
       3'b101:
-        casez_tmp_24 = _pes_6_5_io_acc;
+        casez_tmp_24 = _pes_7_5_io_acc;
       3'b110:
-        casez_tmp_24 = _pes_6_6_io_acc;
+        casez_tmp_24 = _pes_7_6_io_acc;
       default:
-        casez_tmp_24 = _pes_6_7_io_acc;
-    endcase
-  end // always @(*)
-  reg  [31:0]  casez_tmp_25;
-  always @(*) begin
-    casez (resultIdx[2:0])
-      3'b000:
-        casez_tmp_25 = _pes_7_0_io_acc;
-      3'b001:
-        casez_tmp_25 = _pes_7_1_io_acc;
-      3'b010:
-        casez_tmp_25 = _pes_7_2_io_acc;
-      3'b011:
-        casez_tmp_25 = _pes_7_3_io_acc;
-      3'b100:
-        casez_tmp_25 = _pes_7_4_io_acc;
-      3'b101:
-        casez_tmp_25 = _pes_7_5_io_acc;
-      3'b110:
-        casez_tmp_25 = _pes_7_6_io_acc;
-      default:
-        casez_tmp_25 = _pes_7_7_io_acc;
+        casez_tmp_24 = _pes_7_7_io_acc;
     endcase
   end // always @(*)
   reg  [31:0]  rowSelReg_0;
@@ -2903,54 +2984,64 @@ module mm_accel(
   reg  [31:0]  rowSelReg_5;
   reg  [31:0]  rowSelReg_6;
   reg  [31:0]  rowSelReg_7;
-  reg  [31:0]  casez_tmp_26;
+  reg  [31:0]  casez_tmp_25;
   always @(*) begin
     casez (resultIdx[5:3])
       3'b000:
-        casez_tmp_26 = rowSelReg_0;
+        casez_tmp_25 = rowSelReg_0;
       3'b001:
-        casez_tmp_26 = rowSelReg_1;
+        casez_tmp_25 = rowSelReg_1;
       3'b010:
-        casez_tmp_26 = rowSelReg_2;
+        casez_tmp_25 = rowSelReg_2;
       3'b011:
-        casez_tmp_26 = rowSelReg_3;
+        casez_tmp_25 = rowSelReg_3;
       3'b100:
-        casez_tmp_26 = rowSelReg_4;
+        casez_tmp_25 = rowSelReg_4;
       3'b101:
-        casez_tmp_26 = rowSelReg_5;
+        casez_tmp_25 = rowSelReg_5;
       3'b110:
-        casez_tmp_26 = rowSelReg_6;
+        casez_tmp_25 = rowSelReg_6;
       default:
-        casez_tmp_26 = rowSelReg_7;
+        casez_tmp_25 = rowSelReg_7;
     endcase
   end // always @(*)
-  wire         _GEN_126 = s_axi_awaddr[7:2] == 6'h4;
-  wire         _GEN_127 = {2'h0, loadK} == kLen[7:2] - 6'h1;
+  wire         _GEN_138 = s_axi_awaddr[7:2] == 6'h4;
+  wire         _GEN_139 = {2'h0, loadK} == kLen[7:2] - 6'h1;
   wire         destContigEff = destContig | int8Req;
-  wire         _GEN_128 = dmaBusy & mem_ready;
   wire [31:0]  _dmaRowBase_T = dmaRowBase + (_destContig_T ? 32'h20 : destStride);
-  wire         _GEN_129 = wState & s_axi_bready;
-  wire         _GEN_130 = rState & s_axi_rready;
-  wire         softRstPulse = doWrite & _qStartPulse_T & s_axi_wdata[1];
+  wire         _GEN_140 = wState & s_axi_bready;
+  wire         _GEN_141 = rState & s_axi_rready;
   wire         qStartPulse = doWrite & _qStartPulse_T & s_axi_wdata[5] & ~qBusy;
-  wire         _GEN_131 = _GEN_16 & _GEN_17;
-  wire         _GEN_132 = qRun & ~_descQ_io_deq_valid & ~dmaBusy;
-  wire         _GEN_133 = ~_GEN_16 | _GEN_17 | ~_GEN_132;
-  wire         _GEN_134 = busy & t == kLen + 8'hD;
-  wire         _GEN_135 = softRstPulse | startAny;
+  wire         _GEN_142 = qRun & ~_descQ_io_deq_valid & ~dmaBusy & ~ldBusy;
+  wire         _GEN_143 = ~_GEN_16 | _GEN_17 | ~_GEN_142;
+  wire         _GEN_144 = _GEN_20 | _GEN_29 | ~_GEN_28;
+  wire         _GEN_145 = _GEN_16 | _GEN_18;
+  wire         _GEN_146 = _GEN_27 & preDone & _GEN_30;
+  wire         _GEN_147 = _GEN_29 | ~_GEN_146;
+  wire         _GEN_148 = _GEN_16 | _GEN_31;
+  wire         _GEN_149 = _GEN_29 | ~_GEN_28;
+  wire         _GEN_150 = s_axi_awaddr[7:2] == 6'h2;
+  wire         _ldKLen_T_3 = s_axi_wdata[7:0] > 8'h40;
+  wire         _GEN_151 = busy & t == kLen + 8'hD;
+  wire         busyNext = ~softRstPulse & (startAny | ~_GEN_151 & busy);
+  wire         _GEN_152 = softRstPulse | startAny;
   wire         ldLastChunk = {1'h0, ldChunk} == _ldLines_T_1 - 3'h1;
   wire         ldPanelEnd = (&ldLane) & ldLastChunk;
-  wire         _GEN_136 = ldPanelEnd & ldInB;
-  wire         _GEN_137 = ldBusy & _GEN_100 & _GEN_136;
-  wire         _GEN_138 = ldBusy & _GEN_100;
+  wire         fromQueue = _fromQueue_T | prePend;
+  wire         _GEN_153 = ldPanelEnd & ldInB;
+  wire         _GEN_154 = ldBusy & mem_rd_ready & _GEN_153;
+  wire         _GEN_155 = ldBusy & mem_rd_ready;
   wire         fillFire = dmaBusy & (|fillLeft) & _lineFifo_io_count < 5'hF;
   wire         dmaStartAny =
-    doWrite & _qStartPulse_T & s_axi_wdata[2] & ~dmaBusy & ~ldBusy | qState == 3'h5;
-  wire [8:0]   _GEN_139 = {4'h0, int8Req ? 5'h4 : 5'h10};
+    doWrite & _qStartPulse_T & s_axi_wdata[2] & ~dmaBusy | qState == 4'h5;
+  wire [8:0]   _GEN_156 = {4'h0, int8Req ? 5'h4 : 5'h10};
   wire [8:0]   _nextSent_T = dmaSent + {4'h0, wBurstLines};
-  wire         _GEN_140 = _nextSent_T >= _GEN_139;
-  wire         _GEN_141 = dmaBusy & mem_ready & _GEN_140;
-  wire         _GEN_142 = ~_GEN_128 | _GEN_140;
+  wire         _GEN_157 = _nextSent_T >= _GEN_156;
+  wire         _GEN_158 = dmaBusy & mem_wr_ready & _GEN_157;
+  wire         _GEN_159 = dmaBusy & mem_wr_ready;
+  wire         _GEN_160 = ~_GEN_159 | _GEN_157;
+  wire         _GEN_161 = softRstPulse | ldStartAny;
+  wire         _GEN_162 = softRstPulse | dmaStartAny;
   always @(posedge clk) begin
     if (rst) begin
       busy <= 1'h0;
@@ -2968,6 +3059,7 @@ module mm_accel(
       qRun <= 1'h0;
       qBusy <= 1'h0;
       qDone <= 1'h0;
+      qOverflow <= 1'h0;
       qBOnly <= 1'h0;
       destAddr <= 32'h0;
       dmaAddr <= 32'h0;
@@ -2992,7 +3084,79 @@ module mm_accel(
       raddrWord <= 6'h0;
       arreadyReg <= 1'h0;
       rvalidReg <= 1'h0;
-      qState <= 3'h0;
+      qState <= 4'h0;
+      ldKLen <= 8'h0;
+      stgKLen <= 8'h0;
+      stgPanelUse <= 2'h0;
+      stgDest <= 32'h0;
+      preBusy <= 1'h0;
+      preDone <= 1'h0;
+      prePend <= 1'h0;
+      ldDonePrev <= 1'h0;
+      peEn_0_0 <= 1'h0;
+      peEn_0_1 <= 1'h0;
+      peEn_0_2 <= 1'h0;
+      peEn_0_3 <= 1'h0;
+      peEn_0_4 <= 1'h0;
+      peEn_0_5 <= 1'h0;
+      peEn_0_6 <= 1'h0;
+      peEn_0_7 <= 1'h0;
+      peEn_1_0 <= 1'h0;
+      peEn_1_1 <= 1'h0;
+      peEn_1_2 <= 1'h0;
+      peEn_1_3 <= 1'h0;
+      peEn_1_4 <= 1'h0;
+      peEn_1_5 <= 1'h0;
+      peEn_1_6 <= 1'h0;
+      peEn_1_7 <= 1'h0;
+      peEn_2_0 <= 1'h0;
+      peEn_2_1 <= 1'h0;
+      peEn_2_2 <= 1'h0;
+      peEn_2_3 <= 1'h0;
+      peEn_2_4 <= 1'h0;
+      peEn_2_5 <= 1'h0;
+      peEn_2_6 <= 1'h0;
+      peEn_2_7 <= 1'h0;
+      peEn_3_0 <= 1'h0;
+      peEn_3_1 <= 1'h0;
+      peEn_3_2 <= 1'h0;
+      peEn_3_3 <= 1'h0;
+      peEn_3_4 <= 1'h0;
+      peEn_3_5 <= 1'h0;
+      peEn_3_6 <= 1'h0;
+      peEn_3_7 <= 1'h0;
+      peEn_4_0 <= 1'h0;
+      peEn_4_1 <= 1'h0;
+      peEn_4_2 <= 1'h0;
+      peEn_4_3 <= 1'h0;
+      peEn_4_4 <= 1'h0;
+      peEn_4_5 <= 1'h0;
+      peEn_4_6 <= 1'h0;
+      peEn_4_7 <= 1'h0;
+      peEn_5_0 <= 1'h0;
+      peEn_5_1 <= 1'h0;
+      peEn_5_2 <= 1'h0;
+      peEn_5_3 <= 1'h0;
+      peEn_5_4 <= 1'h0;
+      peEn_5_5 <= 1'h0;
+      peEn_5_6 <= 1'h0;
+      peEn_5_7 <= 1'h0;
+      peEn_6_0 <= 1'h0;
+      peEn_6_1 <= 1'h0;
+      peEn_6_2 <= 1'h0;
+      peEn_6_3 <= 1'h0;
+      peEn_6_4 <= 1'h0;
+      peEn_6_5 <= 1'h0;
+      peEn_6_6 <= 1'h0;
+      peEn_6_7 <= 1'h0;
+      peEn_7_0 <= 1'h0;
+      peEn_7_1 <= 1'h0;
+      peEn_7_2 <= 1'h0;
+      peEn_7_3 <= 1'h0;
+      peEn_7_4 <= 1'h0;
+      peEn_7_5 <= 1'h0;
+      peEn_7_6 <= 1'h0;
+      peEn_7_7 <= 1'h0;
       fillGrpD <= 4'h0;
       ldReq <= 1'h0;
       ldInB <= 1'h0;
@@ -3002,49 +3166,147 @@ module mm_accel(
       dmaSent <= 9'h0;
     end
     else begin
-      busy <= ~softRstPulse & (startAny | ~_GEN_134 & busy);
-      done <= ~_GEN_135 & (_GEN_134 | done);
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h2)
-        kLen <= s_axi_wdata[7:0];
-      else if (_GEN_131)
-        kLen <= _descQ_io_deq_bits_ctl[7:0];
-      if (_GEN_19) begin
-        if (_GEN_20) begin
-          if (_GEN_127)
+      busy <= busyNext;
+      done <= ~_GEN_152 & (_GEN_151 | done);
+      if (_GEN_32 & _GEN_150)
+        kLen <= _ldKLen_T_3 ? 8'h40 : s_axi_wdata[7:0];
+      else if (~_GEN_145) begin
+        if (_GEN_19) begin
+          if (ldDone)
+            kLen <= stgKLen;
+        end
+        else if (_GEN_144) begin
+        end
+        else
+          kLen <= stgKLen;
+      end
+      if (_GEN_32) begin
+        if (_GEN_33) begin
+          if (_GEN_139)
             loadK <= 4'h0;
           else
             loadK <= loadK + 4'h1;
         end
-        else if (_GEN_126)
+        else if (_GEN_138)
           loadK <= 4'h0;
         else if (s_axi_awaddr[7:2] == 6'h3)
           loadK <= s_axi_wdata[3:0];
-        if (_GEN_20 & _GEN_127)
+        if (_GEN_33 & _GEN_139)
           loadLane <= loadLane + 3'h1;
-        else if (_GEN_126)
+        else if (_GEN_138)
           loadLane <= s_axi_wdata[2:0];
       end
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h7)
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'h7)
         resultIdx <= s_axi_wdata[5:0];
       else if (rState & s_axi_rready & _GEN_15)
         resultIdx <= resultIdx + 6'h1;
-      if (_GEN_135)
+      if (_GEN_152)
         t <= 8'h0;
       else if (busy)
         t <= t + 8'h1;
-      if (dmaStartAny) begin
+      if (_GEN_162) begin
         fillGrp <= 4'h0;
-        fillLeft <= _GEN_139;
-        dmaAddr <= destAddr;
-        dmaRowBase <= destAddr;
         dmaSent <= 9'h0;
       end
       else begin
-        if (fillFire) begin
+        if (fillFire)
           fillGrp <= fillGrp + 4'h1;
-          fillLeft <= fillLeft - 9'h1;
+        if (_GEN_160) begin
         end
-        if (_GEN_142) begin
+        else
+          dmaSent <= _nextSent_T;
+      end
+      if (softRstPulse) begin
+        fillLeft <= 9'h0;
+        qState <= 4'h0;
+      end
+      else begin
+        if (dmaStartAny)
+          fillLeft <= _GEN_156;
+        else if (fillFire)
+          fillLeft <= fillLeft - 9'h1;
+        if (_GEN_16) begin
+          if (_GEN_17)
+            qState <= 4'h1;
+        end
+        else if (_GEN_18)
+          qState <= 4'h2;
+        else if (_GEN_19) begin
+          if (ldDone)
+            qState <= 4'h8;
+        end
+        else if (_GEN_20)
+          qState <= 4'h3;
+        else if (_GEN_23)
+          qState <= 4'h4;
+        else if (_GEN_24) begin
+          if (done & ~dmaBusy)
+            qState <= 4'h5;
+        end
+        else if (_GEN_25)
+          qState <= 4'h6;
+        else if (_GEN_26) begin
+          if (dmaDone | dmaBusy & fillLeft == 9'h0)
+            qState <= preBusy ? 4'h7 : 4'h0;
+        end
+        else if (_GEN_28)
+          qState <= 4'h3;
+      end
+      if (doWrite & s_axi_awaddr[7:2] == 6'h11)
+        descA <= s_axi_wdata;
+      if (doWrite & s_axi_awaddr[7:2] == 6'h12)
+        descB <= s_axi_wdata;
+      if (doWrite & s_axi_awaddr[7:2] == 6'h13)
+        descD <= s_axi_wdata;
+      qRun <= ~softRstPulse & _GEN_143 & (qStartPulse | qRun);
+      qBusy <= ~softRstPulse & _GEN_143 & (qStartPulse | qBusy);
+      qDone <= ~softRstPulse & (_GEN_16 & ~_GEN_17 & _GEN_142 | ~qStartPulse & qDone);
+      qOverflow <=
+        ~softRstPulse & (descPush & ~_descQ_io_enq_ready | ~qStartPulse & qOverflow);
+      if (_GEN_16) begin
+        if (_GEN_17) begin
+          qBOnly <= _descQ_io_deq_bits_ctl[16];
+          stgKLen <= _descQ_io_deq_bits_ctl[7:0];
+          stgPanelUse <= _descQ_io_deq_bits_ctl[9:8];
+          stgDest <= _descQ_io_deq_bits_dest;
+        end
+      end
+      else if (~_GEN_31) begin
+        if (_GEN_20) begin
+          if (_GEN_22) begin
+            qBOnly <= _descQ_io_deq_bits_ctl[16];
+            stgKLen <= _descQ_io_deq_bits_ctl[7:0];
+            stgPanelUse <= _descQ_io_deq_bits_ctl[9:8];
+            stgDest <= _descQ_io_deq_bits_dest;
+          end
+        end
+        else if (_GEN_147) begin
+        end
+        else begin
+          qBOnly <= _descQ_io_deq_bits_ctl[16];
+          stgKLen <= _descQ_io_deq_bits_ctl[7:0];
+          stgPanelUse <= _descQ_io_deq_bits_ctl[9:8];
+          stgDest <= _descQ_io_deq_bits_dest;
+        end
+      end
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'hA & ~dmaBusy)
+        destAddr <= s_axi_wdata;
+      else if (~_GEN_145) begin
+        if (_GEN_19) begin
+          if (ldDone)
+            destAddr <= stgDest;
+        end
+        else if (_GEN_144) begin
+        end
+        else
+          destAddr <= stgDest;
+      end
+      if (dmaStartAny) begin
+        dmaAddr <= destAddr;
+        dmaRowBase <= destAddr;
+      end
+      else begin
+        if (_GEN_160) begin
         end
         else if (destContigEff)
           dmaAddr <= {23'h0, wBurstLines, 4'h0} + dmaAddr;
@@ -3052,63 +3314,88 @@ module mm_accel(
           dmaAddr <= dmaAddr + 32'h10;
         else
           dmaAddr <= _dmaRowBase_T;
-        if (~_GEN_128 | _GEN_140 | destContigEff | _nextSent_T[0]) begin
+        if (~_GEN_159 | _GEN_157 | destContigEff | _nextSent_T[0]) begin
         end
         else
           dmaRowBase <= _dmaRowBase_T;
-        if (_GEN_142) begin
+      end
+      dmaBusy <= ~softRstPulse & (dmaStartAny | ~_GEN_158 & dmaBusy);
+      dmaDone <= ~_GEN_162 & (_GEN_158 | dmaDone);
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'hB & ~dmaBusy)
+        destStride <= s_axi_wdata;
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'hC & ~ldBusy)
+        aSrcAddr <= s_axi_wdata;
+      else if (_GEN_16) begin
+        if (_GEN_17)
+          aSrcAddr <= _descQ_io_deq_bits_aSrc;
+      end
+      else if (~_GEN_31) begin
+        if (_GEN_20) begin
+          if (_GEN_22)
+            aSrcAddr <= _descQ_io_deq_bits_aSrc;
+        end
+        else if (_GEN_147) begin
         end
         else
-          dmaSent <= _nextSent_T;
+          aSrcAddr <= _descQ_io_deq_bits_aSrc;
       end
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h11)
-        descA <= s_axi_wdata;
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h12)
-        descB <= s_axi_wdata;
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h13)
-        descD <= s_axi_wdata;
-      qRun <= _GEN_133 & (qStartPulse | qRun);
-      qBusy <= _GEN_133 & (qStartPulse | qBusy);
-      qDone <= _GEN_16 & ~_GEN_17 & _GEN_132 | ~qStartPulse & qDone;
-      if (_GEN_131)
-        qBOnly <= _descQ_io_deq_bits_ctl[16];
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'hA)
-        destAddr <= s_axi_wdata;
-      else if (_GEN_131)
-        destAddr <= _descQ_io_deq_bits_dest;
-      dmaBusy <= dmaStartAny | ~_GEN_141 & dmaBusy;
-      dmaDone <= ~dmaStartAny & (_GEN_141 | dmaDone);
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'hB)
-        destStride <= s_axi_wdata;
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'hC)
-        aSrcAddr <= s_axi_wdata;
-      else if (_GEN_131)
-        aSrcAddr <= _descQ_io_deq_bits_aSrc;
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'hD)
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'hD & ~ldBusy)
         bSrcAddr <= s_axi_wdata;
-      else if (_GEN_131)
-        bSrcAddr <= _descQ_io_deq_bits_bSrc;
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'hE)
+      else if (_GEN_16) begin
+        if (_GEN_17)
+          bSrcAddr <= _descQ_io_deq_bits_bSrc;
+      end
+      else if (~_GEN_31) begin
+        if (_GEN_20) begin
+          if (_GEN_22)
+            bSrcAddr <= _descQ_io_deq_bits_bSrc;
+        end
+        else if (_GEN_147) begin
+        end
+        else
+          bSrcAddr <= _descQ_io_deq_bits_bSrc;
+      end
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'hE & ~ldBusy)
         srcStride <= s_axi_wdata;
-      ldBusy <= ldStartAny | ~_GEN_137 & ldBusy;
-      ldDone <= ~ldStartAny & (_GEN_137 | ldDone);
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h16) begin
+      ldBusy <= ~softRstPulse & (ldStartAny | ~_GEN_154 & ldBusy);
+      ldDone <= ~_GEN_161 & (_GEN_154 | ldDone);
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'h16) begin
         outShift <= s_axi_wdata[4:0];
         int8Req <= s_axi_wdata[8];
       end
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'hF)
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'hF)
         bPanelUse <= s_axi_wdata[1:0];
-      else if (_GEN_131)
-        bPanelUse <= _descQ_io_deq_bits_ctl[9:8];
-      if (_GEN_19 & s_axi_awaddr[7:2] == 6'h10)
+      else if (~_GEN_145) begin
+        if (_GEN_19) begin
+          if (ldDone)
+            bPanelUse <= stgPanelUse;
+        end
+        else if (_GEN_144) begin
+        end
+        else
+          bPanelUse <= stgPanelUse;
+      end
+      if (_GEN_32 & s_axi_awaddr[7:2] == 6'h10 & ~ldBusy)
         bPanelLoad <= s_axi_wdata[1:0];
-      else if (_GEN_131)
-        bPanelLoad <= _descQ_io_deq_bits_ctl[13:12];
+      else if (_GEN_16) begin
+        if (_GEN_17)
+          bPanelLoad <= _descQ_io_deq_bits_ctl[13:12];
+      end
+      else if (~_GEN_31) begin
+        if (_GEN_20) begin
+          if (_GEN_22)
+            bPanelLoad <= _descQ_io_deq_bits_ctl[13:12];
+        end
+        else if (_GEN_147) begin
+        end
+        else
+          bPanelLoad <= _descQ_io_deq_bits_ctl[13:12];
+      end
       if (wState) begin
-        wState <= ~_GEN_129 & wState;
+        wState <= ~_GEN_140 & wState;
         awreadyReg <= ~wState & awreadyReg;
         wreadyReg <= ~wState & wreadyReg;
-        bvalidReg <= ~_GEN_129 & bvalidReg;
+        bvalidReg <= ~_GEN_140 & bvalidReg;
       end
       else begin
         wState <= doWrite | wState;
@@ -3117,37 +3404,136 @@ module mm_accel(
         bvalidReg <= doWrite | bvalidReg;
       end
       if (rState)
-        rState <= ~_GEN_130 & rState;
+        rState <= ~_GEN_141 & rState;
       else
         rState <= s_axi_arvalid | rState;
       if (~rState & s_axi_arvalid)
         raddrWord <= s_axi_araddr[7:2];
       if (rState) begin
         arreadyReg <= ~rState & arreadyReg;
-        rvalidReg <= ~_GEN_130 & rvalidReg;
+        rvalidReg <= ~_GEN_141 & rvalidReg;
       end
       else begin
         arreadyReg <= s_axi_arvalid;
         rvalidReg <= s_axi_arvalid | rvalidReg;
       end
-      qState <= casez_tmp;
+      if (_GEN_32 & _GEN_150 & ~ldBusy)
+        ldKLen <= _ldKLen_T_3 ? 8'h40 : s_axi_wdata[7:0];
+      else if (_GEN_16) begin
+        if (_GEN_17)
+          ldKLen <= _descQ_io_deq_bits_ctl[7:0];
+      end
+      else if (~_GEN_31) begin
+        if (_GEN_20) begin
+          if (_GEN_22)
+            ldKLen <= _descQ_io_deq_bits_ctl[7:0];
+        end
+        else if (_GEN_147) begin
+        end
+        else
+          ldKLen <= _descQ_io_deq_bits_ctl[7:0];
+      end
+      preBusy <=
+        ~softRstPulse
+        & (_GEN_148
+             ? preBusy
+             : _GEN_20 ? _GEN_22 | preBusy : _GEN_149 ? preBusy : _GEN_30);
+      preDone <=
+        ~softRstPulse
+        & (ldDone & ~ldDonePrev & preBusy
+           | (_GEN_148 ? preDone : _GEN_20 ? ~_GEN_22 & preDone : _GEN_149 & preDone));
+      prePend <=
+        ~(softRstPulse | prePend)
+        & (_GEN_148
+             ? prePend
+             : _GEN_20 ? _GEN_22 | prePend : ~_GEN_29 & _GEN_146 | prePend);
+      ldDonePrev <= ldDone;
+      peEn_0_0 <= busyNext;
+      peEn_0_1 <= busyNext;
+      peEn_0_2 <= busyNext;
+      peEn_0_3 <= busyNext;
+      peEn_0_4 <= busyNext;
+      peEn_0_5 <= busyNext;
+      peEn_0_6 <= busyNext;
+      peEn_0_7 <= busyNext;
+      peEn_1_0 <= busyNext;
+      peEn_1_1 <= busyNext;
+      peEn_1_2 <= busyNext;
+      peEn_1_3 <= busyNext;
+      peEn_1_4 <= busyNext;
+      peEn_1_5 <= busyNext;
+      peEn_1_6 <= busyNext;
+      peEn_1_7 <= busyNext;
+      peEn_2_0 <= busyNext;
+      peEn_2_1 <= busyNext;
+      peEn_2_2 <= busyNext;
+      peEn_2_3 <= busyNext;
+      peEn_2_4 <= busyNext;
+      peEn_2_5 <= busyNext;
+      peEn_2_6 <= busyNext;
+      peEn_2_7 <= busyNext;
+      peEn_3_0 <= busyNext;
+      peEn_3_1 <= busyNext;
+      peEn_3_2 <= busyNext;
+      peEn_3_3 <= busyNext;
+      peEn_3_4 <= busyNext;
+      peEn_3_5 <= busyNext;
+      peEn_3_6 <= busyNext;
+      peEn_3_7 <= busyNext;
+      peEn_4_0 <= busyNext;
+      peEn_4_1 <= busyNext;
+      peEn_4_2 <= busyNext;
+      peEn_4_3 <= busyNext;
+      peEn_4_4 <= busyNext;
+      peEn_4_5 <= busyNext;
+      peEn_4_6 <= busyNext;
+      peEn_4_7 <= busyNext;
+      peEn_5_0 <= busyNext;
+      peEn_5_1 <= busyNext;
+      peEn_5_2 <= busyNext;
+      peEn_5_3 <= busyNext;
+      peEn_5_4 <= busyNext;
+      peEn_5_5 <= busyNext;
+      peEn_5_6 <= busyNext;
+      peEn_5_7 <= busyNext;
+      peEn_6_0 <= busyNext;
+      peEn_6_1 <= busyNext;
+      peEn_6_2 <= busyNext;
+      peEn_6_3 <= busyNext;
+      peEn_6_4 <= busyNext;
+      peEn_6_5 <= busyNext;
+      peEn_6_6 <= busyNext;
+      peEn_6_7 <= busyNext;
+      peEn_7_0 <= busyNext;
+      peEn_7_1 <= busyNext;
+      peEn_7_2 <= busyNext;
+      peEn_7_3 <= busyNext;
+      peEn_7_4 <= busyNext;
+      peEn_7_5 <= busyNext;
+      peEn_7_6 <= busyNext;
+      peEn_7_7 <= busyNext;
       fillGrpD <= fillGrp;
       ldReq <=
-        ldStartAny | (_GEN_138 ? ~_GEN_136 & (~burstOK | ~ldInB & ldPanelEnd) : ldReq);
-      if (ldStartAny) begin
-        ldInB <= ldStartB & qState != 3'h1 | _bOnly_T_2 & qBOnly;
+        ~softRstPulse
+        & (ldStartAny
+           | (_GEN_155 ? ~_GEN_153 & (~burstOK | ~ldInB & ldPanelEnd) : ldReq));
+      ldInB <=
+        ~softRstPulse
+        & (ldStartAny
+             ? ldStartB & ~fromQueue | fromQueue & qBOnly
+             : _GEN_155 & ~_GEN_153 & ldLastChunk & (&ldLane) | ldInB);
+      if (_GEN_161) begin
         ldLane <= 3'h0;
         ldChunk <= 2'h0;
       end
       else begin
-        ldInB <= _GEN_138 & ~_GEN_136 & ldLastChunk & (&ldLane) | ldInB;
-        if (~_GEN_138 | _GEN_136 | ~ldLastChunk) begin
+        if (~_GEN_155 | _GEN_153 | ~ldLastChunk) begin
         end
         else if (&ldLane)
           ldLane <= 3'h0;
         else
           ldLane <= ldLane + 3'h1;
-        if (~_GEN_138 | _GEN_136) begin
+        if (~_GEN_155 | _GEN_153) begin
         end
         else if (ldLastChunk)
           ldChunk <= 2'h0;
@@ -3188,39 +3574,42 @@ module mm_accel(
       fillGrp[0]
         ? {_pes_7_7_io_acc, _pes_7_6_io_acc, _pes_7_5_io_acc, _pes_7_4_io_acc}
         : {_pes_7_3_io_acc, _pes_7_2_io_acc, _pes_7_1_io_acc, _pes_7_0_io_acc};
-    lineData8_REG <= casez_tmp_17;
-    rowSelReg_0 <= casez_tmp_18;
-    rowSelReg_1 <= casez_tmp_19;
-    rowSelReg_2 <= casez_tmp_20;
-    rowSelReg_3 <= casez_tmp_21;
-    rowSelReg_4 <= casez_tmp_22;
-    rowSelReg_5 <= casez_tmp_23;
-    rowSelReg_6 <= casez_tmp_24;
-    rowSelReg_7 <= casez_tmp_25;
+    lineData8_REG <= casez_tmp_16;
+    rowSelReg_0 <= casez_tmp_17;
+    rowSelReg_1 <= casez_tmp_18;
+    rowSelReg_2 <= casez_tmp_19;
+    rowSelReg_3 <= casez_tmp_20;
+    rowSelReg_4 <= casez_tmp_21;
+    rowSelReg_5 <= casez_tmp_22;
+    rowSelReg_6 <= casez_tmp_23;
+    rowSelReg_7 <= casez_tmp_24;
   end // always @(posedge)
   Queue8_Descriptor descQ (
     .clock            (clk),
     .reset            (rst),
-    .io_enq_valid     (doWrite & s_axi_awaddr[7:2] == 6'h14),
+    .io_enq_ready     (_descQ_io_enq_ready),
+    .io_enq_valid     (descPush),
     .io_enq_bits_aSrc (descA),
     .io_enq_bits_bSrc (descB),
     .io_enq_bits_dest (descD),
     .io_enq_bits_ctl  (s_axi_wdata),
-    .io_deq_ready     (_GEN_16 & _GEN_17),
+    .io_deq_ready
+      (_GEN_16 ? _GEN_17 : ~_GEN_31 & (_GEN_20 ? _GEN_22 : ~_GEN_29 & _GEN_28 & _GEN_30)),
     .io_deq_valid     (_descQ_io_deq_valid),
     .io_deq_bits_aSrc (_descQ_io_deq_bits_aSrc),
     .io_deq_bits_bSrc (_descQ_io_deq_bits_bSrc),
     .io_deq_bits_dest (_descQ_io_deq_bits_dest),
     .io_deq_bits_ctl  (_descQ_io_deq_bits_ctl),
-    .io_count         (_descQ_io_count)
+    .io_count         (_descQ_io_count),
+    .io_flush         (softRstPulse)
   );
   aMem_4x128 aMem_0_ext (
     .R0_addr (_rowNext_T_1),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_0_ext_R0_data),
-    .W0_addr (_GEN_102 ? (_GEN_21 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_102 ? _GEN_21 & pushA : ~ldInB),
+    .W0_addr (_GEN_114 ? (_GEN_34 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_114 ? _GEN_34 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN),
     .W0_mask (_GEN_0)
@@ -3230,8 +3619,8 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_1_ext_R0_data),
-    .W0_addr (_GEN_106 ? (_GEN_31 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_106 ? _GEN_31 & pushA : ~ldInB),
+    .W0_addr (_GEN_118 ? (_GEN_44 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_118 ? _GEN_44 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_1),
     .W0_mask (_GEN_2)
@@ -3241,8 +3630,8 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_2_ext_R0_data),
-    .W0_addr (_GEN_109 ? (_GEN_40 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_109 ? _GEN_40 & pushA : ~ldInB),
+    .W0_addr (_GEN_121 ? (_GEN_53 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_121 ? _GEN_53 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_3),
     .W0_mask (_GEN_4)
@@ -3252,8 +3641,8 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_3_ext_R0_data),
-    .W0_addr (_GEN_112 ? (_GEN_49 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_112 ? _GEN_49 & pushA : ~ldInB),
+    .W0_addr (_GEN_124 ? (_GEN_62 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_124 ? _GEN_62 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_5),
     .W0_mask (_GEN_6)
@@ -3263,8 +3652,8 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_4_ext_R0_data),
-    .W0_addr (_GEN_115 ? (_GEN_58 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_115 ? _GEN_58 & pushA : ~ldInB),
+    .W0_addr (_GEN_127 ? (_GEN_71 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_127 ? _GEN_71 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_7),
     .W0_mask (_GEN_8)
@@ -3274,8 +3663,8 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_5_ext_R0_data),
-    .W0_addr (_GEN_118 ? (_GEN_67 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_118 ? _GEN_67 & pushA : ~ldInB),
+    .W0_addr (_GEN_130 ? (_GEN_80 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_130 ? _GEN_80 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_9),
     .W0_mask (_GEN_10)
@@ -3285,8 +3674,8 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_6_ext_R0_data),
-    .W0_addr (_GEN_121 ? (_GEN_76 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_121 ? _GEN_76 & pushA : ~ldInB),
+    .W0_addr (_GEN_133 ? (_GEN_89 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_133 ? _GEN_89 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_11),
     .W0_mask (_GEN_12)
@@ -3296,104 +3685,104 @@ module mm_accel(
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_aMem_7_ext_R0_data),
-    .W0_addr (_GEN_124 ? (_GEN_85 ? loadK[3:2] : 2'h0) : ldChunk),
-    .W0_en   (_GEN_124 ? _GEN_85 & pushA : ~ldInB),
+    .W0_addr (_GEN_136 ? (_GEN_98 ? loadK[3:2] : 2'h0) : ldChunk),
+    .W0_en   (_GEN_136 ? _GEN_98 & pushA : ~ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_13),
     .W0_mask (_GEN_14)
   );
   bMem_16x128 bMem_0_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_1}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_1}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_0_ext_R0_data),
     .W0_addr
-      (_GEN_102 ? (_GEN_21 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_102 ? _GEN_21 & pushB : ldInB),
+      (_GEN_114 ? (_GEN_34 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_114 ? _GEN_34 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN),
     .W0_mask (_GEN_0)
   );
   bMem_16x128 bMem_1_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_4}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_4}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_1_ext_R0_data),
     .W0_addr
-      (_GEN_106 ? (_GEN_31 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_106 ? _GEN_31 & pushB : ldInB),
+      (_GEN_118 ? (_GEN_44 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_118 ? _GEN_44 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_1),
     .W0_mask (_GEN_2)
   );
   bMem_16x128 bMem_2_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_7}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_7}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_2_ext_R0_data),
     .W0_addr
-      (_GEN_109 ? (_GEN_40 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_109 ? _GEN_40 & pushB : ldInB),
+      (_GEN_121 ? (_GEN_53 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_121 ? _GEN_53 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_3),
     .W0_mask (_GEN_4)
   );
   bMem_16x128 bMem_3_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_10}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_10}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_3_ext_R0_data),
     .W0_addr
-      (_GEN_112 ? (_GEN_49 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_112 ? _GEN_49 & pushB : ldInB),
+      (_GEN_124 ? (_GEN_62 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_124 ? _GEN_62 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_5),
     .W0_mask (_GEN_6)
   );
   bMem_16x128 bMem_4_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_13}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_13}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_4_ext_R0_data),
     .W0_addr
-      (_GEN_115 ? (_GEN_58 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_115 ? _GEN_58 & pushB : ldInB),
+      (_GEN_127 ? (_GEN_71 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_127 ? _GEN_71 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_7),
     .W0_mask (_GEN_8)
   );
   bMem_16x128 bMem_5_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_16}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_16}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_5_ext_R0_data),
     .W0_addr
-      (_GEN_118 ? (_GEN_67 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_118 ? _GEN_67 & pushB : ldInB),
+      (_GEN_130 ? (_GEN_80 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_130 ? _GEN_80 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_9),
     .W0_mask (_GEN_10)
   );
   bMem_16x128 bMem_6_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_19}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_19}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_6_ext_R0_data),
     .W0_addr
-      (_GEN_121 ? (_GEN_76 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_121 ? _GEN_76 & pushB : ldInB),
+      (_GEN_133 ? (_GEN_89 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_133 ? _GEN_89 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_11),
     .W0_mask (_GEN_12)
   );
   bMem_16x128 bMem_7_ext (
-    .R0_addr (_GEN_96 + {2'h0, _rowNext_T_22}),
+    .R0_addr (_GEN_109 + {2'h0, _rowNext_T_22}),
     .R0_en   (1'h1),
     .R0_clk  (clk),
     .R0_data (_bMem_7_ext_R0_data),
     .W0_addr
-      (_GEN_124 ? (_GEN_85 ? _GEN_30 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_30 + _GEN_104),
-    .W0_en   (_GEN_124 ? _GEN_85 & pushB : ldInB),
+      (_GEN_136 ? (_GEN_98 ? _GEN_43 + {2'h0, loadK[3:2]} : 4'h0) : _GEN_43 + _GEN_116),
+    .W0_en   (_GEN_136 ? _GEN_98 & pushB : ldInB),
     .W0_clk  (clk),
     .W0_data (_GEN_13),
     .W0_mask (_GEN_14)
@@ -3401,10 +3790,10 @@ module mm_accel(
   SystolicPE pes_0_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_0),
     .io_clearAcc (t == 8'h0),
-    .io_aIn      (kValid ? casez_tmp_0 : 8'h0),
-    .io_bIn      (kValid ? casez_tmp_1 : 8'h0),
+    .io_aIn      (kValid ? casez_tmp : 8'h0),
+    .io_bIn      (kValid ? casez_tmp_0 : 8'h0),
     .io_aOut     (_pes_0_0_io_aOut),
     .io_bOut     (_pes_0_0_io_bOut),
     .io_acc      (_pes_0_0_io_acc)
@@ -3412,10 +3801,10 @@ module mm_accel(
   SystolicPE pes_0_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_1),
     .io_clearAcc (_pes_1_0_io_clearAcc_T),
     .io_aIn      (_pes_0_0_io_aOut),
-    .io_bIn      (kValid_1 ? casez_tmp_3 : 8'h0),
+    .io_bIn      (kValid_1 ? casez_tmp_2 : 8'h0),
     .io_aOut     (_pes_0_1_io_aOut),
     .io_bOut     (_pes_0_1_io_bOut),
     .io_acc      (_pes_0_1_io_acc)
@@ -3423,10 +3812,10 @@ module mm_accel(
   SystolicPE pes_0_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_2),
     .io_clearAcc (_pes_2_0_io_clearAcc_T),
     .io_aIn      (_pes_0_1_io_aOut),
-    .io_bIn      (kValid_2 ? casez_tmp_5 : 8'h0),
+    .io_bIn      (kValid_2 ? casez_tmp_4 : 8'h0),
     .io_aOut     (_pes_0_2_io_aOut),
     .io_bOut     (_pes_0_2_io_bOut),
     .io_acc      (_pes_0_2_io_acc)
@@ -3434,10 +3823,10 @@ module mm_accel(
   SystolicPE pes_0_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_3),
     .io_clearAcc (_pes_3_0_io_clearAcc_T),
     .io_aIn      (_pes_0_2_io_aOut),
-    .io_bIn      (kValid_3 ? casez_tmp_7 : 8'h0),
+    .io_bIn      (kValid_3 ? casez_tmp_6 : 8'h0),
     .io_aOut     (_pes_0_3_io_aOut),
     .io_bOut     (_pes_0_3_io_bOut),
     .io_acc      (_pes_0_3_io_acc)
@@ -3445,10 +3834,10 @@ module mm_accel(
   SystolicPE pes_0_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_4),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
     .io_aIn      (_pes_0_3_io_aOut),
-    .io_bIn      (kValid_4 ? casez_tmp_9 : 8'h0),
+    .io_bIn      (kValid_4 ? casez_tmp_8 : 8'h0),
     .io_aOut     (_pes_0_4_io_aOut),
     .io_bOut     (_pes_0_4_io_bOut),
     .io_acc      (_pes_0_4_io_acc)
@@ -3456,10 +3845,10 @@ module mm_accel(
   SystolicPE pes_0_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_5),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
     .io_aIn      (_pes_0_4_io_aOut),
-    .io_bIn      (kValid_5 ? casez_tmp_11 : 8'h0),
+    .io_bIn      (kValid_5 ? casez_tmp_10 : 8'h0),
     .io_aOut     (_pes_0_5_io_aOut),
     .io_bOut     (_pes_0_5_io_bOut),
     .io_acc      (_pes_0_5_io_acc)
@@ -3467,10 +3856,10 @@ module mm_accel(
   SystolicPE pes_0_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_6),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_0_5_io_aOut),
-    .io_bIn      (kValid_6 ? casez_tmp_13 : 8'h0),
+    .io_bIn      (kValid_6 ? casez_tmp_12 : 8'h0),
     .io_aOut     (_pes_0_6_io_aOut),
     .io_bOut     (_pes_0_6_io_bOut),
     .io_acc      (_pes_0_6_io_acc)
@@ -3478,10 +3867,10 @@ module mm_accel(
   SystolicPE pes_0_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_0_7),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_0_6_io_aOut),
-    .io_bIn      (kValid_7 ? casez_tmp_15 : 8'h0),
+    .io_bIn      (kValid_7 ? casez_tmp_14 : 8'h0),
     .io_aOut     (/* unused */),
     .io_bOut     (_pes_0_7_io_bOut),
     .io_acc      (_pes_0_7_io_acc)
@@ -3489,9 +3878,9 @@ module mm_accel(
   SystolicPE pes_1_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_0),
     .io_clearAcc (_pes_1_0_io_clearAcc_T),
-    .io_aIn      (kValid_1 ? casez_tmp_2 : 8'h0),
+    .io_aIn      (kValid_1 ? casez_tmp_1 : 8'h0),
     .io_bIn      (_pes_0_0_io_bOut),
     .io_aOut     (_pes_1_0_io_aOut),
     .io_bOut     (_pes_1_0_io_bOut),
@@ -3500,7 +3889,7 @@ module mm_accel(
   SystolicPE pes_1_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_1),
     .io_clearAcc (_pes_2_0_io_clearAcc_T),
     .io_aIn      (_pes_1_0_io_aOut),
     .io_bIn      (_pes_0_1_io_bOut),
@@ -3511,7 +3900,7 @@ module mm_accel(
   SystolicPE pes_1_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_2),
     .io_clearAcc (_pes_3_0_io_clearAcc_T),
     .io_aIn      (_pes_1_1_io_aOut),
     .io_bIn      (_pes_0_2_io_bOut),
@@ -3522,7 +3911,7 @@ module mm_accel(
   SystolicPE pes_1_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_3),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
     .io_aIn      (_pes_1_2_io_aOut),
     .io_bIn      (_pes_0_3_io_bOut),
@@ -3533,7 +3922,7 @@ module mm_accel(
   SystolicPE pes_1_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_4),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
     .io_aIn      (_pes_1_3_io_aOut),
     .io_bIn      (_pes_0_4_io_bOut),
@@ -3544,7 +3933,7 @@ module mm_accel(
   SystolicPE pes_1_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_5),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_1_4_io_aOut),
     .io_bIn      (_pes_0_5_io_bOut),
@@ -3555,7 +3944,7 @@ module mm_accel(
   SystolicPE pes_1_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_6),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_1_5_io_aOut),
     .io_bIn      (_pes_0_6_io_bOut),
@@ -3566,7 +3955,7 @@ module mm_accel(
   SystolicPE pes_1_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_1_7),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_1_6_io_aOut),
     .io_bIn      (_pes_0_7_io_bOut),
@@ -3577,9 +3966,9 @@ module mm_accel(
   SystolicPE pes_2_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_0),
     .io_clearAcc (_pes_2_0_io_clearAcc_T),
-    .io_aIn      (kValid_2 ? casez_tmp_4 : 8'h0),
+    .io_aIn      (kValid_2 ? casez_tmp_3 : 8'h0),
     .io_bIn      (_pes_1_0_io_bOut),
     .io_aOut     (_pes_2_0_io_aOut),
     .io_bOut     (_pes_2_0_io_bOut),
@@ -3588,7 +3977,7 @@ module mm_accel(
   SystolicPE pes_2_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_1),
     .io_clearAcc (_pes_3_0_io_clearAcc_T),
     .io_aIn      (_pes_2_0_io_aOut),
     .io_bIn      (_pes_1_1_io_bOut),
@@ -3599,7 +3988,7 @@ module mm_accel(
   SystolicPE pes_2_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_2),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
     .io_aIn      (_pes_2_1_io_aOut),
     .io_bIn      (_pes_1_2_io_bOut),
@@ -3610,7 +3999,7 @@ module mm_accel(
   SystolicPE pes_2_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_3),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
     .io_aIn      (_pes_2_2_io_aOut),
     .io_bIn      (_pes_1_3_io_bOut),
@@ -3621,7 +4010,7 @@ module mm_accel(
   SystolicPE pes_2_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_4),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_2_3_io_aOut),
     .io_bIn      (_pes_1_4_io_bOut),
@@ -3632,7 +4021,7 @@ module mm_accel(
   SystolicPE pes_2_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_5),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_2_4_io_aOut),
     .io_bIn      (_pes_1_5_io_bOut),
@@ -3643,7 +4032,7 @@ module mm_accel(
   SystolicPE pes_2_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_6),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_2_5_io_aOut),
     .io_bIn      (_pes_1_6_io_bOut),
@@ -3654,7 +4043,7 @@ module mm_accel(
   SystolicPE pes_2_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_2_7),
     .io_clearAcc (_pes_7_2_io_clearAcc_T),
     .io_aIn      (_pes_2_6_io_aOut),
     .io_bIn      (_pes_1_7_io_bOut),
@@ -3665,9 +4054,9 @@ module mm_accel(
   SystolicPE pes_3_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_0),
     .io_clearAcc (_pes_3_0_io_clearAcc_T),
-    .io_aIn      (kValid_3 ? casez_tmp_6 : 8'h0),
+    .io_aIn      (kValid_3 ? casez_tmp_5 : 8'h0),
     .io_bIn      (_pes_2_0_io_bOut),
     .io_aOut     (_pes_3_0_io_aOut),
     .io_bOut     (_pes_3_0_io_bOut),
@@ -3676,7 +4065,7 @@ module mm_accel(
   SystolicPE pes_3_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_1),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
     .io_aIn      (_pes_3_0_io_aOut),
     .io_bIn      (_pes_2_1_io_bOut),
@@ -3687,7 +4076,7 @@ module mm_accel(
   SystolicPE pes_3_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_2),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
     .io_aIn      (_pes_3_1_io_aOut),
     .io_bIn      (_pes_2_2_io_bOut),
@@ -3698,7 +4087,7 @@ module mm_accel(
   SystolicPE pes_3_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_3),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_3_2_io_aOut),
     .io_bIn      (_pes_2_3_io_bOut),
@@ -3709,7 +4098,7 @@ module mm_accel(
   SystolicPE pes_3_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_4),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_3_3_io_aOut),
     .io_bIn      (_pes_2_4_io_bOut),
@@ -3720,7 +4109,7 @@ module mm_accel(
   SystolicPE pes_3_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_5),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_3_4_io_aOut),
     .io_bIn      (_pes_2_5_io_bOut),
@@ -3731,7 +4120,7 @@ module mm_accel(
   SystolicPE pes_3_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_6),
     .io_clearAcc (_pes_7_2_io_clearAcc_T),
     .io_aIn      (_pes_3_5_io_aOut),
     .io_bIn      (_pes_2_6_io_bOut),
@@ -3742,7 +4131,7 @@ module mm_accel(
   SystolicPE pes_3_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_3_7),
     .io_clearAcc (_pes_7_3_io_clearAcc_T),
     .io_aIn      (_pes_3_6_io_aOut),
     .io_bIn      (_pes_2_7_io_bOut),
@@ -3753,9 +4142,9 @@ module mm_accel(
   SystolicPE pes_4_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_0),
     .io_clearAcc (_pes_4_0_io_clearAcc_T),
-    .io_aIn      (kValid_4 ? casez_tmp_8 : 8'h0),
+    .io_aIn      (kValid_4 ? casez_tmp_7 : 8'h0),
     .io_bIn      (_pes_3_0_io_bOut),
     .io_aOut     (_pes_4_0_io_aOut),
     .io_bOut     (_pes_4_0_io_bOut),
@@ -3764,7 +4153,7 @@ module mm_accel(
   SystolicPE pes_4_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_1),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
     .io_aIn      (_pes_4_0_io_aOut),
     .io_bIn      (_pes_3_1_io_bOut),
@@ -3775,7 +4164,7 @@ module mm_accel(
   SystolicPE pes_4_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_2),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_4_1_io_aOut),
     .io_bIn      (_pes_3_2_io_bOut),
@@ -3786,7 +4175,7 @@ module mm_accel(
   SystolicPE pes_4_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_3),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_4_2_io_aOut),
     .io_bIn      (_pes_3_3_io_bOut),
@@ -3797,7 +4186,7 @@ module mm_accel(
   SystolicPE pes_4_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_4),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_4_3_io_aOut),
     .io_bIn      (_pes_3_4_io_bOut),
@@ -3808,7 +4197,7 @@ module mm_accel(
   SystolicPE pes_4_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_5),
     .io_clearAcc (_pes_7_2_io_clearAcc_T),
     .io_aIn      (_pes_4_4_io_aOut),
     .io_bIn      (_pes_3_5_io_bOut),
@@ -3819,7 +4208,7 @@ module mm_accel(
   SystolicPE pes_4_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_6),
     .io_clearAcc (_pes_7_3_io_clearAcc_T),
     .io_aIn      (_pes_4_5_io_aOut),
     .io_bIn      (_pes_3_6_io_bOut),
@@ -3830,7 +4219,7 @@ module mm_accel(
   SystolicPE pes_4_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_4_7),
     .io_clearAcc (_pes_7_4_io_clearAcc_T),
     .io_aIn      (_pes_4_6_io_aOut),
     .io_bIn      (_pes_3_7_io_bOut),
@@ -3841,9 +4230,9 @@ module mm_accel(
   SystolicPE pes_5_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_0),
     .io_clearAcc (_pes_5_0_io_clearAcc_T),
-    .io_aIn      (kValid_5 ? casez_tmp_10 : 8'h0),
+    .io_aIn      (kValid_5 ? casez_tmp_9 : 8'h0),
     .io_bIn      (_pes_4_0_io_bOut),
     .io_aOut     (_pes_5_0_io_aOut),
     .io_bOut     (_pes_5_0_io_bOut),
@@ -3852,7 +4241,7 @@ module mm_accel(
   SystolicPE pes_5_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_1),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
     .io_aIn      (_pes_5_0_io_aOut),
     .io_bIn      (_pes_4_1_io_bOut),
@@ -3863,7 +4252,7 @@ module mm_accel(
   SystolicPE pes_5_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_2),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_5_1_io_aOut),
     .io_bIn      (_pes_4_2_io_bOut),
@@ -3874,7 +4263,7 @@ module mm_accel(
   SystolicPE pes_5_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_3),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_5_2_io_aOut),
     .io_bIn      (_pes_4_3_io_bOut),
@@ -3885,7 +4274,7 @@ module mm_accel(
   SystolicPE pes_5_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_4),
     .io_clearAcc (_pes_7_2_io_clearAcc_T),
     .io_aIn      (_pes_5_3_io_aOut),
     .io_bIn      (_pes_4_4_io_bOut),
@@ -3896,7 +4285,7 @@ module mm_accel(
   SystolicPE pes_5_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_5),
     .io_clearAcc (_pes_7_3_io_clearAcc_T),
     .io_aIn      (_pes_5_4_io_aOut),
     .io_bIn      (_pes_4_5_io_bOut),
@@ -3907,7 +4296,7 @@ module mm_accel(
   SystolicPE pes_5_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_6),
     .io_clearAcc (_pes_7_4_io_clearAcc_T),
     .io_aIn      (_pes_5_5_io_aOut),
     .io_bIn      (_pes_4_6_io_bOut),
@@ -3918,7 +4307,7 @@ module mm_accel(
   SystolicPE pes_5_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_5_7),
     .io_clearAcc (_pes_7_5_io_clearAcc_T),
     .io_aIn      (_pes_5_6_io_aOut),
     .io_bIn      (_pes_4_7_io_bOut),
@@ -3929,9 +4318,9 @@ module mm_accel(
   SystolicPE pes_6_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_0),
     .io_clearAcc (_pes_6_0_io_clearAcc_T),
-    .io_aIn      (kValid_6 ? casez_tmp_12 : 8'h0),
+    .io_aIn      (kValid_6 ? casez_tmp_11 : 8'h0),
     .io_bIn      (_pes_5_0_io_bOut),
     .io_aOut     (_pes_6_0_io_aOut),
     .io_bOut     (_pes_6_0_io_bOut),
@@ -3940,7 +4329,7 @@ module mm_accel(
   SystolicPE pes_6_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_1),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
     .io_aIn      (_pes_6_0_io_aOut),
     .io_bIn      (_pes_5_1_io_bOut),
@@ -3951,7 +4340,7 @@ module mm_accel(
   SystolicPE pes_6_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_2),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_6_1_io_aOut),
     .io_bIn      (_pes_5_2_io_bOut),
@@ -3962,7 +4351,7 @@ module mm_accel(
   SystolicPE pes_6_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_3),
     .io_clearAcc (_pes_7_2_io_clearAcc_T),
     .io_aIn      (_pes_6_2_io_aOut),
     .io_bIn      (_pes_5_3_io_bOut),
@@ -3973,7 +4362,7 @@ module mm_accel(
   SystolicPE pes_6_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_4),
     .io_clearAcc (_pes_7_3_io_clearAcc_T),
     .io_aIn      (_pes_6_3_io_aOut),
     .io_bIn      (_pes_5_4_io_bOut),
@@ -3984,7 +4373,7 @@ module mm_accel(
   SystolicPE pes_6_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_5),
     .io_clearAcc (_pes_7_4_io_clearAcc_T),
     .io_aIn      (_pes_6_4_io_aOut),
     .io_bIn      (_pes_5_5_io_bOut),
@@ -3995,7 +4384,7 @@ module mm_accel(
   SystolicPE pes_6_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_6),
     .io_clearAcc (_pes_7_5_io_clearAcc_T),
     .io_aIn      (_pes_6_5_io_aOut),
     .io_bIn      (_pes_5_6_io_bOut),
@@ -4006,7 +4395,7 @@ module mm_accel(
   SystolicPE pes_6_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_6_7),
     .io_clearAcc (_pes_7_6_io_clearAcc_T),
     .io_aIn      (_pes_6_6_io_aOut),
     .io_bIn      (_pes_5_7_io_bOut),
@@ -4017,9 +4406,9 @@ module mm_accel(
   SystolicPE pes_7_0 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_0),
     .io_clearAcc (_pes_7_0_io_clearAcc_T),
-    .io_aIn      (kValid_7 ? casez_tmp_14 : 8'h0),
+    .io_aIn      (kValid_7 ? casez_tmp_13 : 8'h0),
     .io_bIn      (_pes_6_0_io_bOut),
     .io_aOut     (_pes_7_0_io_aOut),
     .io_bOut     (/* unused */),
@@ -4028,7 +4417,7 @@ module mm_accel(
   SystolicPE pes_7_1 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_1),
     .io_clearAcc (_pes_7_1_io_clearAcc_T),
     .io_aIn      (_pes_7_0_io_aOut),
     .io_bIn      (_pes_6_1_io_bOut),
@@ -4039,7 +4428,7 @@ module mm_accel(
   SystolicPE pes_7_2 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_2),
     .io_clearAcc (_pes_7_2_io_clearAcc_T),
     .io_aIn      (_pes_7_1_io_aOut),
     .io_bIn      (_pes_6_2_io_bOut),
@@ -4050,7 +4439,7 @@ module mm_accel(
   SystolicPE pes_7_3 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_3),
     .io_clearAcc (_pes_7_3_io_clearAcc_T),
     .io_aIn      (_pes_7_2_io_aOut),
     .io_bIn      (_pes_6_3_io_bOut),
@@ -4061,7 +4450,7 @@ module mm_accel(
   SystolicPE pes_7_4 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_4),
     .io_clearAcc (_pes_7_4_io_clearAcc_T),
     .io_aIn      (_pes_7_3_io_aOut),
     .io_bIn      (_pes_6_4_io_bOut),
@@ -4072,7 +4461,7 @@ module mm_accel(
   SystolicPE pes_7_5 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_5),
     .io_clearAcc (_pes_7_5_io_clearAcc_T),
     .io_aIn      (_pes_7_4_io_aOut),
     .io_bIn      (_pes_6_5_io_bOut),
@@ -4083,7 +4472,7 @@ module mm_accel(
   SystolicPE pes_7_6 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_6),
     .io_clearAcc (_pes_7_6_io_clearAcc_T),
     .io_aIn      (_pes_7_5_io_aOut),
     .io_bIn      (_pes_6_6_io_bOut),
@@ -4094,7 +4483,7 @@ module mm_accel(
   SystolicPE pes_7_7 (
     .clock       (clk),
     .reset       (rst),
-    .io_en       (busy),
+    .io_en       (peEn_7_7),
     .io_clearAcc (t == 8'hE),
     .io_aIn      (_pes_7_6_io_aOut),
     .io_bIn      (_pes_6_7_io_bOut),
@@ -4106,8 +4495,8 @@ module mm_accel(
     .clock        (clk),
     .reset        (rst),
     .io_enq_valid (fillValid),
-    .io_enq_bits  (int8Req ? lineData8_REG : casez_tmp_16),
-    .io_deq_ready (mem_wnext | dmaBusy & mem_ready | ~dmaBusy),
+    .io_enq_bits  (int8Req ? lineData8_REG : casez_tmp_15),
+    .io_deq_ready (mem_wnext | dmaBusy & mem_wr_ready | ~dmaBusy),
     .io_deq_valid (_lineFifo_io_deq_valid),
     .io_deq_bits  (mem_wline),
     .io_count     (_lineFifo_io_count)
@@ -4119,7 +4508,7 @@ module mm_accel(
   assign s_axi_arready = arreadyReg;
   assign s_axi_rdata =
     raddrWord == 6'h1
-      ? {24'h0, qDone, qBusy, ldDone, ldBusy, dmaDone, dmaBusy, done, busy}
+      ? {23'h0, qOverflow, qDone, qBusy, ldDone, ldBusy, dmaDone, dmaBusy, done, busy}
       : raddrWord == 6'hA
           ? destAddr
           : raddrWord == 6'hB
@@ -4147,21 +4536,20 @@ module mm_accel(
                                                       : raddrWord == 6'h7
                                                           ? {26'h0, resultIdx}
                                                           : _GEN_15
-                                                              ? casez_tmp_26
+                                                              ? casez_tmp_25
                                                               : raddrWord == 6'h9
                                                                   ? 32'h44008
                                                                   : 32'h0;
   assign s_axi_rresp = 2'h0;
   assign s_axi_rvalid = rvalidReg;
-  assign mem_req_valid = dmaBusy & _lineFifo_io_deq_valid | ldBusy & ldReq & ~dmaBusy;
-  assign mem_req_write = dmaBusy;
-  assign mem_req_addr =
-    dmaBusy
-      ? dmaAddr
-      : burstOK
-          ? ldBase
-          : {26'h0, ldChunk, 4'h0} + ldBase + {29'h0, ldLane} * effSrcStride;
-  assign mem_req_lines =
-    {2'h0, dmaBusy ? {1'h0, wBurstLines} : burstOK ? {_ldLines_T_1, 3'h0} : 6'h1};
+  assign mem_rd_req_valid = ldBusy & ldReq;
+  assign mem_rd_req_addr =
+    burstOK ? ldBase : {26'h0, ldChunk, 4'h0} + ldBase + {29'h0, ldLane} * effSrcStride;
+  assign mem_rd_req_lines = {2'h0, burstOK ? {_ldLines_T_1, 3'h0} : 6'h1};
+  assign mem_wr_req_valid = dmaBusy & _lineFifo_io_deq_valid;
+  assign mem_wr_req_addr = dmaAddr;
+  assign mem_wr_req_lines = {3'h0, wBurstLines};
+  assign irq_batch = qDone;
+  assign irq_dma = dmaDone;
 endmodule
 

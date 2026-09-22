@@ -1,3 +1,6 @@
+`ifndef _CACHE_CORE_V_
+`define _CACHE_CORE_V_
+
 module cache_core #(
     parameter ADDR_WIDTH = 32, 
     parameter LINE_BYTES = 16, 
@@ -214,3 +217,5 @@ module cache_core #(
     end 
 
 endmodule
+
+`endif // _CACHE_CORE_V_

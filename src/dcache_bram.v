@@ -1,3 +1,6 @@
+`ifndef _DCACHE_BRAM_V_
+`define _DCACHE_BRAM_V_
+
 `timescale 1ns/1ps
 
 // BRAM-backed direct-mapped write-back data cache.
@@ -349,3 +352,5 @@ module dcache_bram #(
     assign mem_wline     = wb_line;
 
 endmodule
+
+`endif // _DCACHE_BRAM_V_

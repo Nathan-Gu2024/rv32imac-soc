@@ -1,3 +1,6 @@
+`ifndef _TCM_V_
+`define _TCM_V_
+
 `timescale 1ns/1ps
 
 // Banked instruction memory: mem_even holds bits[15:0] and mem_odd holds
@@ -173,3 +176,5 @@ module tcm #(
     end
 
 endmodule
+
+`endif // _TCM_V_

@@ -1,3 +1,6 @@
+`ifndef _CONTROL_LOGIC_V_
+`define _CONTROL_LOGIC_V_
+
 module control_logic (
     input wire [31:0] inst,
     output wire reg_wen, a_sel, b_sel, mem_rw,
@@ -10,8 +13,13 @@ module control_logic (
 
     output wire [1:0] csr_op,
     output wire csr_use_imm,
-    output wire [4:0] csr_uimm
+    output wire [4:0] csr_uimm,
 
+    // 1 when nothing in the decode table matched. Until this existed the
+    // table's `default` quietly handed back ADD's control word, so an
+    // undefined opcode - or a jump into zeroed memory - executed as
+    // `add rd, rs1, rs2` and corrupted a register instead of trapping.
+    output wire illegal_inst
 );
 
     wire [5:0] rom_address;
@@ -25,7 +33,8 @@ module control_logic (
 
     rom_decoder decoder (
         .inst(inst),
-        .rom_address(rom_address)
+        .rom_address(rom_address),
+        .illegal(illegal_inst)
     );
 
     rom rom_inst (
@@ -140,7 +149,8 @@ endmodule
 
 module rom_decoder (
     input wire [31:0] inst,
-    output reg [5:0] rom_address
+    output reg [5:0] rom_address,
+    output reg illegal
 );
     wire [4:0] opcode = inst[6:2];
     wire [2:0] funct3 = inst[14:12];
@@ -149,8 +159,20 @@ module rom_decoder (
     wire [4:0] funct5 = inst[31:27];
 
     always @(*) begin
+        illegal = 1'b0;
+
+        // The two canonical illegal encodings, checked before anything else.
+        //
+        // All-zeros matters most here: rvc_expansion.v emits 32'h00000000 for
+        // every compressed encoding it does not recognise, so catching it
+        // covers illegal RVC for free. It is also what a jump into zeroed or
+        // uninitialised memory lands on - which currently decodes as
+        // `lb x0, 0(x0)` and runs on silently.
+        if (inst == 32'h0000_0000 || inst == 32'hFFFF_FFFF) begin
+            rom_address = 6'd0;
+            illegal = 1'b1;
         // Intercept Atomics (Opcode: 01011)
-        if (opcode == 5'b01011) begin
+        end else if (opcode == 5'b01011) begin
             if (funct5 == 5'b00010)
                 rom_address = 6'd36; // lr.w
             else if (funct5 == 5'b00011)
@@ -162,6 +184,15 @@ module rom_decoder (
                 // from is_amo/atomic_op, decoded separately above.
                 rom_address = 6'd36; // share lr.w's control word
         end else if (inst[6:2] == 5'b11100) begin
+            // SYSTEM. Not flagged: ECALL/EBREAK/MRET are handled by
+            // trap_controller, CSR ops by csr_wen above, and WFI is
+            // architecturally allowed to retire as a no-op - which is exactly
+            // what ADD with rd=x0 does here.
+            rom_address = 6'd0;
+        end else if (opcode == 5'b00011) begin
+            // MISC-MEM. FENCE and FENCE.I are legal and, on a single-hart
+            // core with no runtime code loading, correctly retire as no-ops.
+            // They must NOT trap: GCC emits FENCE around atomics.
             rom_address = 6'd0;
         end else if (opcode == 5'b01100 && inst[31:25] == 7'b0010000) begin
             // Zba shifted-add, intercepted ahead of the casex below rather
@@ -175,7 +206,12 @@ module rom_decoder (
                 3'b010:  rom_address = 6'd45; // sh1add
                 3'b100:  rom_address = 6'd46; // sh2add
                 3'b110:  rom_address = 6'd47; // sh3add
-                default: rom_address = 6'd0;
+                default: begin
+                    // funct7=0010000 with any other funct3 is not a Zba
+                    // encoding this core implements.
+                    rom_address = 6'd0;
+                    illegal = 1'b1;
+                end
             endcase
         end else begin
             casex ({opcode, funct3, f7_bit5, f7_bit0})
@@ -240,8 +276,13 @@ module rom_decoder (
                 // JALR (I-Type, funct3 is 000)
                 10'b11001_000_?_?: rom_address = 6'd35; // jalr
 
-                default: rom_address = 6'd0;
+                default: begin
+                    rom_address = 6'd0;
+                    illegal = 1'b1;
+                end
             endcase
         end
     end
 endmodule
+
+`endif // _CONTROL_LOGIC_V_

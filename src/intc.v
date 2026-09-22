@@ -1,3 +1,6 @@
+`ifndef _INTC_V_
+`define _INTC_V_
+
 // Minimal interrupt controller: aggregates NUM_SOURCES external interrupt
 // lines (peripherals - UART today, more later) into the single external/
 // "machine external interrupt" line the CPU's mip.MEIP bit expects, the
@@ -85,3 +88,5 @@ module intc #(
         end
     end
 endmodule
+
+`endif // _INTC_V_

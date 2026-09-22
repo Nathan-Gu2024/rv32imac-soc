@@ -13,28 +13,63 @@
 // against a 64-word MMIO window - it does not fit, and the map is what blocks
 // scaling, not the array.
 //
-// This map is CONSTANT SIZE in DIM (10 words) because the lane and the
-// accumulator are addressed by index rather than by address:
+// This map is CONSTANT SIZE in DIM - 23 words, 0..22, inside the 64-word MMIO
+// window - because the lane and the accumulator are addressed by index rather
+// than by address. It is the size in DIM that matters, not the count: the count
+// grew from 10 to 23 as the DMA, the panel split and the descriptor queue
+// landed, and none of that scaled with DIM.
 //
-//   word 0  CTRL       (W)  bit0=START (ignored while BUSY), bit1=SOFT_RST
-//   word 1  STATUS     (R)  bit0=BUSY, bit1=DONE, bit2=DMA_BUSY, bit3=DMA_DONE
-//   word 2  K_LEN      (RW) reduction depth for the next run, <= maxK
-//   word 3  LOAD_K     (RW) k-GROUP index; each group is 4 packed INT8
-//   word 4  LOAD_LANE  (RW) which row (A) or column (B) to push into.
+// Listed in address order. The authority is the decode at the bottom of this
+// file (`switch(raddrWord)` and the `waddrWord` whens); if they disagree, they
+// are right and this comment is stale.
+//
+//   word 0  CTRL        (W) bit0=START (ignored while BUSY), bit1=SOFT_RST,
+//                           bit2=result-DMA start, bit3=operand-DMA start
+//                           (A and B), bit4=operand-DMA start (B only),
+//                           bit5=descriptor-queue start
+//   word 1  STATUS      (R) bit0=BUSY,    bit1=DONE,
+//                           bit2=DMA_BUSY bit3=DMA_DONE   (result store)
+//                           bit4=LD_BUSY  bit5=LD_DONE    (operand fetch)
+//                           bit6=Q_BUSY   bit7=Q_DONE     (batch)
+//                           bit8=Q_OVERFLOW - sticky, a DESC_PUSH was dropped
+//                           because the queue was full. Cleared by the next
+//                           queue kick. Check it after assembling a batch: the
+//                           alternative is a missing tile with no error.
+//   word 2  K_LEN       (RW) reduction depth for the next run, <= maxK
+//   word 3  LOAD_K      (RW) k-GROUP index; each group is 4 packed INT8
+//   word 4  LOAD_LANE   (RW) which row (A) or column (B) to push into.
 //                           Writing it resets LOAD_K to 0.
-//   word 5  A_PUSH     (W)  4 packed INT8 -> aRow[LOAD_LANE][4*LOAD_K ..+3],
+//   word 5  A_PUSH      (W) 4 packed INT8 -> aRow[LOAD_LANE][4*LOAD_K ..+3],
 //                           then LOAD_K auto-increments
-//   word 6  B_PUSH     (W)  same for bCol[LOAD_LANE]
-//   word 7  RESULT_IDX (RW) accumulator to read, = row*DIM + col
-//   word 8  RESULT     (R)  accumulator[RESULT_IDX], then RESULT_IDX
+//   word 6  B_PUSH      (W) same for bCol[LOAD_LANE]
+//   word 7  RESULT_IDX  (RW) accumulator to read, = row*DIM + col
+//   word 8  RESULT      (R) accumulator[RESULT_IDX], then RESULT_IDX
 //                           auto-increments - so a whole tile reads back with
 //                           one transaction per element instead of two
-//   word 9  INFO       (R)  {bPanels[23:16], maxK[15:8], dim[7:0]} - geometry
+//   word 9  INFO        (R) {bPanels[23:16], maxK[15:8], dim[7:0]} - geometry
 //                           discovery, so software need not hardcode any of it
-//   word 10 DEST_ADDR  (RW) byte address the result DMA writes to. Must be
+//   word 10 DEST_ADDR   (RW) byte address the result DMA writes to. Must be
 //                           16-byte aligned; the burst is dim*dim/4 lines of
 //                           128 bits, written in row-major accumulator order.
-//   word 20 DESC_PUSH  (W)  commits a descriptor. Layout:
+//   word 11 DEST_STRIDE (RW) byte distance between consecutive RESULT ROWS.
+//                           0 = contiguous (stride = dim*4). Set this to the
+//                           full matrix row pitch (N*4) to have a tile land
+//                           directly in its place inside a larger C, with no
+//                           software copy. Ignored at dim=2, where one
+//                           128-bit line spans both rows - and it must be 0 in
+//                           INT8 mode, where a line spans 16/dim result rows
+//                           and there is no row boundary to stride at.
+//   word 12 A_SRC_ADDR  (RW) byte address the operand DMA fetches the A panel
+//   word 13 B_SRC_ADDR  (RW) byte address for the B panel
+//   word 14 SRC_STRIDE  (RW) byte pitch between operand rows at the source
+//   word 15 B_PANEL_USE (RW) which B scratchpad panel the ARRAY reads
+//   word 16 B_PANEL_LOAD(RW) which B panel a push or operand DMA WRITES.
+//                           Split from B_PANEL_USE so the next panel can be
+//                           filled while the current one feeds a run.
+//   word 17 DESC_A_SRC  (W) staged into the next descriptor (see DESC_PUSH)
+//   word 18 DESC_B_SRC  (W) same
+//   word 19 DESC_DEST   (W) same
+//   word 20 DESC_PUSH   (W) commits a descriptor built from words 17-19 plus:
 //                           {bOnly[16], panelLoad[15:12], panelUse[11:8], kLen[7:0]}
 //                           bOnly=1 fetches ONLY the B panel, leaving the A
 //                           panel resident from the previous tile. In a tiled
@@ -42,16 +77,18 @@
 //                           ti fixed, so A is identical across all of them and
 //                           re-fetching it is pure waste: at dim=8,maxK=64 the
 //                           A panel is 32 of the 80 lines a tile moves.
-//   word 15 B_PANEL_USE (RW) which B scratchpad panel the ARRAY reads
-//   word 16 B_PANEL_LOAD(RW) which B panel a push or operand DMA WRITES.
-//                           Split from B_PANEL_USE so the next panel can be
-//                           filled while the current one feeds a run.
-//   word 11 DEST_STRIDE(RW) byte distance between consecutive RESULT ROWS.
-//                           0 = contiguous (stride = dim*4). Set this to the
-//                           full matrix row pitch (N*4) to have a tile land
-//                           directly in its place inside a larger C, with no
-//                           software copy. Ignored at dim=2, where one
-//                           128-bit line spans both rows.
+//   word 21 QUEUE_FREE  (R) descriptor slots still free, so software can push
+//                           without overflowing the queue
+//   word 22 OUT_CTRL    (RW) bits[4:0]=outShift, bit8=INT8 requantize enable.
+//                           With INT8 on, a tile stores as dim*dim BYTES
+//                           instead of INT32 accumulators - four cache lines
+//                           at dim=16 rather than sixteen, which is where most
+//                           of the destination-invalidate cost went.
+//
+// Two interrupt lines leave this module alongside the register window:
+// irq_batch (a queued batch finished) and irq_dma (a standalone result store
+// finished). Both are sticky levels, not pulses, because intc.v edge-captures
+// them - see the note at their declaration.
 //
 // CTRL bit2 kicks the result DMA, which drains the accumulators over the
 // mem_arbiter line port instead of through this 32-bit register window. That
@@ -115,6 +152,11 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
               val fifoDepth: Int = 8,
               val enableReadBursts: Boolean = true,
               val enableWriteBursts: Boolean = true,
+              // Overlap tile N+1's operand load with tile N's compute. Measured
+              // worth 25% on an A-reuse batch, but currently corrupts the first
+              // prefetched tile - see tryPrefetch's STATUS note. OFF until that
+              // is root-caused; turning it on is how you reproduce the failure.
+              val enablePrefetch: Boolean = true,
               val descDepth: Int = 8) extends RawModule {
   require(dim >= 1, "dim must be positive")
   require(maxK % 4 == 0, "maxK must be a multiple of 4: operands pack 4 INT8 per write")
@@ -167,17 +209,46 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
   // AXI4 - the SoC already arbitrates two 128-bit cache ports into
   // axi_cache_adapter, so becoming a third requester reuses proven plumbing
   // and gets 16 bytes per transaction instead of AXI4-Lite's 4.
-  val mem_req_valid = IO(Output(Bool()))
-  val mem_req_write = IO(Output(Bool()))
-  val mem_req_addr  = IO(Output(UInt(32.W)))
-  val mem_wline     = IO(Output(UInt(128.W)))
-  // Burst length in LINES for the current request. Driven to 1 initially so
-  // this is a pure interface addition; the burst sequencing lands next.
-  val mem_req_lines = IO(Output(UInt(8.W)))
-  // Adapter asks for the next line of a write burst.
-  val mem_wnext     = IO(Input(Bool()))
-  val mem_rline     = IO(Input(UInt(128.W)))
-  val mem_ready     = IO(Input(Bool()))
+  // TWO channels, not one. The single port carried no direction tag on its
+  // completion, so the load capture had to guess with !dmaBusy and the store
+  // credit guessed with nothing - a read line arriving during a store was both
+  // dropped by the loader and miscredited to the store. Separate completions
+  // make that unrepresentable rather than merely guarded against.
+  //
+  // The asymmetry is part of the contract and is not an accident: a READ
+  // completes one LINE at a time, a WRITE once per TRANSACTION.
+  //
+  // ---- read channel: operand fetch ----
+  val mem_rd_req_valid = IO(Output(Bool()))
+  val mem_rd_req_addr  = IO(Output(UInt(32.W)))
+  val mem_rd_req_lines = IO(Output(UInt(8.W)))
+  val mem_rline        = IO(Input(UInt(128.W)))
+  val mem_rd_ready     = IO(Input(Bool()))      // ONE PULSE PER LINE
+  // ---- write channel: result store ----
+  val mem_wr_req_valid = IO(Output(Bool()))
+  val mem_wr_req_addr  = IO(Output(UInt(32.W)))
+  val mem_wr_req_lines = IO(Output(UInt(8.W)))
+  val mem_wline        = IO(Output(UInt(128.W)))
+  val mem_wnext        = IO(Input(Bool()))      // requester: present next line
+  val mem_wr_ready     = IO(Input(Bool()))      // ONE PULSE PER TRANSACTION
+
+  // Completion interrupts, driven straight from the sticky DONE registers.
+  //
+  // These are LEVELS, not pulses, and that is deliberate: src/intc.v captures
+  // on the 0->1 EDGE (irq_edge = irq_in & ~irq_in_prev) and latches into its
+  // own pending register, which software clears write-1-to-clear. qDone is set
+  // once when a batch drains and cleared only by the next CTRL bit5 kick, so
+  // it produces exactly one clean edge per batch - which is precisely the
+  // shape intc wants. A pulse generator here would add state for nothing, and
+  // an accelerator-side enable/clear register would duplicate intc's own
+  // ENABLE and PENDING.
+  //
+  // Only these two are exported. done/ldDone also go high once per TILE while
+  // a queued batch runs (the sequencer drives startAny and ldStartAny from
+  // qComp/qLoad), so wiring them to interrupts would fire the ISR once per
+  // tile for markers that have no meaning outside the sequencer.
+  val irq_batch = IO(Output(Bool()))   // a queued batch finished (CTRL bit5)
+  val irq_dma   = IO(Output(Bool()))   // a standalone result store finished
 
   withClockAndReset(clk, rst) {
 
@@ -241,13 +312,25 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       val dest = UInt(32.W)
       val ctl  = UInt(32.W)
     }
-    val descQ  = Module(new Queue(new Descriptor, descDepth))
+    // hasFlush so SOFT_RST can actually empty the queue. Without it there is no
+    // way to abandon a batch short of a full SoC reset, which is what made the
+    // driver's timeout path worse than having none.
+    val descQ  = Module(new Queue(new Descriptor, descDepth, hasFlush = true))
     val descA  = RegInit(0.U(32.W))
     val descB  = RegInit(0.U(32.W))
     val descD  = RegInit(0.U(32.W))
     val qRun   = RegInit(false.B)
     val qBusy  = RegInit(false.B)
     val qDone  = RegInit(false.B)
+    // Sticky: a DESC_PUSH arrived with the queue full and was DROPPED.
+    //
+    // A Chisel Queue silently discards the beat when enq.ready is low, and
+    // enq.valid is driven from descPush alone - so without this the failure mode
+    // is a missing tile in the output matrix while STATUS reports success.
+    // Software is expected to read QUEUE_FREE first and the driver does, but that
+    // is a separate AXI transaction with nothing enforcing the ordering, so the
+    // hardware needs to be able to say it happened.
+    val qOverflow = RegInit(false.B)
     // Set from the current descriptor: fetch only the B panel and leave A
     // resident. See DESC_PUSH in the register map above.
     val qBOnly = RegInit(false.B)
@@ -256,6 +339,11 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     val dmaAddr  = RegInit(0.U(32.W))
     val dmaBusy  = RegInit(false.B)
     val dmaDone  = RegInit(false.B)
+
+    // See the port declarations above for why these are levels off the sticky
+    // DONE bits rather than pulses.
+    irq_batch := qDone
+    irq_dma   := dmaDone
 
     // Byte distance between consecutive RESULT ROWS in memory - OpenGeMM's
     // "programmable strided memory access", and the thing that decides whether
@@ -478,19 +566,25 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // dmaStart originally checked only !dmaBusy, which let a result DMA be
     // kicked DURING an operand load: dmaDrive would then raise mem_req_write
     // and swing mem_req_addr mid-read, corrupting the in-flight fetch.
-    val dmaStart     = doWrite && (waddrWord === 0.U) && s_axi_wdata(2) && !dmaBusy && !ldBusy
+    val dmaStart     = doWrite && (waddrWord === 0.U) && s_axi_wdata(2) && !dmaBusy
     // CTRL bit3 kicks the operand load. Gated on BOTH engines being idle: they
     // share one line port and one mem_ready, so overlapping them would corrupt
     // whichever request happened to be in flight.
-    val ldStart      = doWrite && (waddrWord === 0.U) && s_axi_wdata(3) && !ldBusy && !dmaBusy
+    val ldStart      = doWrite && (waddrWord === 0.U) && s_axi_wdata(3) && !ldBusy
     // CTRL bit4: load ONLY the B panel, leaving aRowBuf untouched so this may
     // run concurrently with compute. Safe only when B_PANEL_LOAD differs from
     // B_PANEL_USE - software's responsibility, and what double buffering means.
-    val ldStartB     = doWrite && (waddrWord === 0.U) && s_axi_wdata(4) && !ldBusy && !dmaBusy
+    val ldStartB     = doWrite && (waddrWord === 0.U) && s_axi_wdata(4) && !ldBusy
     // CTRL bit5 starts the queue. Writing DESC_PUSH (word 20) commits a
     // descriptor built from the three staged words plus this one.
     val qStartPulse  = doWrite && (waddrWord === 0.U) && s_axi_wdata(5) && !qBusy
     val descPush     = doWrite && (waddrWord === 20.U)
+
+    // Latch a dropped push. Cleared when a new batch is kicked, so the bit
+    // always describes the batch being assembled rather than accumulating
+    // forever.
+    when(descPush && !descQ.io.enq.ready) { qOverflow := true.B }
+      .elsewhen(qStartPulse)              { qOverflow := false.B }
 
     descQ.io.enq.valid     := descPush
     descQ.io.enq.bits.aSrc := descA
@@ -503,8 +597,147 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // Per descriptor: fetch operands, compute, write results back - with no CPU
     // round trip between phases. Each phase has a one-cycle issue state and a
     // wait state, so the pulses below are naturally single-cycle.
-    val qIdle :: qLoad :: qLoadW :: qComp :: qCompW :: qStore :: qStoreW :: Nil = Enum(7)
+    // qPreW is the overlap state: the current tile's store has drained and the
+    // NEXT tile's operands are already loading (or loaded), so the sequencer
+    // waits on that prefetch instead of starting a fresh load from idle.
+    val qIdle :: qLoad :: qLoadW :: qComp :: qCompW :: qStore :: qStoreW :: qPreW :: qPreIssue :: Nil = Enum(9)
     val qState = RegInit(qIdle)
+
+    // ---- operand prefetch: overlap tile N+1's load with tile N's compute ----
+    //
+    // Measured opportunity: the memory port is idle for 100% of the array's
+    // compute window (tb_mm_accel_queue reports array-busy-with-port-idle = 23%
+    // of a batch), because the sequencer ran load -> compute -> store strictly in
+    // series with ONE set of config registers.
+    //
+    // The blocker was that kLen fed both the load sizing (ldLines) and the array
+    // schedule (lastT/kValid), so advancing to the next descriptor mid-compute
+    // would have resized the running tile. Hence two contexts:
+    //
+    //   LOAD ctx    aSrcAddr, bSrcAddr, bPanelLoad, qBOnly, ldKLen
+    //   STAGED      the same descriptor's compute/store fields, held until its
+    //               operands are resident
+    //   COMPUTE ctx kLen, bPanelUse, destAddr  - promoted from STAGED on ldDone
+    //
+    // A prefetch is only started when the panel it would overwrite is not the
+    // panel the array is about to read, which is what bPanels > 1 exists for.
+    val ldKLen      = RegInit(0.U(8.W))   // load sizing only; array uses kLen
+    val stgKLen     = RegInit(0.U(8.W))
+    val stgPanelUse = RegInit(0.U(panBits.W))
+    val stgDest     = RegInit(0.U(32.W))
+
+    // preBusy: a prefetch has been issued for the tile after the one computing.
+    // preDone: that prefetch's ldDone has been seen (sticky, because it usually
+    //          lands during compute or the store, long before it is consumed).
+    val preBusy = RegInit(false.B)
+    val preDone = RegInit(false.B)
+    // One-cycle start pulse for the load engine, driven from the FSM below and
+    // consumed by ldStartAny further down.
+    //
+    // It is asserted the cycle AFTER the descriptor is latched, not the same
+    // cycle. The load engine's start block reads the load context as REGISTERS
+    // (ldInB := bOnly, with bOnly taken from qBOnly), so firing
+    // preStart in the same cycle as tryPrefetch's writes starts the load on the
+    // PREVIOUS descriptor's address and b_only flag. The qLoad path never had
+    // this problem because qIdle latches and only then moves to qLoad, a full
+    // cycle apart; prePend reproduces that separation for the prefetch.
+    //
+    // Concretely, without it: the first prefetch is issued from qLoadW, where the
+    // descriptor that just finished is tile 0 - which is NOT b_only. qBOnly is
+    // therefore still false, so the prefetch starts an A+B load with
+    // ldInB := false and walks the A buffer instead of loading B alone.
+    val preStart = WireDefault(false.B)
+    val prePend  = RegInit(false.B)
+
+    // Operands for the staged descriptor are now resident: it becomes the tile
+    // the array and the store work on.
+    def promoteStaged(): Unit = {
+      kLen      := stgKLen
+      bPanelUse := stgPanelUse
+      destAddr  := stgDest
+    }
+
+    // Start loading the next descriptor, if there is one and it is safe.
+    //
+    // TWO conditions, both necessary.
+    //
+    // 1. The panel being loaded into must not be the panel the array is about to
+    //    read. That is what bPanels > 1 exists for. stgPanelUse is the panel just
+    //    promoted to bPanelUse, so it is what to compare against.
+    //
+    // 2. The prefetched descriptor must be B-ONLY. The B scratchpad is banked
+    //    into bPanels panels, but there is exactly ONE A buffer - A is not
+    //    double-buffered at all. So prefetching a tile that fetches A would
+    //    overwrite the A operands the CURRENTLY COMPUTING tile is still reading.
+    //    That is not a theoretical hazard: without this term the queue bench
+    //    reported 124 wrong results, because every tile in it fetches A.
+    //
+    //    This costs nothing in the case the feature exists for. In a tiled GEMM
+    //    walking a row of C, ti is fixed, so tile 0 fetches A and every tile
+    //    after it is b_only - which is exactly the shape the A-reuse work
+    //    introduced and what the driver already emits.
+    //
+    // When either condition fails the prefetch is skipped: that tile loses its
+    // overlap and nothing is incorrect.
+    // STATUS: ENABLED. A-reuse batch in tb_mm_accel_queue: 469 -> 371 cycles
+    // (21%), results correct, suite 10/11 with only the pre-existing
+    // tb_mm_accel_c_test failure outstanding.
+    //
+    // Three separate bugs had to be fixed to get here, and the first version of
+    // this feature had all three at once - which is why it appeared to "work and
+    // be fast" at 350 cycles while returning a tile of zeros. That 350 was not a
+    // speedup: it was the cost of an operand load the sequencer never waited for.
+    //
+    //   1. preStart fired in the SAME cycle tryPrefetch wrote the load context,
+    //      so the load engine sampled the PREVIOUS descriptor's address and
+    //      b_only flag. The qLoad path was always immune because qIdle latches
+    //      and only then transitions. Fixed with prePend.
+    //
+    //   2. preDone latched on ldDone as a LEVEL. ldDone is not a pulse - it stays
+    //      high from completion until the next load starts - so preBusy rising
+    //      inside that window latched the previous load's completion, and qPreW
+    //      promoted a tile whose B panel had never been fetched. That produced
+    //      the tile of zeros (62 of 64 words, not 6 as first recorded). Fixed by
+    //      requiring a rising edge.
+    //
+    //   3. With qPreW finally waiting properly, a real DEADLOCK surfaced: the
+    //      last line of an in-flight read burst was discarded when a store
+    //      started on that exact cycle, because the load captures only
+    //      `when(mem_ready && !dmaBusy)` and mem_ready is ambiguous between
+    //      "read line ready" and "write accepted". Fixed by refusing to enter
+    //      qStore while ldBusy.
+    //
+    // Note what (3) means for sequencing: prefetch does NOT come for free before
+    // the read/write split. It overlaps the operand load with COMPUTE only;
+    // overlapping it with the result store needs independent read and write paths
+    // and an unambiguous mem_ready, which is the T3.2 work.
+    def tryPrefetch(): Unit = {
+      val nextCtl   = descQ.io.deq.bits.ctl
+      val nextPanel = nextCtl(12 + panBits - 1, 12)
+      val nextBOnly = nextCtl(16)
+      // !preBusy makes the one-prefetch-outstanding rule LOCAL. It already
+      // held, but only because of where this is called from - qPreIssue, and
+      // qPreW which clears preBusy first. That is a non-local invariant, and the
+      // single panel comparison below is only sufficient while it holds: with two
+      // prefetches in flight there would be more than one live B panel and
+      // comparing against stgPanelUse alone would let a load overwrite a panel
+      // the array is still reading.
+      when(enablePrefetch.B && !preBusy && descQ.io.deq.valid && nextBOnly &&
+           (nextPanel =/= stgPanelUse)) {
+        aSrcAddr    := descQ.io.deq.bits.aSrc
+        bSrcAddr    := descQ.io.deq.bits.bSrc
+        ldKLen      := nextCtl(7, 0)
+        bPanelLoad  := nextPanel
+        qBOnly      := nextCtl(16)
+        stgKLen     := nextCtl(7, 0)
+        stgPanelUse := nextCtl(8 + panBits - 1, 8)
+        stgDest     := descQ.io.deq.bits.dest
+        descQ.io.deq.ready := true.B
+        prePend     := true.B   // preStart fires next cycle; see its declaration
+        preBusy     := true.B
+        preDone     := false.B
+      }
+    }
 
     when(qStartPulse) {
       qRun  := true.B
@@ -515,18 +748,25 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     switch(qState) {
       is(qIdle) {
         when(qRun && descQ.io.deq.valid) {
-          // Adopt the descriptor's geometry, then retire it immediately: the
-          // config registers hold everything the phases need from here on.
-          aSrcAddr   := descQ.io.deq.bits.aSrc
-          bSrcAddr   := descQ.io.deq.bits.bSrc
-          destAddr   := descQ.io.deq.bits.dest
-          kLen       := descQ.io.deq.bits.ctl(7, 0)
-          bPanelUse  := descQ.io.deq.bits.ctl(8 + panBits - 1, 8)
-          bPanelLoad := descQ.io.deq.bits.ctl(12 + panBits - 1, 12)
-          qBOnly     := descQ.io.deq.bits.ctl(16)
+          // Adopt into the LOAD context plus staging, then retire the
+          // descriptor. The compute context is NOT written here: it is promoted
+          // from staging once these operands are actually resident, which is
+          // what lets the next descriptor be adopted while this tile computes.
+          aSrcAddr    := descQ.io.deq.bits.aSrc
+          bSrcAddr    := descQ.io.deq.bits.bSrc
+          ldKLen      := descQ.io.deq.bits.ctl(7, 0)
+          bPanelLoad  := descQ.io.deq.bits.ctl(12 + panBits - 1, 12)
+          qBOnly      := descQ.io.deq.bits.ctl(16)
+          stgKLen     := descQ.io.deq.bits.ctl(7, 0)
+          stgPanelUse := descQ.io.deq.bits.ctl(8 + panBits - 1, 8)
+          stgDest     := descQ.io.deq.bits.dest
           descQ.io.deq.ready := true.B
           qState := qLoad
-        }.elsewhen(qRun && !descQ.io.deq.valid && !dmaBusy) {
+        // !ldBusy added alongside !dmaBusy. A batch must not report DONE with a
+        // fetch still in flight. That held before only because no load could be
+        // outstanding without either qLoadW waiting on it or preBusy set - a
+        // non-local invariant, and loads now overlap stores.
+        }.elsewhen(qRun && !descQ.io.deq.valid && !dmaBusy && !ldBusy) {
           // Queue drained AND the last store has completed. The !dmaBusy term
           // is load-bearing now that qStoreW releases on the drain rather than
           // on completion: without it the batch could report DONE with a write
@@ -537,11 +777,44 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
         }
       }
       is(qLoad)   { qState := qLoadW }
-      is(qLoadW)  { when(ldDone)  { qState := qComp  } }
+      is(qLoadW)  {
+        when(ldDone) {
+          promoteStaged()
+          // NOTE: no tryPrefetch() here. Starting the next load on the SAME
+          // cycle ldDone is observed corrupted the prefetched tile - only that
+          // tile, and only when prefetched from here rather than from qPreW,
+          // which is what localised it. The prefetch is issued from qPreIssue
+          // one cycle later instead.
+          qState := qPreIssue
+        }
+      }
+      // One cycle of separation between "the previous load reported done" and
+      // "the next load starts". Costs a single cycle per batch, not per tile,
+      // because every later prefetch is issued from qPreW.
+      is(qPreIssue) {
+        tryPrefetch()
+        qState := qComp
+      }
       is(qComp)   { qState := qCompW }
       // Only one result DMA may be in flight: entering qStore asserts
       // dmaStartAny, which reloads dmaAddr and fillLeft, so doing that while
       // the previous store is still draining would redirect it mid-transfer.
+      // !ldBusy is load-bearing with prefetch enabled. A read burst is requested
+      // once and then streams, with ldReq dropped after the first line; the load
+      // captures only `when(mem_ready && !dmaBusy)`, so a store starting
+      // mid-burst makes the load DISCARD lines that were actually delivered and
+      // wait for them forever. Measured: the 8th line of an 8-line burst landed
+      // on the same cycle dmaBusy rose, and the load hung on lane 7.
+      //
+      // Serialising here costs the load-against-store overlap only. The overlap
+      // prefetch exists for - load against COMPUTE - is unaffected. Overlapping
+      // reads with writes needs independent read/write paths and an unambiguous
+      // mem_ready, which is the T3.2 work, not this.
+      // !ldBusy is GONE: the store no longer waits for the operand fetch. That
+      // term was never about the array - it was there because a read line
+      // arriving while dmaBusy was set got dropped by the loader and miscredited
+      // to the store. Separate completions make that impossible.
+      // !dmaBusy stays: still one store at a time.
       is(qCompW)  { when(done && !dmaBusy) { qState := qStore } }
       is(qStore)  { qState := qStoreW }
       // Release the array as soon as the accumulators are DRAINED, not when
@@ -556,29 +829,115 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       // arbitration keeps them from colliding, so the load waits for the port
       // while the rest of its sequencing proceeds.
       is(qStoreW) {
-        when(dmaDone || (dmaBusy && fillLeft === 0.U)) { qState := qIdle }
+        when(dmaDone || (dmaBusy && fillLeft === 0.U)) {
+          // If the next tile's operands are already on their way, go straight to
+          // waiting on that rather than back to idle - qIdle would try to
+          // dequeue a descriptor that has already been consumed.
+          qState := Mux(preBusy, qPreW, qIdle)
+        }
+      }
+      // The overlap payoff lands here: by this point the prefetch has usually
+      // finished during compute or the store, so preDone is already set and this
+      // state costs a single cycle instead of a whole operand fetch.
+      is(qPreW) {
+        when(preDone) {
+          promoteStaged()
+          preBusy := false.B
+          preDone := false.B
+          tryPrefetch()
+          qState := qComp
+        }
       }
     }
+
+    // Latch the prefetch's completion. Sticky, because the completion normally
+    // arrives while the array is still computing or the store is draining - many
+    // cycles before qPreW consumes it.
+    //
+    // ON THE RISING EDGE, which is the whole point. ldDone is NOT a pulse: the
+    // load engine asserts it on completion and clears it only on the next
+    // ldStartAny, so it stays high across the entire gap between one load
+    // finishing and the next starting. preBusy goes high inside that gap - at
+    // qPreIssue, one cycle after qLoadW observed the previous load's ldDone - so
+    // a level-sensitive latch here fired on the PREVIOUS load's completion,
+    // before the prefetch had fetched a single line. qPreW then found preDone
+    // already set, promoted the staged descriptor immediately, and computed the
+    // tile against a B panel that had never been loaded: the whole tile came out
+    // as its cleared accumulator value. That was the 62-of-64 zeros in the first
+    // prefetched tile, and it is why the failure was specific to the first one -
+    // only there does preBusy rise while a stale ldDone is still asserted.
+    val ldDonePrev = RegNext(ldDone, false.B)
+    when(ldDone && !ldDonePrev && preBusy) { preDone := true.B }
 
     val pushA = doWrite && !busy && (waddrWord === 5.U)
     val pushB = doWrite && !busy && (waddrWord === 6.U)
 
+    // DESCRIPTOR STAGING IS NOT GATED ON !busy, deliberately, and this is a fix
+    // rather than an oversight in the other direction.
+    //
+    // These three were originally inside the `!busy` block below alongside the
+    // config registers, but DESC_PUSH (word 20) never was - so a descriptor
+    // pushed while the array was computing committed the PREVIOUS descriptor's
+    // addresses and both read and wrote the wrong buffers, silently. `busy` is
+    // high for the compute phase of every tile (~23% of a tile at dim=8, K=64)
+    // and each of these is an independent ~9.5-cycle AXI write, so the window is
+    // wide open.
+    //
+    // Ungating the staging registers is the right half to change: unlike kLen,
+    // destAddr and the panel selects, these are never read by the running array.
+    // The queue sequencer copies a DEQUEUED descriptor into the config registers,
+    // so the staging copies are dead until a push consumes them. Gating
+    // DESC_PUSH instead would have silently dropped the push and foreclosed
+    // streaming descriptors into a running queue, which is the only way past the
+    // depth-8 batch ceiling.
+    when(doWrite) {
+      when(waddrWord === 17.U) { descA := s_axi_wdata }   // DESC_A_SRC
+      when(waddrWord === 18.U) { descB := s_axi_wdata }   // DESC_B_SRC
+      when(waddrWord === 19.U) { descD := s_axi_wdata }   // DESC_DEST
+    }
+
     when(doWrite && !busy) {
-      when(waddrWord === 2.U)  { kLen := s_axi_wdata(7, 0) }
-      when(waddrWord === 10.U) { destAddr   := s_axi_wdata } // DEST_ADDR
-      when(waddrWord === 11.U) { destStride := s_axi_wdata } // DEST_STRIDE
-      when(waddrWord === 12.U) { aSrcAddr   := s_axi_wdata } // A_SRC_ADDR
-      when(waddrWord === 13.U) { bSrcAddr   := s_axi_wdata } // B_SRC_ADDR
-      when(waddrWord === 14.U) { srcStride  := s_axi_wdata } // SRC_STRIDE
+      // Clamped to maxK. The register map documents "<= maxK" as a caller
+      // constraint, but nothing enforced it and the failure was silent: kSel
+      // wraps, so K_LEN=100 at maxK=64 reads wrapped operand rows and produces
+      // a plausible-looking wrong answer. ldLines right beside this is already
+      // clamped, so this was an inconsistency as much as a hole.
+      when(waddrWord === 2.U) {
+        val kReq = s_axi_wdata(7, 0)
+        // Both copies. On the manual path software writes K_LEN and then drives
+        // the load itself, so the load engine's ldKLen must follow it; only the
+        // descriptor queue ever sets them to different values, and only while a
+        // prefetch is in flight.
+        // kLen is the ARRAY's copy and !busy is the right guard for it.
+        // ldKLen is the LOAD engine's and needs !ldBusy: it feeds ldLines, hence
+        // ldPanelEnd (the load's completion condition), linesPerPanel (hence
+        // mem_req_lines) and burstOK (hence burst mode). The arbiter latches its
+        // own line count at grant, so moving this mid-load makes the two sides
+        // disagree about how many lines are coming - the load then either
+        // finishes early or waits forever for a line nobody asked for.
+        kLen   := Mux(kReq > maxK.U, maxK.U, kReq)
+        when(!ldBusy) { ldKLen := Mux(kReq > maxK.U, maxK.U, kReq) }
+      }
+      // Destination geometry belongs to the store; source geometry to the load.
+      // Each is now held still while its own engine is running, which is the
+      // invariant the split relies on and which !busy alone did not provide -
+      // busy is the ARRAY, and the array is idle for most of a transfer.
+      when(waddrWord === 10.U) { when(!dmaBusy) { destAddr   := s_axi_wdata } }
+      when(waddrWord === 11.U) { when(!dmaBusy) { destStride := s_axi_wdata } }
+      when(waddrWord === 12.U) { when(!ldBusy)  { aSrcAddr   := s_axi_wdata } }
+      when(waddrWord === 13.U) { when(!ldBusy)  { bSrcAddr   := s_axi_wdata } }
+      when(waddrWord === 14.U) { when(!ldBusy)  { srcStride  := s_axi_wdata } }
       when(waddrWord === 22.U) {                      // OUT_CTRL
         outShift := s_axi_wdata(4, 0)
         int8Req  := s_axi_wdata(8)
       }
       when(waddrWord === 15.U) { bPanelUse  := s_axi_wdata(panBits - 1, 0) }
-      when(waddrWord === 16.U) { bPanelLoad := s_axi_wdata(panBits - 1, 0) }
-      when(waddrWord === 17.U) { descA := s_axi_wdata }   // DESC_A_SRC
-      when(waddrWord === 18.U) { descB := s_axi_wdata }   // DESC_B_SRC
-      when(waddrWord === 19.U) { descD := s_axi_wdata }   // DESC_DEST
+      // bPanelLoad picks the row the load's captures are written into, so it
+      // must not move under an in-flight load. bPanelUse above is the array's,
+      // and !busy is correct for that one.
+      when(waddrWord === 16.U) {
+        when(!ldBusy) { bPanelLoad := s_axi_wdata(panBits - 1, 0) }
+      }
       when(waddrWord === 3.U) { loadK := s_axi_wdata(kGrpBits - 1, 0) }
       when(waddrWord === 4.U) {
         loadLane := s_axi_wdata(laneBits - 1, 0)
@@ -635,14 +994,22 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // The sequencer issues the same phase starts software would, so both paths
     // share one implementation rather than duplicating the run logic.
     val startAny = startPulse || (qState === qComp)
+    // SOFT_RST clears the ARRAY here; every other engine is reset at its own
+    // declaration site below, and descQ is flushed via its flush port. See the
+    // note at softRstPulse for why partial coverage was actively harmful.
+    // busy's next value as a named wire. The PE enable replicas below are loaded
+    // from THIS, not from busy, so each replica holds the same value as busy in
+    // the same cycle rather than one cycle behind it.
+    val busyNext = WireDefault(busy)
     when(softRstPulse) {
-      busy := false.B; done := false.B; t := 0.U
+      busyNext := false.B; done := false.B; t := 0.U
     }.elsewhen(startAny) {
-      busy := true.B; done := false.B; t := 0.U
+      busyNext := true.B; done := false.B; t := 0.U
     }.elsewhen(busy) {
-      when(t === lastT) { busy := false.B; done := true.B }
+      when(t === lastT) { busyNext := false.B; done := true.B }
       t := t + 1.U
     }
+    busy := busyNext
 
     // ---- skewed edge feed: row i's k-th value enters at t = k+i ----
     //
@@ -673,9 +1040,29 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
 
     // ---- PE array ----
     val pes = Seq.tabulate(dim, dim)((_, _) => Module(new SystolicPE(8, 32)))
+
+    // ENABLE REPLICATION, one copy per PE. This is a timing fix, and it is the
+    // FPGA critical path: `pe.io.en := busy` put one flop in front of every
+    // enable pin in the array - aReg(8) + bReg(8) + accReg(32) per PE, so
+    // 64 x 48 = 3072 pins - and the router needed 15.582 ns to distribute it
+    // (fanout 2995, zero logic in the path, 85% of a 16.667 ns period).
+    //
+    // Each copy is a REGISTER loaded from busyNext, not a buffer in series with
+    // busy, so all copies change on the same edge and every one is bit-identical
+    // to busy in every cycle. Inserting a pipeline stage instead would delay the
+    // array by a cycle against the skew schedule and silently corrupt results.
+    //
+    // dontTouch keeps the copies from being folded back into one: they are
+    // structurally identical by construction, which is exactly what CSE and
+    // equivalent-register removal look for. If a synthesis run still merges
+    // them, the FPGA flow needs -keep_equivalent_registers (or DONT_TOUCH on
+    // these cells) or the fanout comes straight back.
+    val peEn = Seq.tabulate(dim, dim)((_, _) => RegNext(busyNext, false.B))
+    peEn.foreach(_.foreach(dontTouch(_)))
+
     for (i <- 0 until dim; j <- 0 until dim) {
       val pe = pes(i)(j)
-      pe.io.en       := busy
+      pe.io.en       := peEn(i)(j)
       pe.io.clearAcc := t === (i + j).U
       pe.io.aIn      := (if (j == 0) aEdge(i) else pes(i)(j - 1).io.aOut)
       pe.io.bIn      := (if (i == 0) bEdge(j) else pes(i - 1)(j).io.bOut)
@@ -781,12 +1168,13 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // build's 133 on identical work. Raising maxK must not penalise every run
     // that does not use it.
     val ldLines = if (linesPerLane == 1) 1.U else {
-      val ceilLines = (kLen +& 15.U)(8, 4)               // ceil(kLen/16)
+      // ldKLen, not kLen: the load engine sizes the tile it is FETCHING, which
+      // during a prefetch is not the tile the array is computing.
+      val ceilLines = (ldKLen +& 15.U)(8, 4)             // ceil(ldKLen/16)
       val clamped   = Mux(ceilLines > linesPerLane.U, linesPerLane.U, ceilLines)
       Mux(ceilLines === 0.U, 1.U, clamped)((lplBits + 1) - 1, 0)
     }
 
-    val ldAddr  = RegInit(0.U(32.W))
     val ldReq   = RegInit(false.B)
 
     // Panel / lane / chunk as three explicit counters rather than one flat
@@ -828,7 +1216,12 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     val ldBase       = Mux(ldInB, bSrcAddr, aSrcAddr)
     val ldNextAddr   = ldBase + (ldLane * effSrcStride) + (ldChunk << 4.U)
 
-    val ldStartAny = ldStart || ldStartB || (qState === qLoad)
+    // Deferred prefetch start: the cycle after tryPrefetch latched the load
+    // context, so ldInB/bPanelLoad/ldKLen below sample the prefetched one.
+    when(prePend) { prePend := false.B }
+    preStart := prePend
+
+    val ldStartAny = ldStart || ldStartB || (qState === qLoad) || preStart
     when(ldStartAny) {
       ldBusy  := true.B
       ldDone  := false.B
@@ -838,18 +1231,25 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       // descriptor with bOnly set. The queue used to force a full load
       // unconditionally, so a batch walking one tile ROW re-fetched the same A
       // panel for every tile - half the operand traffic, discarded.
-      val bOnly = (ldStartB && (qState =/= qLoad)) || ((qState === qLoad) && qBOnly)
+      // A queue-driven load - whether the first of a batch (qLoad) or a prefetch
+      // (preStart) - takes bOnly from the descriptor. preStart MUST be included:
+      // without it a prefetched b-only tile would re-fetch the A panel, undoing
+      // the A-reuse saving and, worse, overwriting the resident A panel that the
+      // currently-computing tile is still reading.
+      val fromQueue = (qState === qLoad) || preStart
+      val bOnly = (ldStartB && !fromQueue) || (fromQueue && qBOnly)
       ldBOnly := bOnly
       ldInB   := bOnly
       ldLane  := 0.U
       ldChunk := 0.U
-      ldAddr  := Mux(bOnly, bSrcAddr, aSrcAddr)
       ldReq   := true.B
     }.elsewhen(ldBusy) {
       // mem_ready belongs to whoever owns the port. With a store in flight it
       // is the store's completion, and consuming it here would advance the
       // load by a line it never received.
-      when(mem_ready && !dmaBusy) {
+      // mem_rd_ready is a READ-channel signal: no write completion can reach
+      // here, so there is nothing left to disambiguate.
+      when(mem_rd_ready) {
         // Capture the returned line into its lane. 16 bytes at a time; the
         // buffers are registers precisely so this costs one cycle.
         for (i <- 0 until dim) {
@@ -896,7 +1296,6 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // request presented each cycle already matches the current index. Unlike
     // the result DMA there is no registered mux in this path, so no settle
     // cycle is needed.
-    ldAddr := ldNextAddr
 
     // One outstanding line request at a time, exactly like each cache port on
     // mem_arbiter - so this needs no reordering and no tags.
@@ -991,7 +1390,10 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
       dmaSent    := 0.U
     }.elsewhen(dmaBusy) {
       // mem_ready marks the END of a whole burst, not of a line.
-      when(mem_ready) {
+      // mem_wr_ready is a WRITE-channel signal. This is the half of the double
+      // fault that had no guard at all: a read completion used to land here and
+      // credit dmaSent for a line the store never wrote.
+      when(mem_wr_ready) {
         val nextSent = dmaSent + wBurstLines
         when(nextSent >= nGroupsEff) {
           dmaBusy := false.B
@@ -1029,7 +1431,67 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // which is exactly how the strided pass wrote row 0 correctly and then
     // shifted every row after it by one line.
     // Also drained while idle so a run never inherits the previous run's tail.
-    lineFifo.io.deq.ready := mem_wnext || (dmaBusy && mem_ready) || !dmaBusy
+    lineFifo.io.deq.ready := mem_wnext || (dmaBusy && mem_wr_ready) || !dmaBusy
+
+    // ---- SOFT_RST: clear EVERY engine, not just the array ----
+    //
+    // Placed here, after all engine logic, so Chisel's last-connect semantics
+    // make it authoritative over whatever each engine's own state machine
+    // decided this cycle. Splitting it across the engines would reintroduce
+    // exactly the bug below the moment someone adds a new one.
+    //
+    // It used to clear only busy/done/t. Everything else kept running, and the
+    // consequence was not a stuck accelerator but a FALSE SUCCESS on the next
+    // batch: the driver's timeout writes SOFT_RST
+    // (gemm_rv32_5stage.c), the abandoned batch keeps DMA-writing into a dest
+    // buffer the caller is now free to reuse, the next gemm_submit cannot start
+    // because qStartPulse requires !qBusy, and then a late qDone from the
+    // abandoned batch satisfies the NEW batch's semaphore. The caller reads a
+    // buffer nothing wrote and is told it succeeded. A recovery path that does
+    // that is worse than no recovery path.
+    //
+    // descQ is flushed through its flush port rather than cleared here, because
+    // a Queue's pointers are internal.
+    descQ.io.flush.get := softRstPulse
+
+    when(softRstPulse) {
+      qRun     := false.B
+      qBusy    := false.B
+      qDone    := false.B
+      qState   := qIdle
+      ldBusy   := false.B
+      ldDone   := false.B
+      dmaBusy  := false.B
+      dmaDone  := false.B
+      fillLeft := 0.U
+      // Drop a stale overflow report too: it describes the batch being
+      // abandoned, not the next one.
+      qOverflow := false.B
+      // And the prefetch bookkeeping, or the next batch would enter qPreW
+      // waiting on a load belonging to the batch that was just abandoned.
+      preBusy := false.B
+      preDone := false.B
+      // prePend is the one that actually matters here. It self-clears one cycle
+      // later, and that cycle asserts preStart - so a SOFT_RST landing while it
+      // is set launches a load for the descriptor that was just abandoned, using
+      // register state belonging to a batch that no longer exists.
+      prePend := false.B
+      // dmaSent is belt-and-braces, NOT a bug fix, and the distinction is worth
+      // recording because it was briefly claimed as one. It is already cleared
+      // unconditionally by the dmaStartAny block below, so a value surviving this
+      // reset is wiped before the next store can read it. It is cleared here only
+      // so that the reset leaves no engine showing the abandoned batch's state.
+      dmaSent := 0.U
+      // The rest are re-initialised at their engine's next start, so they cannot
+      // corrupt anything. They are cleared because a waveform taken after a
+      // SOFT_RST is far harder to read when half the engine still shows the
+      // abandoned batch's state.
+      ldReq   := false.B
+      ldInB   := false.B
+      ldLane  := 0.U
+      ldChunk := 0.U
+      fillGrp := 0.U
+    }
 
     // Both engines share one line port. Mutual exclusion is enforced at the
     // START gates above - each requires the other engine idle - so at most one
@@ -1044,16 +1506,23 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     // They cannot share the port, so the DMA holds it for the WHOLE
     // transaction - gated on dmaBusy, not dmaDrive, since a momentarily empty
     // FIFO must not hand the port to the load mid-burst.
-    val ldDrive  = ldBusy && ldReq && !dmaBusy
-    mem_req_valid := dmaDrive || ldDrive
-    mem_req_write := dmaBusy                           // loads are reads
+    // !dmaBusy is GONE - this is the term that actually cost the overlap. The
+    // load may now present its request while a store is in flight; the arbiter
+    // and the AXI engine carry them on independent channels.
+    val ldDrive  = ldBusy && ldReq
+    // Each channel's address, length and data are now selected by the engine
+    // that owns them, rather than by dmaBusy steering one shared set. There is
+    // deliberately no `Mux(valid, ..., 0.U)` here: an idle channel's fields are
+    // simply not sampled, because its valid is low.
+    mem_rd_req_valid := ldDrive
+    mem_wr_req_valid := dmaDrive
     // A burst addresses the PANEL BASE and covers linesPerPanel lines; the
     // per-line path addresses each line individually with a length of 1.
-    mem_req_addr  := Mux(dmaBusy, dmaAddr,
-                         Mux(burstOK, panelBase, ldNextAddr))
+    mem_wr_req_addr := dmaAddr
+    mem_rd_req_addr := Mux(burstOK, panelBase, ldNextAddr)
     mem_wline     := lineFifo.io.deq.bits
-    mem_req_lines := Mux(dmaBusy, wBurstLines,
-                         Mux(burstOK, linesPerPanel, 1.U))
+    mem_wr_req_lines := wBurstLines
+    mem_rd_req_lines := Mux(burstOK, linesPerPanel, 1.U)
 
 
     // ---- read mux ----
@@ -1087,7 +1556,8 @@ class MmAccel(val dim: Int = 2, val maxK: Int = 16, val bPanels: Int = 4,
     val results   = rowSelReg(resRow)
     val rdata     = WireDefault(0.U(32.W))
     switch(raddrWord) {
-      is(1.U)  { rdata := Cat(0.U(24.W), qDone, qBusy, ldDone, ldBusy,
+      is(1.U)  { rdata := Cat(0.U(23.W), qOverflow,
+                              qDone, qBusy, ldDone, ldBusy,
                               dmaDone, dmaBusy, done, busy) }
       is(10.U) { rdata := destAddr }
       is(11.U) { rdata := destStride }

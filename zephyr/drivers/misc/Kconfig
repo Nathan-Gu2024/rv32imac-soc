@@ -1,0 +1,29 @@
+# Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+# INT8 systolic GEMM accelerator (src/mm_accel.v).
+# SPDX-License-Identifier: Apache-2.0
+
+config GEMM_RV32_5STAGE
+	bool "RV32 5-stage INT8 GEMM accelerator"
+	default y
+	depends on DT_HAS_RV32_5STAGE_GEMM_ENABLED
+	select CACHE_MANAGEMENT
+	help
+	  Driver for the Chisel-generated systolic-array GEMM accelerator.
+	  Submits descriptor batches, blocks on a semaphore released by the
+	  batch-completion interrupt rather than spinning on STATUS, and
+	  serialises threads with a mutex.
+
+	  CACHE_MANAGEMENT is required, not optional: the accelerator's DMA
+	  moves operands and results over mem_arbiter's third port, behind the
+	  write-back D-cache, so the driver must flush operands before a batch
+	  and displace destinations after it. Without a working cache backend
+	  the results a thread reads back are whatever the cache happened to
+	  hold.
+
+config GEMM_RV32_5STAGE_INIT_PRIORITY
+	int "Init priority"
+	default 60
+	depends on GEMM_RV32_5STAGE
+	help
+	  Must be after the interrupt controller, since init calls
+	  irq_enable_next_level() on it.

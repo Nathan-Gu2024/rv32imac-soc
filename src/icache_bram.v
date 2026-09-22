@@ -1,3 +1,6 @@
+`ifndef _ICACHE_BRAM_V_
+`define _ICACHE_BRAM_V_
+
 `timescale 1ns/1ps
 
 // BRAM-backed direct-mapped instruction cache.
@@ -16,6 +19,35 @@
 // edge that pc advances to that address, and the data is already sitting
 // there, readable combinationally, on the cycle it's needed. Hits cost
 // zero extra cycles.
+//
+// WHAT THE ZERO-CYCLE HIT COSTS: the array address is data-dependent on the
+// instruction currently being fetched, so it closes a combinational loop through
+// the fetch path in a single cycle. Since 2026-09-20 this is the design's
+// critical path on the Zynq build, at +0.726 ns of 16.667 ns:
+//
+//   TCM BRAM read                      2.125 ns
+//   instruction assembly + RVC          ~0.7     (inst_out[*], 5 LUT levels)
+//   branch decode + PHT lookup          ~0.5     (predicted_taken, ghr)
+//   branch/JAL target adder             0.343    (CARRY4; b_imm and j_imm sums
+//                                                 run in PARALLEL and the mux
+//                                                 sits after them - see cpu.v)
+//   next-PC mux -> I-cache index adder  ~0.6     (CARRY4 x2 -> esel)
+//   ... into this module's ADDRBWRADDR
+//
+// Two things are worth knowing before trying to shorten it.
+//
+// It is ROUTING-dominated, not logic-dominated: 9.686 ns of the 14.949 ns
+// datapath is net delay across 12 nets, against 5.263 ns of BRAM and LUT/carry
+// delay. The path starts at RAMB36_X4Y6 (TCM) and ends at RAMB36_X3Y9 (this
+// cache) via ten slices scattered between X54 and X75. So logic-level
+// micro-optimisation buys much less here than placement does; a pblock holding
+// the TCM, this cache and the fetch/predict cluster together is the first lever.
+//
+// And the adder-before-mux trick is ALREADY applied on the target path
+// (cpu.v's if_pc_plus_b_imm / if_pc_plus_j_imm), so that particular win is spent.
+// What remains structural is the loop itself: removing it means a second fetch
+// stage, which buys timing back at the cost of a bubble on every taken branch -
+// the exact trade this design made in the other direction on purpose.
 //
 // This distinction is load-bearing, not incidental: tcm.v registers its
 // i_ready and therefore charges 1 cycle on EVERY access, which is exactly
@@ -322,3 +354,5 @@ module icache_bram #(
     assign mem_req_addr  = miss_addr_q;
 
 endmodule
+
+`endif // _ICACHE_BRAM_V_

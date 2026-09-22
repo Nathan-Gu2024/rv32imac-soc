@@ -1,3 +1,6 @@
+`ifndef _CSR_FILE_V_
+`define _CSR_FILE_V_
+
 module csr_file (
     input wire clk,
     input wire rst,
@@ -14,6 +17,11 @@ module csr_file (
     output reg [31:0] csr_rdata,
 
     // Hardware (Trap Controller)
+    // Value to latch into mtval when trap_taken fires: the offending
+    // instruction word for an illegal instruction, the offending address for
+    // a misaligned access, and 0 for interrupts and ECALL (which carry no
+    // extra information). Driven by trap_controller alongside trap_cause.
+    input wire [31:0] trap_val,
     input wire trap_taken, // High when a hardware interrupt/exception occurs
     input wire [31:0] trap_pc, // pc of the interrupted instruction
     input wire [31:0] trap_cause, // reason for trap
@@ -41,6 +49,7 @@ module csr_file (
     reg [31:0] mtvec;
     reg [31:0] mepc;
     reg [31:0] mcause;
+    reg [31:0] mtval;
     reg [31:0] mie;
 
     // Route critical registers continuously to the hardware trap controller
@@ -64,6 +73,7 @@ module csr_file (
             12'h305: csr_rdata = mtvec;
             12'h341: csr_rdata = mepc;
             12'h342: csr_rdata = mcause;
+            12'h343: csr_rdata = mtval;
             12'h344: csr_rdata = mip;
             default: csr_rdata = 32'b0; // Unknown CSR reads as 0
         endcase
@@ -76,12 +86,14 @@ module csr_file (
             mtvec <= 32'b0;
             mepc <= 32'b0;
             mcause <= 32'b0;
+            mtval <= 32'b0;
             mie <= 32'b0;
         end else begin
             // HW trap handler -> HW automatically overwrites mepc and mcause when a trap fires
             if (trap_taken) begin
                 mepc <= trap_pc;
                 mcause <= trap_cause;
+                mtval <= trap_val;
                 // Disable global interrupts (MIE bit is bit 3) by moving it to MPIE (bit 7)
                 mstatus[7] <= mstatus[3];
                 mstatus[3] <= 1'b0;
@@ -116,8 +128,15 @@ module csr_file (
                         mcause <= (csr_op == 2'b01) ? actual_wdata : 
                                     (csr_op == 2'b10) ? (mcause | actual_wdata) : 
                                     (mcause & ~actual_wdata);
+
+                    12'h343: 
+                        mtval <= (csr_op == 2'b01) ? actual_wdata : 
+                                    (csr_op == 2'b10) ? (mtval | actual_wdata) : 
+                                    (mtval & ~actual_wdata);
                 endcase
             end
         end
     end
 endmodule
+
+`endif // _CSR_FILE_V_

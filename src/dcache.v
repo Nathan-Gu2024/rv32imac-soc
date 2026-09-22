@@ -1,3 +1,6 @@
+`ifndef _DCACHE_V_
+`define _DCACHE_V_
+
 `timescale 1ns/1ps
 
 // Data-side memory front end: routes a request either to the TCM (direct,
@@ -103,3 +106,5 @@ module dcache #(
     assign cpu_ready = cpu_addr_is_tcm ? tcm_ready : bram_ready;
 
 endmodule
+
+`endif // _DCACHE_V_

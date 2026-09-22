@@ -1,3 +1,6 @@
+`ifndef _UART_MMIO_V_
+`define _UART_MMIO_V_
+
 module uart_mmio #(
     // MUST match the actual PL clock (PS7 FCLK_CLK0). The TX/RX bit
     // divisors are CLK_FREQ/BAUD_RATE, so if this disagrees with the real
@@ -136,3 +139,5 @@ module uart_mmio #(
         end
     end
 endmodule
+
+`endif // _UART_MMIO_V_

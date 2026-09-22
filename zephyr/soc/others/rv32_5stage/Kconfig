@@ -8,6 +8,13 @@ config SOC_RV32_5STAGE
 	select RISCV_ISA_EXT_C
 	select RISCV_ISA_EXT_ZICSR
 	select INCLUDE_RESET_VECTOR
+	# dcache.v / dcache_bram.v: 16 KB direct-mapped write-back on FPGA,
+	# 8 KB in SRAM macros on ASIC. Selected so CONFIG_DCACHE becomes
+	# available and the cache API can dispatch; CPU_HAS_ICACHE is
+	# deliberately NOT selected, because icache_bram.v has no CPU-side
+	# write path and so no way to invalidate - claiming otherwise would let
+	# Zephyr believe i-cache maintenance works.
+	select CPU_HAS_DCACHE
 
 if SOC_RV32_5STAGE
 

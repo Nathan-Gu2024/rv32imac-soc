@@ -1,3 +1,6 @@
+`ifndef _UART_TX_V_
+`define _UART_TX_V_
+
 module uart_tx #(
     parameter CLK_FREQ = 50_000_000,  
     parameter BAUD_RATE = 115200      // Standard PC terminal speed
@@ -86,3 +89,5 @@ module uart_tx #(
         end
     end
 endmodule
+
+`endif // _UART_TX_V_

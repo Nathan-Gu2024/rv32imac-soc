@@ -1,3 +1,6 @@
+`ifndef _ALU_V_
+`define _ALU_V_
+
 module alu (
     input wire [31:0] a, b,
     input wire [4:0] alu_sel,
@@ -75,3 +78,4 @@ module alu (
 
 endmodule
 
+`endif // _ALU_V_

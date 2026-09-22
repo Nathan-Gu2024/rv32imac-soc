@@ -1,0 +1,34 @@
+description: |
+  INT8 systolic-array GEMM accelerator (chisel/src/MmAccel.scala, emitted as
+  src/mm_accel.v). A constant-size 23-word AXI4-Lite register window in a
+  0x100-byte block; geometry (dim, maxK, bPanels) is fixed at Chisel
+  elaboration and is read back from the INFO register at word 9, so software
+  does not hardcode it.
+
+  The window is control only. Operands and results move over mem_arbiter's
+  third 128-bit port straight to DRAM, BEHIND the write-back D-cache, so a
+  driver must flush before the accelerator reads operands and invalidate
+  before the CPU reads results - see drivers/cache/cache_rv32_5stage.c.
+
+  Two interrupt sources on the parent rv32_5stage,intc:
+
+    batch  qDone   - a queued descriptor batch finished (CTRL bit5). Asserts
+                     ONCE per batch regardless of how many tiles it held.
+    dma    dmaDone - a result store finished. During a queued batch the
+                     sequencer restarts the store per tile, so this asserts
+                     once per TILE; leave it masked in queue mode.
+
+  Both are sticky levels rather than pulses: the underlying DONE bit is
+  cleared only by the next kick of that engine, which presents exactly one
+  rising edge per completion to the edge-capturing aggregator.
+
+compatible: "rv32_5stage,gemm"
+
+include: [base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true

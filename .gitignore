@@ -28,6 +28,7 @@ Thumbs.db
 *~
 
 *.png
+*.sh
 # Build artifacts - regenerate with fpga/coremark/build.sh and the
 # per-test build steps described in the README.
 Testbenches/build_*/
@@ -48,8 +49,9 @@ chisel/out/
 .bloop/
 .metals/
 .bsp/
-
 # Accelerator simulation artifacts
 Testbenches/*.vvp
 Testbenches/sim_*
 !Testbenches/sim_*.v
+
+scripts/

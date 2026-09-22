@@ -2,3 +2,19 @@ name: rv32_5stage
 build:
   cmake: .
   kconfig: Kconfig
+  # Declare the board, SoC and devicetree-binding roots here rather than
+  # relying on the caller passing -DBOARD_ROOT/-DSOC_ROOT/-DDTS_ROOT. With
+  # ZEPHYR_EXTRA_MODULES alone the drivers build but the board is
+  # undiscoverable, and the failures name neither the missing root nor the
+  # flag: first "No board named 'rv32_5stage' found", then, once the board is
+  # found, "interrupt controller ... lacks binding" - which looks like a
+  # broken devicetree rather than an unset DTS_ROOT.
+  #
+  # All three are relative to this module; Zephyr appends boards/, soc/ and
+  # dts/bindings/ itself. A build now needs only:
+  #   west build -b rv32_5stage/rv32_5stage <app> \
+  #        -- -DZEPHYR_EXTRA_MODULES=<repo>/zephyr
+  settings:
+    board_root: .
+    soc_root: .
+    dts_root: .

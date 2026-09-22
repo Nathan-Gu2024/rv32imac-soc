@@ -1,3 +1,6 @@
+`ifndef _ICACHE_V_
+`define _ICACHE_V_
+
 `timescale 1ns/1ps
 
 // Instruction-fetch front end: routes a fetch either to the TCM boot RAM
@@ -100,3 +103,5 @@ module icache #(
     assign cpu_ready = req_is_tcm ? tcm_ready : bram_ready;
 
 endmodule
+
+`endif // _ICACHE_V_

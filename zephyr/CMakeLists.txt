@@ -6,3 +6,5 @@
 
 add_subdirectory(drivers/serial)
 add_subdirectory(drivers/interrupt_controller)
+add_subdirectory(drivers/cache)
+add_subdirectory(drivers/misc)

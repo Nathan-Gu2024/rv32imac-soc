@@ -1,3 +1,6 @@
+`ifndef _CPU_V_
+`define _CPU_V_
+
 `include "../src/regfile.v"
 `include "../src/alu.v"
 `include "../src/div_unit.v"
@@ -56,12 +59,22 @@ module cpu_pipelined #(
     // configuration, against +86% cycles at the 256B/256B geometry the
     // flip-flop ASIC build was forced to use - which is why both caches are
     // worth moving to macros, not just the D-cache.
-    parameter IC_USE_SRAM = 0
+    parameter IC_USE_SRAM = 0,
+    // Cycles of UNBROKEN global_mem_stall before the machine is declared
+    // wedged. This has to clear the longest LEGITIMATE stall by a wide
+    // margin, and that is not a cache miss - it is the I-cache reset sweep,
+    // which holds imem_stall for IC_NUM_SETS cycles (2048 by default, 512 on
+    // ASIC). 65535 is ~32x that and ~1.1 ms at 60 MHz, so a real hang is
+    // still caught promptly.
+    parameter STALL_WATCHDOG_LIMIT = 16'hFFFF
 ) (
     input wire clk, rst,
     output wire uart_tx,
     input wire uart_rx,
-    output reg [3:0] leds,
+    // Software-written, except that the stall watchdog overrides all four
+    // when it fires - see the watchdog below. Same 4-bit port either way, so
+    // no pin assignment changes.
+    output wire [3:0] leds,
 
     output wire [31:0] icache_mem_req_addr,
     output wire icache_mem_req_valid,
@@ -79,18 +92,31 @@ module cpu_pipelined #(
     input wire [127:0] dcache_mem_read_data_block,
     input wire dcache_mem_ready,
 
-    // mm_accel result-DMA port, third requester on mem_arbiter alongside the
-    // two caches. The accelerator drains its accumulators here as 128-bit
-    // lines rather than through its 32-bit AXI4-Lite register window, which
-    // measured 70% of GEMM runtime at DIM=16.
-    output wire accel_mem_req_valid,
-    output wire accel_mem_req_write,
-    output wire [31:0] accel_mem_req_addr,
-    output wire [7:0] accel_mem_req_lines,
-    output wire [127:0] accel_mem_wline,
-    input wire accel_mem_ready,
-    input wire accel_mem_wnext,
+    // mm_accel memory port, SPLIT into independent read and write channels.
+    // The accelerator moves 128-bit lines here rather than through its 32-bit
+    // AXI4-Lite register window, which measured 70% of GEMM runtime at DIM=16.
+    //
+    // Two channels rather than one because a single completion carried no
+    // direction, so each engine had to infer it - and a read line arriving
+    // during a store was both dropped by the loader and miscredited to the
+    // store. The completion semantics are asymmetric and that is part of the
+    // contract: READ completes one LINE at a time, WRITE once per TRANSACTION.
+    //
+    // Wire these either to mem_arbiter_rw (which takes them directly) or to
+    // accel_port_join, which re-serialises them onto the older single-port
+    // mem_arbiter. fpga_top selects between the two.
+    output wire accel_mem_rd_req_valid,
+    output wire [31:0] accel_mem_rd_req_addr,
+    output wire [7:0] accel_mem_rd_req_lines,
+    input wire accel_mem_rd_ready,
     input wire [127:0] accel_mem_rline,
+
+    output wire accel_mem_wr_req_valid,
+    output wire [31:0] accel_mem_wr_req_addr,
+    output wire [7:0] accel_mem_wr_req_lines,
+    output wire [127:0] accel_mem_wline,
+    input wire accel_mem_wnext,
+    input wire accel_mem_wr_ready,
 
     // debug (ILA probes; debug_pc/debug_instr are the ID-stage pc/inst,
     // debug_raw_pc is one stage earlier - the raw IF-stage fetch)
@@ -191,6 +217,12 @@ module cpu_pipelined #(
     // ID/EX
     wire id_ex_compressed;
     wire id_ex_valid;
+    // Carried on to MEM and WB so a precise exception can tell a real
+    // instruction from a flush-inserted bubble, and so minstret can count
+    // retirements rather than register writes. Unused until then; see
+    // ex_mem_reg / mem_wb_reg for why only the former takes a flush.
+    (* mark_debug = "true" *) wire ex_mem_valid;
+    (* mark_debug = "true" *) wire mem_wb_valid;
     wire id_ex_predicted_taken;
     wire [31:0] id_ex_predicted_target;
     wire [31:0] id_ex_pc;
@@ -225,6 +257,7 @@ module cpu_pipelined #(
     wire [31:0] mtvec_out;
     wire [31:0] mepc_out;
     wire [31:0] trap_cause;
+    wire [31:0] trap_val;
     wire [31:0] trap_pc;
     wire [31:0] trap_target_pc;
     wire [31:0] actual_ex_result;
@@ -488,6 +521,34 @@ module cpu_pipelined #(
 
     assign global_mem_stall = dmem_stall | imem_stall | div_stall | uart_stall | intc_stall | amo_stall | accel_stall;
 
+    // ---- stall-progress watchdog ----
+    //
+    // global_mem_stall freezes the entire pipeline and seven independent
+    // sources can assert it. This design has already shipped one livelock
+    // where two of them re-armed out of phase and the stall never cleared -
+    // the comment block above the uart/intc/accel handshakes records it - and
+    // every hang of that class presents identically: the board goes quiet
+    // with no output, no trace, and nothing to bisect but bitstreams.
+    //
+    // This counts cycles of unbroken stall and latches a sticky flag past
+    // STALL_WATCHDOG_LIMIT. It cannot fix a hang; it makes one legible. A
+    // single cycle of forward progress resets the count, so no legitimate
+    // stall - however long - can trip it as long as the machine is advancing.
+    (* mark_debug = "true" *) reg [15:0] stall_watchdog;
+    (* mark_debug = "true" *) reg        stall_hung;
+    always @(posedge clk) begin
+        if (rst) begin
+            stall_watchdog <= 16'd0;
+            stall_hung     <= 1'b0;
+        end else if (!global_mem_stall) begin
+            stall_watchdog <= 16'd0;
+        end else if (stall_watchdog < STALL_WATCHDOG_LIMIT[15:0]) begin
+            stall_watchdog <= stall_watchdog + 16'd1;
+        end else begin
+            stall_hung <= 1'b1;
+        end
+    end
+
     // TCM
     wire tcm_i_req, tcm_i_ready;
     wire [31:0] tcm_i_addr, tcm_i_rdata;
@@ -702,7 +763,18 @@ module cpu_pipelined #(
     end
 
     always @(posedge clk) begin
-        if (id_ex_is_branch) begin
+        // !global_mem_stall is required, not cosmetic. global_mem_stall FREEZES
+        // id_ex_reg, and id_ex_is_branch is combinational off id_ex_inst, so a
+        // branch held in EX for N stall cycles applied the increment N times. A
+        // 2-bit saturating counter rails in two steps, which destroys the
+        // hysteresis that is the entire point of it and degrades that entry to a
+        // 1-bit predictor. Reachable from uart_stall (hundreds of cycles at
+        // 115200), dmem/imem_stall, amo_stall, accel_stall and div_stall.
+        //
+        // id_ex_valid is belt-and-braces: a bubble's inst is 0x13, so
+        // id_ex_is_branch is already 0 for it, but the PHT should not depend on
+        // what a flushed slot happens to decode to.
+        if (id_ex_is_branch && id_ex_valid && !global_mem_stall) begin
             if (branch_actual_taken)
                 pht[id_ex_pht_index] <= (pht[id_ex_pht_index] == 2'b11) ? 2'b11 : pht[id_ex_pht_index] + 2'b01;
             else
@@ -765,7 +837,27 @@ module cpu_pipelined #(
     program_counter PC (
         .clk(clk),
         .rst(rst),
-        .stall(stall | global_mem_stall),
+        // ~pc_trap_override on the load-use stall ONLY. program_counter
+        // resolves its own inputs as (stall ? pc : next_pc), i.e. the freeze
+        // sits ABOVE pc_sel - so the priority comment above was wrong about
+        // the one case where the two collide, and a trap redirect was being
+        // silently discarded.
+        //
+        // Faults are gated on !global_mem_stall but NOT on !stall, so a
+        // misaligned load whose result is consumed by the next instruction
+        // raises its fault on a cycle when stall is also 1. Everything else
+        // about the trap worked - mcause/mepc/mtval were latched and all three
+        // flushes fired - but the PC held instead of taking mtvec, so the
+        // handler never ran and execution resumed straight past the fault.
+        // Precisely the case tb_cpu_trap.v could not see: it polls
+        // DUT.CSR.mcause, which trap_taken sets whether or not control
+        // transfers. See test_trap.c / tb_echo_ddr.v.
+        //
+        // global_mem_stall stays ungated: interrupts are already qualified
+        // with ~global_mem_stall & ~stall (:1248-1249) and faults with
+        // !global_mem_stall, so pc_trap_override provably never coincides with
+        // it, and a real memory stall must never release the PC.
+        .stall((stall & ~pc_trap_override) | global_mem_stall),
         .pc_sel(actual_pc_sel),
         .mem_address(actual_jump_target),
         .pc_inc(pc_inc),
@@ -801,6 +893,9 @@ module cpu_pipelined #(
     assign debug_cache_ready = cache_ready;
 
     // ID
+    wire illegal_inst;
+    wire id_ex_illegal;
+
     control_logic CL (
         .inst(if_id_inst),
         .reg_wen(reg_wen),
@@ -817,7 +912,8 @@ module cpu_pipelined #(
         .csr_wen(csr_wen),
         .csr_op(csr_op),
         .csr_use_imm(csr_use_imm),
-        .csr_uimm(csr_uimm)
+        .csr_uimm(csr_uimm),
+        .illegal_inst(illegal_inst)
     );
 
     regfile RF (
@@ -864,6 +960,7 @@ module cpu_pipelined #(
         .is_amo_in(is_amo),
         .atomic_op_in(atomic_op),
         .csr_wen_in(csr_wen),
+        .illegal_in(illegal_inst),
         .csr_op_in(csr_op),
         .csr_use_imm_in(csr_use_imm),
         .csr_uimm_in(csr_uimm),
@@ -873,6 +970,7 @@ module cpu_pipelined #(
         .is_amo_out(id_ex_is_amo),
         .atomic_op_out(id_ex_atomic_op),
         .csr_wen_out(id_ex_csr_wen),
+        .illegal_out(id_ex_illegal),
         .csr_op_out(id_ex_csr_op),
         .csr_use_imm_out(id_ex_csr_use_imm),
         .csr_uimm_out(id_ex_csr_uimm),
@@ -928,6 +1026,32 @@ module cpu_pipelined #(
     // could specialize on its own.
     wire [31:0] redirect_target_adder = alu_a + alu_b;
 
+    // ---- misaligned data-address detection (EX) ----
+    //
+    // Reuses redirect_target_adder rather than adding a second adder: for a
+    // load or store a_sel picks rs1 and b_sel picks the immediate, and the
+    // control word decodes alu_sel=add, so this IS the effective address.
+    // Only two of its bits and a funct3 compare are new logic on that path.
+    //
+    // partial_load.v and partial_store.v have no alignment check of their
+    // own, so before this a misaligned lw silently returned the wrong word.
+    wire        ex_op_load   = (id_ex_inst[6:0] == 7'b0000011);
+    wire        ex_op_store  = (id_ex_inst[6:0] == 7'b0100011);
+    wire        ex_op_atomic = (id_ex_inst[6:0] == 7'b0101111);
+    wire [1:0]  ex_acc_size  = id_ex_inst[13:12];   // funct3[1:0]
+    wire [31:0] ex_data_addr = redirect_target_adder;
+
+    // 00 byte (always aligned), 01 halfword, 10 word. Atomics are word-only.
+    wire ex_size_misaligned = (ex_acc_size == 2'b01) ? ex_data_addr[0] :
+                              (ex_acc_size == 2'b10) ? (|ex_data_addr[1:0]) :
+                                                       1'b0;
+
+    wire ex_misalign_load  = ex_op_load  && ex_size_misaligned;
+    // LR/SC and every AMO are word accesses and must be word-aligned; the
+    // spec reports them as store/AMO faults regardless of direction.
+    wire ex_misalign_store = (ex_op_store && ex_size_misaligned) ||
+                             (ex_op_atomic && (|ex_data_addr[1:0]));
+
     alu ALU (
         .a(alu_a),
         .b(alu_b),
@@ -952,10 +1076,29 @@ module cpu_pipelined #(
     wire div_start = is_div_op && !div_busy && !div_done && !div_result_ready;
     wire div_stall = is_div_op && !div_result_ready;
 
+    // Cleared on RETIREMENT, not on operand type.
+    //
+    // `else if (!is_div_op)` was wrong and silently returned the previous
+    // divide's result for any two adjacent divide-class instructions. The
+    // always block samples the OUTGOING instruction, so on the edge where
+    // divide #1 leaves EX and divide #2 enters, is_div_op is still 1 and the
+    // clear never happened. Divide #2 then saw div_result_ready=1, so div_stall
+    // and div_start were both 0 - it never started, and ex_result handed MEM the
+    // stale div_quotient/div_remainder.
+    //
+    // It hid because GCC's divmod idiom is `div rq,a,b; rem rr,a,b` on the SAME
+    // operands and div_unit computes both in one pass, so the stale registers
+    // held the right answer. Testbenches/tb_cpu_b2b.v covers both that case and
+    // the one that breaks.
+    //
+    // !global_mem_stall is the retirement condition: while it is high the divide
+    // is still in EX and still needs its result, so the flag must persist. A
+    // load-use `stall` cannot occur here (it requires a load in EX), so it plays
+    // no part.
     always @(posedge clk) begin
         if (rst) div_result_ready <= 1'b0;
         else if (div_done) div_result_ready <= 1'b1;
-        else if (!is_div_op) div_result_ready <= 1'b0;
+        else if (div_result_ready && !global_mem_stall) div_result_ready <= 1'b0;
     end
 
     div_unit DIV (
@@ -1032,9 +1175,23 @@ module cpu_pipelined #(
     // general ALU's case-select mux on this timing-critical path - see
     // redirect_target_adder's declaration above.
     assign id_ex_pc_plus_inc = id_ex_pc + (id_ex_compressed ? 32'd2 : 32'd4);
+    // Bit 0 forced to 0: RISC-V defines the JALR target as (rs1+imm) & ~1.
+    //
+    // Masking the whole expression rather than just the JALR arm costs one less
+    // mux and changes nothing else - JAL and branch immediates have bit 0 clear
+    // by encoding, and an instruction address is always at least 2-byte aligned,
+    // so bit 0 of those sums is already 0.
+    //
+    // Without this the machine did NOT execute garbage: tcm.v:101/108 and the
+    // I-cache index by [..:2] and bit 1 only, so bit 0 never reaches the array
+    // and the correct instruction is still fetched. What it did was leave every
+    // subsequent PC odd, which corrupts mepc on a later trap and every auipc or
+    // PC-relative result from then on. Testbenches/tb_cpu_b2b.v checks PC parity
+    // after a jalr to a deliberately odd target.
     assign ex_redirect_target =
-        (id_ex_is_jal | id_ex_is_jalr | branch_actual_taken) ? redirect_target_adder
-                                                               : id_ex_pc_plus_inc;
+        ((id_ex_is_jal | id_ex_is_jalr | branch_actual_taken)
+            ? redirect_target_adder
+            : id_ex_pc_plus_inc) & 32'hFFFF_FFFE;
 
     // Speculative dcache index: the address MEM will present next cycle.
     // Only the low DC_SPEC_W bits ever reach the array address pins, so
@@ -1057,16 +1214,48 @@ module cpu_pipelined #(
 
     wire id_ex_mem_read = (id_ex_wb_sel == 2'b00) && id_ex_reg_wen;
 
+    // Which register fields the ID-stage instruction actually reads.
+    //
+    // Decoded from the 5-bit opcode of the EXPANDED instruction - if_id_inst is
+    // post-rvc_expansion (muxed_if_inst), so this is valid for compressed code
+    // too, which matters because CoreMark is built with RVC. Same signal the
+    // existing if_is_branch/if_is_jal decode keys off.
+    //
+    // Deliberately CONSERVATIVE where a field's use is ambiguous: SYSTEM keeps
+    // rs1_used=1 even though the csrrwi/csrrsi/csrrci forms put a uimm in that
+    // field, and FENCE keeps it although it reads nothing. An unnecessary stall
+    // costs a cycle; a missed dependence costs a wrong answer, so the asymmetry
+    // decides the default.
+    wire [4:0] if_id_opc = if_id_inst[6:2];
+
+    // rs2 is a register only in R-type, stores, branches and atomics. For LR the
+    // rs2 field must be zero and is not read, but grouping it with the other
+    // atomics is the conservative side of that line.
+    wire if_id_rs2_used = (if_id_opc == 5'b01100) ||   // OP      (R-type)
+                          (if_id_opc == 5'b01000) ||   // STORE
+                          (if_id_opc == 5'b11000) ||   // BRANCH
+                          (if_id_opc == 5'b01011);     // AMO / LR / SC
+
+    // rs1 is a register everywhere except the two U-types and JAL, where both
+    // fields are immediate payload - which is why those had two chances each to
+    // collide.
+    wire if_id_rs1_used = !((if_id_opc == 5'b11011) ||  // JAL
+                            (if_id_opc == 5'b01101) ||  // LUI
+                            (if_id_opc == 5'b00101));   // AUIPC
+
     hazard_unit HU (
         .id_ex_mem_read(id_ex_mem_read),
         .id_ex_rd(id_ex_rd),
         .id_ex_wb_sel(id_ex_wb_sel),
         .if_id_rs1(if_id_inst[19:15]),
         .if_id_rs2(if_id_inst[24:20]),
+        .if_id_rs1_used(if_id_rs1_used),
+        .if_id_rs2_used(if_id_rs2_used),
         .ex_mem_rd(ex_mem_rd),
         .mem_wb_rd(mem_wb_rd),
         .ex_mem_reg_wen(ex_mem_reg_wen),
         .mem_wb_reg_wen(mem_wb_reg_wen),
+        .ex_mem_wb_sel(ex_mem_wb_sel),
         .id_ex_rs1(id_ex_inst[19:15]),
         .id_ex_rs2(id_ex_inst[24:20]),
         .pc_sel(pc_sel),
@@ -1095,12 +1284,37 @@ module cpu_pipelined #(
     trap_controller TRAP_CTRL (
         .ex_pc(id_ex_pc),
         .ex_inst(id_ex_inst),
+        // A bubble carries inst=0, which is itself an illegal encoding, so
+        // the fault has to be qualified by there being a real instruction.
+        .ex_valid(id_ex_valid),
+        .illegal_inst(id_ex_illegal),
+        .misalign_load(ex_misalign_load),
+        .misalign_store(ex_misalign_store),
+        .fault_addr(ex_data_addr),
         .timer_irq(timer_fires),
         .external_irq(external_fires),
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out),
+        // global_mem_stall ONLY - deliberately not `| stall`.
+        //
+        // ECALL and MRET are decoded from ex_inst combinationally, so they must
+        // not re-fire while frozen; global_mem_stall covers that, because it is
+        // what actually freezes id_ex_reg (see its .mem_stall port).
+        //
+        // The load-use `stall` must NOT be included, and including it was a real
+        // bug. `stall` does not freeze ID/EX - id_ex_reg takes it on .flush, so
+        // the instruction in EX advances and a bubble replaces it. Worse, `stall`
+        // requires id_ex_mem_read, i.e. a LOAD in EX, so it can never coincide
+        // with an ECALL/MRET and never served its stated purpose. What it did do
+        // was suppress misalign_load on the one cycle the fault could fire, after
+        // which the flush discarded the instruction and the trap was lost
+        // forever - a misaligned load followed by any instruction consuming its
+        // result silently returned wrong data. See the DEPENDENT case in
+        // Testbenches/tb_cpu_trap.v, which fails if this term comes back.
+        .mem_stall(global_mem_stall),
         .trap_taken(trap_taken),
         .trap_cause(trap_cause),
+        .trap_val(trap_val),
         .trap_pc(trap_pc),
         .mret_exec(mret_exec),
         .flush_if(flush_if),
@@ -1124,6 +1338,7 @@ module cpu_pipelined #(
         .trap_taken(trap_taken),
         .trap_pc(trap_pc),
         .trap_cause(trap_cause),
+        .trap_val(trap_val),
         .mret_exec(mret_exec),
         .timer_pending(timer_interrupt),
         .external_pending(intc_irq_out),
@@ -1165,21 +1380,31 @@ module cpu_pipelined #(
         .rd_out(ex_mem_rd),
         .reg_wen_out(ex_mem_reg_wen),
         .mem_rw_out(ex_mem_mem_rw),
-        .wb_sel_out(ex_mem_wb_sel)
+        .wb_sel_out(ex_mem_wb_sel),
+        .valid_in(id_ex_valid),
+        .valid_out(ex_mem_valid)
     );
 
+    reg [3:0] leds_sw;
     always @(posedge clk) begin
         if (rst) begin
-            leds <= 4'b0;
+            leds_sw <= 4'b0;
         end else begin
             // Gate MMIO side effects so stores do not repeat while the pipeline is frozen
             if (!global_mem_stall && store_commits) begin
                 if (is_led) begin
-                    leds <= ex_mem_rs2[3:0];
+                    leds_sw <= ex_mem_rs2[3:0];
                 end
             end
         end
     end
+
+    // All four on means the stall watchdog fired. Chosen as an override
+    // rather than an OR into one bit because a partial overlay corrupts
+    // whatever value software was displaying - fpga/tests/irqtest.S shows a
+    // captured mcause here, and 1011 (external) must stay readable as 1011.
+    // No mcause software displays is 1111, so this is unambiguous.
+    assign leds = stall_hung ? 4'b1111 : leds_sw;
 
     // uart_mmio owns its own uart_tx instance and drives the physical tx
     // pin directly; its d_req is the pending-gated pulse computed above so
@@ -1202,6 +1427,8 @@ module cpu_pipelined #(
 
     // intc: source 0 is UART TX-complete; sources 1-7 are reserved for
     // future peripherals (tie 0 until wired up).
+    wire accel_irq_batch, accel_irq_dma;
+
     intc #(
         .NUM_SOURCES(8)
     ) INTC (
@@ -1213,7 +1440,22 @@ module cpu_pipelined #(
         .d_wdata(ex_mem_rs2),
         .d_rdata(intc_rdata),
         .d_ready(intc_ready),
-        .irq_in({6'b0, uart_rx_irq, uart_tx_irq}),
+        // Source map, low bit first - mirrored in
+        // zephyr/drivers/interrupt_controller/intc_rv32_5stage.c and in the
+        // uart0/gemm0 devicetree nodes. Sources 4-7 are still spare.
+        //   0 UART TX complete      2 accelerator batch done (CTRL bit5 queue)
+        //   1 UART RX data ready    3 accelerator result DMA done
+        //
+        // Both accelerator lines are sticky LEVELS off qDone/dmaDone rather
+        // than pulses. intc captures the 0->1 edge and latches into its own
+        // pending register, and those DONE bits are cleared only by the next
+        // kick of that engine, so each one presents exactly one edge per
+        // completion. irq_dma goes high once per TILE during a queued batch
+        // while irq_batch goes high once for the whole batch, so software
+        // leaves source 3 masked in queue mode - see tb_mm_accel_queue.v,
+        // which asserts 1 and NTILE edges respectively.
+        .irq_in({4'b0, accel_irq_dma, accel_irq_batch,
+                 uart_rx_irq, uart_tx_irq}),
         .irq_out(intc_irq_out)
     );
 
@@ -1277,15 +1519,22 @@ module cpu_pipelined #(
         .s_axi_rvalid(accel_axi_rvalid),
         .s_axi_rready(accel_axi_rready),
 
-        // result DMA out to mem_arbiter's third port
-        .mem_req_valid(accel_mem_req_valid),
-        .mem_req_write(accel_mem_req_write),
-        .mem_req_addr(accel_mem_req_addr),
-        .mem_req_lines(accel_mem_req_lines),
-        .mem_wline(accel_mem_wline),
+        // split memory port, straight out to the top level
+        .mem_rd_req_valid(accel_mem_rd_req_valid),
+        .mem_rd_req_addr(accel_mem_rd_req_addr),
+        .mem_rd_req_lines(accel_mem_rd_req_lines),
         .mem_rline(accel_mem_rline),
+        .mem_rd_ready(accel_mem_rd_ready),
+        .mem_wr_req_valid(accel_mem_wr_req_valid),
+        .mem_wr_req_addr(accel_mem_wr_req_addr),
+        .mem_wr_req_lines(accel_mem_wr_req_lines),
+        .mem_wline(accel_mem_wline),
         .mem_wnext(accel_mem_wnext),
-        .mem_ready(accel_mem_ready)
+        .mem_wr_ready(accel_mem_wr_ready),
+
+        // completion interrupts -> intc sources 2 and 3
+        .irq_batch(accel_irq_batch),
+        .irq_dma(accel_irq_dma)
     );
 
     // MEM
@@ -1340,8 +1589,25 @@ module cpu_pipelined #(
         endcase
     end
 
+    // The retirement term is as load-bearing as the !ex_mem_is_amo one.
+    //
+    // With only `rst || !ex_mem_is_amo`, two ADJACENT AMOs broke: the block
+    // samples the OUTGOING instruction, so on the edge where AMO #1 retires and
+    // AMO #2 enters MEM, ex_mem_is_amo is still 1 and the sequencer was never
+    // rearmed. AMO #2 then saw state==AMO_WRITE with amo_result_ready=1, so
+    // amo_stall, amo_read_phase and amo_write_phase were ALL 0 - it asserted
+    // neither dcache_ren nor dcache_wen, performed no read and no write, and
+    // final_mem_read_data returned AMO #1's amo_old_value into its rd. Memory
+    // was left unmodified, which is worse than the divider's version of this
+    // bug. Covered by Testbenches/tb_cpu_b2b.v.
+    //
+    // Clearing on retirement is safe for the in-flight AMO: amo_old_value is not
+    // touched here, and final_mem_read_data (:1552) selects it on ex_mem_is_amo
+    // rather than on amo_result_ready, so the retiring AMO's rd value survives
+    // the cycle its flag is dropped.
     always @(posedge clk) begin
-        if (rst || !ex_mem_is_amo) begin
+        if (rst || !ex_mem_is_amo ||
+            (amo_result_ready && !global_mem_stall)) begin
             amo_state <= AMO_IDLE;
             amo_result_ready <= 1'b0;
         end else begin
@@ -1398,7 +1664,16 @@ module cpu_pipelined #(
 
     assign final_mem_read_data = ex_mem_is_amo ? amo_old_value :
                                  is_clint ? clint_rdata :
-                                 is_led ? {28'b0, leds} :
+                                 // Upper bits carry the stall watchdog, which
+                                 // was 28 bits of zero. Nothing reads this
+                                 // register today (every LED_REG use in
+                                 // fpga/tests is a write), so it costs
+                                 // nothing and gives software a way to ask
+                                 // how long the pipeline was frozen:
+                                 //   [3:0]   what software last wrote
+                                 //   [19:4]  cycles of unbroken stall
+                                 //   [31]    sticky: the watchdog fired
+                                 is_led ? {stall_hung, 11'b0, stall_watchdog, leds_sw} :
                                  is_uart ? uart_rdata_latched :
                                  is_intc ? intc_rdata_latched :
                                  is_accel ? accel_rdata_latched :
@@ -1422,7 +1697,9 @@ module cpu_pipelined #(
         .compressed_out(mem_wb_compressed),
         .rd_out(mem_wb_rd),
         .reg_wen_out(mem_wb_reg_wen),
-        .wb_sel_out(mem_wb_wb_sel)
+        .wb_sel_out(mem_wb_wb_sel),
+        .valid_in(ex_mem_valid),
+        .valid_out(mem_wb_valid)
     );
 
     // WB
@@ -1459,6 +1736,23 @@ module program_counter (
 
     wire [31:0] next_pc = pc_sel ? mem_address : pc + pc_inc;
 
+    // PRIORITY, and it is the opposite of what the call site used to claim:
+    // `stall` sits ABOVE `pc_sel` in both expressions below, so a freeze
+    // DISCARDS a redirect presented on the same cycle rather than deferring it.
+    // next_pc is recomputed every cycle from live inputs, so there is nothing
+    // held anywhere to replay it from once the freeze lifts - the redirect is
+    // simply gone.
+    //
+    // For a branch that is harmless (pc_sel comes from a branch in EX, and the
+    // load-use stall requires a LOAD in EX, so the two are mutually exclusive).
+    // For a trap it was a live bug: faults are gated on !global_mem_stall but
+    // NOT on !stall, so a misaligned load consumed by the very next instruction
+    // raised its fault while `stall` was 1, latched mcause/mepc/mtval, flushed
+    // all three stages - and never left the faulting address. Fixed at the call
+    // site by gating that stall term with ~pc_trap_override.
+    //
+    // Any caller adding a new redirect source must therefore either prove it
+    // cannot coincide with a freeze, or gate the freeze with it.
     assign pc_next_out = rst ? RESET_PC : (stall ? pc : next_pc);
 
     always @(posedge clk) begin
@@ -1534,6 +1828,9 @@ module id_ex_reg (
     input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
     input wire csr_wen_in,
+    // Decode found nothing matching; travels with the instruction so the
+    // fault is raised in EX, where flush_ex can still cancel it.
+    input wire illegal_in,
     input wire [1:0] csr_op_in,
     input wire csr_use_imm_in,
     input wire [4:0] csr_uimm_in,
@@ -1551,6 +1848,7 @@ module id_ex_reg (
     output reg [31:0] predicted_target_out,
     output reg [9:0] pht_index_out,
     output reg csr_wen_out,
+    output reg illegal_out,
     output reg [1:0] csr_op_out,
     output reg csr_use_imm_out,
     output reg [4:0] csr_uimm_out,
@@ -1582,6 +1880,7 @@ module id_ex_reg (
             is_amo_out <= 1'b0;
             atomic_op_out <= 5'b0;
             csr_wen_out <= 1'b0;
+            illegal_out <= 1'b0;
             csr_op_out <= 2'b0;
             csr_use_imm_out <= 1'b0;
             csr_uimm_out <= 5'b0;
@@ -1617,6 +1916,7 @@ module id_ex_reg (
             is_amo_out <= is_amo_in;
             atomic_op_out <= atomic_op_in;
             csr_wen_out <= csr_wen_in;
+            illegal_out <= illegal_in;
             csr_op_out <= csr_op_in;
             csr_use_imm_out <= csr_use_imm_in;
             csr_uimm_out <= csr_uimm_in;
@@ -1635,6 +1935,12 @@ module ex_mem_reg (
     input wire [1:0] wb_sel_in,
     input wire is_lr_in, is_sc_in, is_amo_in,
     input wire [4:0] atomic_op_in,
+    // See if_id_reg's valid_out. Carried this far because a precise exception
+    // has to know whether MEM holds a real instruction or a flush-inserted
+    // bubble, and because minstret must not count bubbles. reg_wen_out is not
+    // a substitute: it is 0 for every store and every branch.
+    input wire valid_in,
+    output reg valid_out,
     output reg is_lr_out, is_sc_out, is_amo_out,
     output reg [4:0] atomic_op_out,
     output reg [31:0] alu_res_out, rs2_out, inst_out, pc_out,
@@ -1658,6 +1964,7 @@ module ex_mem_reg (
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
             atomic_op_out <= 5'b0;
+            valid_out <= 1'b0;
         end else if (mem_stall) begin
             // Freeze
         end else if (flush) begin
@@ -1673,6 +1980,7 @@ module ex_mem_reg (
             is_sc_out <= 1'b0;
             is_amo_out <= 1'b0;
             inst_out <= 32'h00000013;
+            valid_out <= 1'b0;
         end else begin
             alu_res_out <= alu_res_in;
             rs2_out <= rs2_in;
@@ -1687,6 +1995,7 @@ module ex_mem_reg (
             is_sc_out <= is_sc_in;
             is_amo_out <= is_amo_in;
             atomic_op_out <= atomic_op_in;
+            valid_out <= valid_in;
         end
     end
 
@@ -1700,6 +2009,13 @@ module mem_wb_reg (
     input wire [4:0] rd_in,
     input wire reg_wen_in,
     input wire [1:0] wb_sel_in,
+    // Deliberately no flush port here, and valid_out must not get one.
+    // flush_ex already clears EX/MEM, which is the correct precise-trap
+    // boundary: whatever has reached MEM/WB is an OLDER instruction than the
+    // one trapping, so it has to be allowed to complete. Squashing it here
+    // would lose a committed result.
+    input wire valid_in,
+    output reg valid_out,
     output reg [31:0] alu_res_out, mem_data_out, pc_out, inst_out,
     output reg compressed_out,
     output reg [4:0] rd_out,
@@ -1716,6 +2032,7 @@ module mem_wb_reg (
             compressed_out <= 1'b0;
             wb_sel_out <= 0;
             inst_out <= 32'h00000013;
+            valid_out <= 1'b0;
         end else if (mem_stall) begin
         // Freeze
         end else begin
@@ -1727,7 +2044,10 @@ module mem_wb_reg (
             reg_wen_out <= reg_wen_in;
             wb_sel_out <= wb_sel_in;
             inst_out <= inst_in;
+            valid_out <= valid_in;
         end
     end
 
 endmodule
+
+`endif // _CPU_V_
