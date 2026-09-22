@@ -1,3 +1,6 @@
+`ifndef _REGFILE_V_
+`define _REGFILE_V_
+
 module regfile (
     input wire [4:0] read_index1, read_index2, write_index,
     input wire [31:0] write_data,
@@ -29,3 +32,5 @@ module regfile (
                         regs[read_index2];
 
 endmodule
+
+`endif // _REGFILE_V_

@@ -1,3 +1,6 @@
+`ifndef _BRANCH_COMP_V_
+`define _BRANCH_COMP_V_
+
 module branch_comp(
     input wire [31:0] br_data1, br_data2,
     input wire br_un,
@@ -13,3 +16,5 @@ module branch_comp(
     end
 
 endmodule
+
+`endif // _BRANCH_COMP_V_

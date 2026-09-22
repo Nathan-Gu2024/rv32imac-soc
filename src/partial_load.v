@@ -1,3 +1,6 @@
+`ifndef _PARTIAL_LOAD_V_
+`define _PARTIAL_LOAD_V_
+
 module partial_load (
     input wire [31:0] inst, mem_address, data_from_mem,
     output reg [31:0] data_to_reg
@@ -46,3 +49,5 @@ module partial_load (
     end
 
 endmodule
+
+`endif // _PARTIAL_LOAD_V_

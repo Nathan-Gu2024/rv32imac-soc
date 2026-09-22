@@ -1,3 +1,6 @@
+`ifndef _MEM_ARBITER_V_
+`define _MEM_ARBITER_V_
+
 module mem_arbiter (
     input wire clk, 
     input wire rst,
@@ -227,3 +230,5 @@ module mem_arbiter (
     assign accel_rline  = mem_rline;
 
 endmodule
+
+`endif // _MEM_ARBITER_V_

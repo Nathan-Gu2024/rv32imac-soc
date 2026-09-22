@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `include "../src/cpu.v"
+`include "../src/accel_port_join.v"
 
 // CPU-integrated accelerator test: real sw/lw instructions through the
 // pipeline to the accelerator's MMIO window, exercising axi_lite_bridge's
@@ -25,6 +26,8 @@ module tb_mm_accel_cpu;
     wire [31:0] accel_mem_req_addr;
     wire [127:0] accel_mem_wline;
     wire accel_mem_ready;
+    wire [7:0] accel_mem_req_lines;
+    reg accel_mem_wnext;
 
     wire [31:0] dmem_req_addr;
     wire [31:0] store_data;
@@ -42,6 +45,16 @@ module tb_mm_accel_cpu;
     wire [31:0] debug_raw_pc;
     wire debug_id_predicted_taken;
     wire debug_cache_ready;
+
+    // cpu_pipelined's accelerator port is split; accel_port_join below
+    // re-serialises it onto the single-port model this bench already had, which
+    // is therefore unchanged.
+    wire        aj_rd_valid, aj_wr_valid, aj_wnext_o, aj_rd_ready, aj_wr_ready;
+    wire [31:0] aj_rd_addr,  aj_wr_addr;
+    wire [7:0]  aj_rd_lines, aj_wr_lines;
+    wire [127:0] aj_wline_o;
+
+    wire [127:0] aj_rline_w;
 
     cpu_pipelined DUT (
         .clk(clk), .rst(rst),
@@ -64,13 +77,26 @@ module tb_mm_accel_cpu;
         .dcache_mem_read_data_block(dcache_mem_read_data_block),
         .dcache_mem_ready(dcache_mem_ready),
 
-        .accel_mem_req_valid(accel_mem_req_valid),
-        .accel_mem_req_write(accel_mem_req_write),
-        .accel_mem_req_addr(accel_mem_req_addr),
-        .accel_mem_req_lines(),
-        .accel_mem_wnext(1'b0),
-        .accel_mem_wline(accel_mem_wline),
-        .accel_mem_ready(accel_mem_ready),
+        .accel_mem_rd_req_valid(aj_rd_valid),
+        .accel_mem_rd_req_addr(aj_rd_addr),
+        .accel_mem_rd_req_lines(aj_rd_lines),
+        .accel_mem_rd_ready(aj_rd_ready),
+        .accel_mem_wr_req_valid(aj_wr_valid),
+        .accel_mem_wr_req_addr(aj_wr_addr),
+        .accel_mem_wr_req_lines(aj_wr_lines),
+        .accel_mem_wnext(aj_wnext_o),
+        .accel_mem_wline(aj_wline_o),
+        .accel_mem_wr_ready(aj_wr_ready),
+        // req_lines was left unconnected and wnext tied to 0, which is why this
+        // bench reported "DMA issued 1 line writes, expected 16": with wnext
+        // never pulsed the accelerator's lineFifo is never advanced, so it
+        // presents line 0 for the whole burst, and the memory model only ever
+        // wrote one line anyway. Both halves of the burst protocol were missing
+        // because the bench predates enableWriteBursts.
+        .accel_mem_rline(aj_rline_w),
+        // Operands reach the array by MMIO push in this bench, never by operand
+        // DMA, so no read data is needed - but tie it off rather than leave an
+        // input dangling.
 
         .debug_pc(debug_pc),
         .debug_instr(debug_instr),
@@ -160,34 +186,81 @@ module tb_mm_accel_cpu;
     // dim>=8 publish the previous group's data at the new address.
     reg [2:0] a_lat_cnt;
     reg a_busy;
-    reg [31:0] a_addr_latched;
-    reg [127:0] a_wline_latched;
+    // Burst-capable accelerator write port.
+    //
+    // The protocol is taken from tb_mm_accel_queue.v, which is the bench that
+    // models it correctly: one address phase, then a line every BEATS_PER_LINE=2
+    // cycles, mem_wnext pulsed ONE LINE AHEAD so the requester's FIFO advances,
+    // and exactly ONE mem_ready for the whole write transaction (reads signal
+    // per line instead - not needed here, this bench pushes operands by MMIO).
+    //
+    // Getting wnext's timing wrong is the trap: pulse it too late and the last
+    // line is written twice, too early and line 0 is skipped. One line ahead,
+    // gated on there being a next line, is what the adapter does.
+    reg [31:0]  a_addr;
+    reg [31:0]  a_left;
+    reg         a_in_burst, a_write, a_beat;
+    reg         a_ready_r;
+    integer     accel_lines_written = 0;
+
     always @(posedge clk) begin
         if (rst) begin
-            a_busy <= 1'b0;
-            a_lat_cnt <= 0;
-        end else if (!a_busy && accel_mem_req_valid) begin
-            a_busy <= 1'b1;
-            a_lat_cnt <= 3;
-            a_addr_latched <= accel_mem_req_addr;
-            a_wline_latched <= accel_mem_wline;
-        end else if (a_busy) begin
-            if (a_lat_cnt == 0) a_busy <= 1'b0;
-            else a_lat_cnt <= a_lat_cnt - 1;
+            a_ready_r      <= 1'b0;
+            a_lat_cnt      <= 0;
+            a_in_burst     <= 1'b0;
+            a_left         <= 0;
+            accel_mem_wnext <= 1'b0;
+            a_beat         <= 1'b0;
+        end else if (a_in_burst) begin
+            accel_mem_wnext <= 1'b0;
+            a_ready_r       <= 1'b0;
+            if (a_left > 0) begin
+                if (a_write) begin
+                    if (a_beat == 1'b0) begin
+                        ddr_mem[{a_addr[28:4], 2'b00}] <= accel_mem_wline[31:0];
+                        ddr_mem[{a_addr[28:4], 2'b01}] <= accel_mem_wline[63:32];
+                        ddr_mem[{a_addr[28:4], 2'b10}] <= accel_mem_wline[95:64];
+                        ddr_mem[{a_addr[28:4], 2'b11}] <= accel_mem_wline[127:96];
+                        accel_lines_written <= accel_lines_written + 1;
+                        if (a_left > 1) accel_mem_wnext <= 1'b1;
+                        a_beat <= 1'b1;
+                    end else begin
+                        a_beat <= 1'b0;
+                        a_addr <= a_addr + 32'd16;
+                        a_left <= a_left - 1;
+                        if (a_left == 1) begin
+                            a_in_burst <= 1'b0;
+                            a_ready_r  <= 1'b1;   // one completion per write
+                        end
+                    end
+                end else begin
+                    // Reads are not exercised here (rline is tied off), but
+                    // terminate the burst rather than hang if one ever appears.
+                    a_ready_r  <= 1'b1;
+                    a_addr     <= a_addr + 32'd16;
+                    a_left     <= a_left - 1;
+                    if (a_left == 1) a_in_burst <= 1'b0;
+                end
+            end
+        end else if (accel_mem_req_valid && !a_ready_r) begin
+            if (a_lat_cnt >= 3) begin
+                a_write    <= accel_mem_req_write;
+                a_addr     <= accel_mem_req_addr;
+                // 0 means one line: the pre-burst interface used lines=0 for a
+                // single-line request and mm_accel still emits that for the
+                // non-burst paths.
+                a_left     <= (accel_mem_req_lines == 8'd0)
+                              ? 32'd1 : {24'd0, accel_mem_req_lines};
+                a_in_burst <= 1'b1;
+                a_beat     <= 1'b0;
+                a_lat_cnt  <= 0;
+            end else a_lat_cnt <= a_lat_cnt + 1;
+        end else begin
+            a_ready_r       <= 1'b0;
+            accel_mem_wnext <= 1'b0;
         end
     end
-    assign accel_mem_ready = a_busy && (a_lat_cnt == 0);
-
-    integer accel_lines_written = 0;
-    always @(posedge clk) begin
-        if (accel_mem_ready) begin
-            ddr_mem[{a_addr_latched[28:4], 2'b00}] <= a_wline_latched[31:0];
-            ddr_mem[{a_addr_latched[28:4], 2'b01}] <= a_wline_latched[63:32];
-            ddr_mem[{a_addr_latched[28:4], 2'b10}] <= a_wline_latched[95:64];
-            ddr_mem[{a_addr_latched[28:4], 2'b11}] <= a_wline_latched[127:96];
-            accel_lines_written <= accel_lines_written + 1;
-        end
-    end
+    assign accel_mem_ready = a_ready_r;
 
     initial clk = 0;
     always #5 clk = ~clk;
@@ -223,7 +296,10 @@ module tb_mm_accel_cpu;
         $display("Sentinel reached, checking results...");
 
         // geometry first: a wrong-DIM build invalidates every other check
-        check("INFO", 24, 32'h00001008);   // maxK=16, dim=8
+        // INFO = {bPanels[23:16], maxK[15:8], dim[7:0]}.
+        // Was 32'h00001008 (maxK=16, bPanels=0), which predated the maxK=64 /
+        // bPanels=4 generator config and had been failing ever since.
+        check("INFO", 24, 32'h00044008);   // bPanels=4, maxK=64, dim=8
 
         check("C00", 20, 4);     // 4*1*1
         check("C12", 21, 24);    // 4*2*3
@@ -271,4 +347,19 @@ module tb_mm_accel_cpu;
             DUT.accel_pending, DUT.accel_done);
         $finish;
     end
+
+    accel_port_join AJ (
+        .clk(clk), .rst(rst),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines), .accel_rd_ready(aj_rd_ready),
+        .accel_rline(aj_rline_w),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline_o),
+        .accel_wnext(aj_wnext_o), .accel_wr_ready(aj_wr_ready),
+        .mem_req_valid(accel_mem_req_valid), .mem_req_write(accel_mem_req_write),
+        .mem_req_addr(accel_mem_req_addr), .mem_req_lines(accel_mem_req_lines),
+        .mem_wline(accel_mem_wline), .mem_ready(accel_mem_ready),
+        .mem_wnext(accel_mem_wnext), .mem_rline(128'b0)
+    );
+
 endmodule

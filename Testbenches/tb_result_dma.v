@@ -1,6 +1,18 @@
 `timescale 1ns/1ps
+// REGRESSION_VARIANT: RW_SPLIT
+//
+// -DRW_SPLIT rebuilds the same stimulus against the chain fpga_top
+// selects at MEM_PATH_RW=1 - mm_accel's split port straight into
+// mem_arbiter_rw and axi_rw_engine, with no accel_port_join and no
+// axi_cache_adapter. Same reference model, same checks, same AXI slave;
+// only the path between the accelerator and AXI differs, which is what
+// makes the two builds an A/B of the two hardware configurations rather
+// than two loosely related tests.
 `include "../src/axi_lite_bridge.v"
+`include "../src/accel_port_join.v"
 `include "../src/mem_arbiter.v"
+`include "../src/mem_arbiter_rw.v"
+`include "../src/axi_rw_engine.v"
 `include "../src/axi_cache_adapter.v"
 
 // Why does a RESULT write cost 11.18 cycles per line on hardware when an
@@ -102,6 +114,13 @@ module tb_result_dma;
     wire [31:0]  a_req_addr;
     wire [127:0] a_wline, a_rline;
 
+    // mm_accel's port is split; accel_port_join below re-serialises it onto the
+    // single-port model this bench already had, which is therefore unchanged.
+    wire        aj_rd_valid, aj_wr_valid, aj_wnext, aj_rd_ready, aj_wr_ready;
+    wire [31:0] aj_rd_addr,  aj_wr_addr;
+    wire [7:0]  aj_rd_lines, aj_wr_lines;
+    wire [127:0] aj_wline, aj_rline;
+
     mm_accel ACCEL (
         .clk(clk), .rst(rst),
         .s_axi_awaddr(m_awaddr), .s_axi_awvalid(m_awvalid), .s_axi_awready(m_awready),
@@ -109,9 +128,12 @@ module tb_result_dma;
         .s_axi_bresp(m_bresp), .s_axi_bvalid(m_bvalid), .s_axi_bready(m_bready),
         .s_axi_araddr(m_araddr), .s_axi_arvalid(m_arvalid), .s_axi_arready(m_arready),
         .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready),
-        .mem_req_valid(a_req_valid), .mem_req_write(a_req_write),
-        .mem_req_addr(a_req_addr), .mem_wline(a_wline), .mem_req_lines(a_req_lines),
-        .mem_wnext(a_wnext), .mem_rline(a_rline), .mem_ready(a_ready)
+        .mem_rd_req_valid(aj_rd_valid), .mem_rd_req_addr(aj_rd_addr),
+        .mem_rd_req_lines(aj_rd_lines), .mem_rd_ready(aj_rd_ready),
+        .mem_rline(aj_rline),
+        .mem_wr_req_valid(aj_wr_valid), .mem_wr_req_addr(aj_wr_addr),
+        .mem_wr_req_lines(aj_wr_lines), .mem_wline(aj_wline),
+        .mem_wnext(aj_wnext), .mem_wr_ready(aj_wr_ready)
     );
 
     // ---- arbiter: caches idle, so the accelerator is alone on the port ----
@@ -120,6 +142,32 @@ module tb_result_dma;
     wire [31:0]  mem_req_addr;
     wire [127:0] mem_wline, mem_rline;
 
+`ifdef RW_SPLIT
+    // ---- the MEM_PATH_RW=1 chain, exactly as fpga_top builds it ----
+    wire        rd_rv, wr_rv, wr_nx, rd_rdy, wr_rdy;
+    wire [31:0] rd_ra, wr_ra;
+    wire [7:0]  rd_rl, wr_rl;
+    wire [127:0] rd_rln, wr_wl;
+
+    mem_arbiter_rw ARB (
+        .clk(clk), .rst(rst),
+        .icache_req_valid(1'b0), .icache_req_addr(32'b0),
+        .icache_ready(), .icache_rline(),
+        .dcache_req_valid(1'b0), .dcache_req_write(1'b0),
+        .dcache_req_addr(32'b0), .dcache_wline(128'b0),
+        .dcache_ready(), .dcache_rline(),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline),
+        .accel_rd_ready(aj_rd_ready), .accel_wr_ready(aj_wr_ready),
+        .accel_wnext(aj_wnext), .accel_rline(aj_rline),
+        .rd_req_valid(rd_rv), .rd_req_addr(rd_ra), .rd_req_lines(rd_rl),
+        .rd_ready(rd_rdy), .rd_rline(rd_rln),
+        .wr_req_valid(wr_rv), .wr_req_addr(wr_ra), .wr_req_lines(wr_rl),
+        .wr_wline(wr_wl), .wr_next(wr_nx), .wr_ready(wr_rdy)
+    );
+`else
     mem_arbiter ARB (
         .clk(clk), .rst(rst),
         .icache_req_valid(1'b0), .icache_req_addr(32'b0),
@@ -136,6 +184,7 @@ module tb_result_dma;
         .mem_wline(mem_wline), .mem_ready(mem_ready),
         .mem_wnext(mem_wnext), .mem_rline(mem_rline)
     );
+`endif
 
     // ---- AXI ----
     wire [31:0] awaddr, araddr;
@@ -150,6 +199,25 @@ module tb_result_dma;
     reg         rvalid = 1'b0, rlast = 1'b0, bvalid = 1'b0;
     reg  [1:0]  bresp = 2'b00;
 
+`ifdef RW_SPLIT
+    axi_rw_engine #(.AXI_DATA_WIDTH(AXI_W)) ADP (
+        .clk(clk), .rst(rst),
+        .rd_req_valid(rd_rv), .rd_req_addr(rd_ra), .rd_req_lines(rd_rl),
+        .rd_rline(rd_rln), .rd_ready(rd_rdy),
+        .wr_req_valid(wr_rv), .wr_req_addr(wr_ra), .wr_req_lines(wr_rl),
+        .wr_wline(wr_wl), .wr_next(wr_nx), .wr_ready(wr_rdy),
+        .rd_retries(), .wr_retries(),
+        .m_axi_araddr(araddr), .m_axi_arlen(arlen), .m_axi_arsize(arsize),
+        .m_axi_arburst(arburst), .m_axi_arvalid(arvalid), .m_axi_arready(arready),
+        .m_axi_rdata(rdata), .m_axi_rvalid(rvalid), .m_axi_rlast(rlast),
+        .m_axi_rready(rready),
+        .m_axi_awaddr(awaddr), .m_axi_awlen(awlen), .m_axi_awsize(awsize),
+        .m_axi_awburst(awburst), .m_axi_awvalid(awvalid), .m_axi_awready(awready),
+        .m_axi_wdata(wdata), .m_axi_wstrb(wstrb), .m_axi_wvalid(wvalid),
+        .m_axi_wlast(wlast), .m_axi_wready(wready),
+        .m_axi_bvalid(bvalid), .m_axi_bresp(bresp), .m_axi_bready(bready)
+    );
+`else
     axi_cache_adapter #(.AXI_DATA_WIDTH(AXI_W)) ADP (
         .clk(clk), .rst(rst),
         .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
@@ -166,6 +234,7 @@ module tb_result_dma;
         .m_axi_wlast(wlast), .m_axi_wready(wready),
         .m_axi_bvalid(bvalid), .m_axi_bresp(bresp), .m_axi_bready(bready)
     );
+`endif
 
     // ---- AXI slave with a realistic address-phase latency ----
     reg [127:0] LMEM [0:65535];
@@ -296,7 +365,15 @@ module tb_result_dma;
             q_idle <= 0; q_load <= 0; q_loadw <= 0; q_comp <= 0;
             q_compw <= 0; q_store <= 0; q_storew <= 0;
         end else if (qtiming) begin
+`ifdef RW_SPLIT
+            // Two engines, two states. A cycle counts as port-busy if EITHER
+            // direction is working, which is the like-for-like comparison
+            // against the single-FSM adapter below.
+            if (rd_rv || wr_rv || ADP.rd_state != 2'd0 || ADP.wr_state != 3'd0)
+                port_busy <= port_busy + 1;
+`else
             if (mem_req_valid || ADP.state != 3'd0) port_busy  <= port_busy + 1;
+`endif
             if (ACCEL.busy)                         array_busy <= array_busy + 1;
             case (ACCEL.qState)
                 3'd0: q_idle   <= q_idle   + 1;
@@ -639,4 +716,21 @@ module tb_result_dma;
         $display("TIMEOUT");
         $finish;
     end
+
+`ifndef RW_SPLIT
+    accel_port_join AJ (
+        .clk(clk), .rst(rst),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines), .accel_rd_ready(aj_rd_ready),
+        .accel_rline(aj_rline),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline),
+        .accel_wnext(aj_wnext), .accel_wr_ready(aj_wr_ready),
+        .mem_req_valid(a_req_valid), .mem_req_write(a_req_write),
+        .mem_req_addr(a_req_addr), .mem_req_lines(a_req_lines),
+        .mem_wline(a_wline), .mem_ready(a_ready),
+        .mem_wnext(a_wnext), .mem_rline(a_rline)
+    );
+`endif
+
 endmodule

@@ -1,3 +1,6 @@
+`ifndef _MM_ACCEL_V2X2_LEGACY_V_
+`define _MM_ACCEL_V2X2_LEGACY_V_
+
 `timescale 1ns/1ps
 
 // Single output-stationary systolic PE: acc += a_in*b_in each enabled
@@ -273,3 +276,5 @@ module mm_accel_v2x2_legacy #(
     end
 
 endmodule
+
+`endif // _MM_ACCEL_V2X2_LEGACY_V_

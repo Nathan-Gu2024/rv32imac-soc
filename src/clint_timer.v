@@ -1,3 +1,6 @@
+`ifndef _CLINT_TIMER_V_
+`define _CLINT_TIMER_V_
+
 module clint_timer (
     input wire clk,
     input wire rst,
@@ -32,33 +35,25 @@ module clint_timer (
                 case (addr[3:0])
                     4'h0: mtime[31:0] <= wdata;
                     4'h4: mtime[63:32] <= wdata;
-                    // NON-STANDARD: writing the LOW half also clears the HIGH
-                    // half. Documented because it is invisible from the
-                    // register map and changes what update sequences are safe.
+                    // Writes the LOW half only, leaving the high half alone -
+                    // which is what the register map implies and what software
+                    // is entitled to assume.
                     //
-                    // Zephyr's riscv_machine_timer writes hi=-1, lo=new,
-                    // hi=new. That still lands correctly here - the final high
-                    // write restores what the low write cleared:
+                    // This used to also clear mtimecmp[63:32]. Zephyr's
+                    // riscv_machine_timer writes hi=-1, lo=new, hi=new, so the
+                    // final high write restored what the low write cleared and
+                    // the sequence still landed correctly. The exposure was the
+                    // MIDDLE state: with the high half zeroed, mtimecmp is only
+                    // reliably in the future while mtime[63:32] is still 0 -
+                    // about 71 s of uptime at 60 MHz. Past that, a timer
+                    // reprogrammed at the wrong moment sees mtime >= mtimecmp,
+                    // fires early, and the tick handler re-arms into a storm.
                     //
-                    //   hi=-1   FFFFFFFF_old
-                    //   lo=new  00000000_new      <- high cleared by this write
-                    //   hi=new  newhi____new
-                    //
-                    // The exposure is the middle state. With the high half
-                    // zeroed, mtimecmp is only reliably in the future while
-                    // mtime[63:32] is still 0 - about 71 s of uptime at 60 MHz.
-                    // Past that, a timer reprogrammed at the wrong moment can
-                    // see mtime >= mtimecmp and fire early. Nothing in the
-                    // current bring-up runs that long, which is why this has
-                    // not bitten; a long-running Zephyr application could.
-                    //
-                    // Writing the high half LAST is what makes it safe, so any
-                    // new timer code must do the same.
-                    4'h8:
-                        begin
-                            mtimecmp[31:0]  <= wdata;
-                            mtimecmp[63:32] <= 32'b0;
-                        end
+                    // The old behaviour was documented rather than fixed on the
+                    // grounds that it was invisible from the register map. That
+                    // is a reason to write it down, not a reason to keep it -
+                    // and it cost only this one line to remove.
+                    4'h8: mtimecmp[31:0] <= wdata;
 
                     4'hC: mtimecmp[63:32] <= wdata;
                 endcase
@@ -67,3 +62,5 @@ module clint_timer (
     end
 
 endmodule
+
+`endif // _CLINT_TIMER_V_

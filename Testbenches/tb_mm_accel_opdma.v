@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `include "../src/axi_lite_bridge.v"
+`include "../src/accel_port_join.v"
 
 // Operand-DMA test: does the accelerator fetching its own operands over the
 // 128-bit line port actually work, and what is it worth against pushing them
@@ -145,6 +146,13 @@ module tb_mm_accel_opdma;
         .m_axi_rdata(m_rdata), .m_axi_rresp(m_rresp), .m_axi_rvalid(m_rvalid), .m_axi_rready(m_rready)
     );
 
+    // mm_accel's port is split; accel_port_join below re-serialises it onto the
+    // single-port model this bench already had, which is therefore unchanged.
+    wire        aj_rd_valid, aj_wr_valid, aj_wnext, aj_rd_ready, aj_wr_ready;
+    wire [31:0] aj_rd_addr,  aj_wr_addr;
+    wire [7:0]  aj_rd_lines, aj_wr_lines;
+    wire [127:0] aj_wline, aj_rline;
+
     mm_accel ACCEL (
         .clk(clk), .rst(rst),
         .s_axi_awaddr(m_awaddr), .s_axi_awvalid(m_awvalid), .s_axi_awready(m_awready),
@@ -152,10 +160,12 @@ module tb_mm_accel_opdma;
         .s_axi_bresp(m_bresp), .s_axi_bvalid(m_bvalid), .s_axi_bready(m_bready),
         .s_axi_araddr(m_araddr), .s_axi_arvalid(m_arvalid), .s_axi_arready(m_arready),
         .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready),
-        .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
-        .mem_req_addr(mem_req_addr), .mem_wline(mem_wline),
-        .mem_req_lines(mem_req_lines),
-        .mem_rline(mem_rline), .mem_ready(mem_ready)
+        .mem_rd_req_valid(aj_rd_valid), .mem_rd_req_addr(aj_rd_addr),
+        .mem_rd_req_lines(aj_rd_lines), .mem_rd_ready(aj_rd_ready),
+        .mem_rline(aj_rline),
+        .mem_wr_req_valid(aj_wr_valid), .mem_wr_req_addr(aj_wr_addr),
+        .mem_wr_req_lines(aj_wr_lines), .mem_wline(aj_wline),
+        .mem_wnext(aj_wnext), .mem_wr_ready(aj_wr_ready)
     );
 
     task do_write(input [31:0] addr, input [31:0] data);
@@ -340,4 +350,19 @@ module tb_mm_accel_opdma;
         $display("TIMEOUT - LOAD_DONE never asserted");
         $finish;
     end
+
+    accel_port_join AJ (
+        .clk(clk), .rst(rst),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines), .accel_rd_ready(aj_rd_ready),
+        .accel_rline(aj_rline),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline),
+        .accel_wnext(aj_wnext), .accel_wr_ready(aj_wr_ready),
+        .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
+        .mem_req_addr(mem_req_addr), .mem_req_lines(mem_req_lines),
+        .mem_wline(mem_wline), .mem_ready(mem_ready),
+        .mem_wnext(), .mem_rline(mem_rline)
+    );
+
 endmodule

@@ -1,3 +1,6 @@
+`ifndef _RVC_EXPANSION_V_
+`define _RVC_EXPANSION_V_
+
 module rvc_expand (
     input wire [15:0] inst_c,
     output reg [31:0] inst_expanded,
@@ -385,3 +388,5 @@ module rvc_expand (
     end
 
 endmodule
+
+`endif // _RVC_EXPANSION_V_

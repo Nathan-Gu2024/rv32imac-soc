@@ -1,3 +1,6 @@
+`ifndef _RESERVATION_MONITOR_V_
+`define _RESERVATION_MONITOR_V_
+
 module reservation_monitor (
     input wire clk,
     input wire rst,
@@ -42,3 +45,5 @@ module reservation_monitor (
         end
     end
 endmodule
+
+`endif // _RESERVATION_MONITOR_V_

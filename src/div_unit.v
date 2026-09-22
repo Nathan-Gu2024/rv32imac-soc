@@ -1,3 +1,6 @@
+`ifndef _DIV_UNIT_V_
+`define _DIV_UNIT_V_
+
 // Multi-cycle restoring divider for RV32M div/divu/rem/remu.
 //
 // A single-cycle combinational 32-bit divider (plain Verilog '/' and '%')
@@ -74,3 +77,5 @@ module div_unit (
         end
     end
 endmodule
+
+`endif // _DIV_UNIT_V_

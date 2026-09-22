@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `include "../src/axi_lite_bridge.v"
+`include "../src/accel_port_join.v"
 
 // Performance benchmark for the Chisel GEMM generator - a REAL tiled GEMM,
 // not a correctness check. tb_mm_accel_gen.v already proves the arithmetic;
@@ -75,21 +76,66 @@ module tb_mm_accel_bench;
     reg [31:0] DMEM [0:4*1024-1];       // word-addressed, base DMA_BASE
     integer    a_lat, dma_lines;
 
+    // Burst-capable, matching tb_mm_accel_queue.v's model.
+    //
+    // This was a single-line responder: it ignored mem_req_lines, did not drive
+    // mem_wnext at all, and wrote exactly one line per request. With
+    // enableWriteBursts the accelerator asks for a whole tile in ONE request, so
+    // 15 of 16 lines were dropped and the upper result columns read back X - which
+    // presented as a design regression rather than a stale bench.
+    //
+    // mem_wnext was not even in the instantiation below, so it was a dangling
+    // INPUT on mm_accel: the requester's lineFifo advance was driven by X.
+    //
+    // Protocol: one address phase, a line every BEATS_PER_LINE=2 cycles, wnext
+    // one line AHEAD (gated on a next line existing), and one mem_ready for the
+    // whole write transaction.
+    wire [7:0] a_req_lines;
+    reg        a_wnext;
+    reg [31:0] a_baddr;
+    reg [31:0] a_left;
+    reg        a_in_burst, a_write_l, a_phase;
+
     always @(posedge clk) begin
         if (rst) begin
             a_ready <= 1'b0; a_lat <= 0; dma_lines <= 0;
+            a_in_burst <= 1'b0; a_left <= 0; a_phase <= 1'b0; a_wnext <= 1'b0;
+        end else if (a_in_burst) begin
+            a_wnext <= 1'b0;
+            a_ready <= 1'b0;
+            if (a_left > 0) begin
+                if (a_phase == 1'b0) begin
+                    if (a_write_l) begin
+                        DMEM[((a_baddr - DMA_BASE) >> 2) + 0] <= a_wline[31:0];
+                        DMEM[((a_baddr - DMA_BASE) >> 2) + 1] <= a_wline[63:32];
+                        DMEM[((a_baddr - DMA_BASE) >> 2) + 2] <= a_wline[95:64];
+                        DMEM[((a_baddr - DMA_BASE) >> 2) + 3] <= a_wline[127:96];
+                        dma_lines <= dma_lines + 1;
+                        if (a_left > 1) a_wnext <= 1'b1;
+                    end
+                    a_phase <= 1'b1;
+                end else begin
+                    a_phase <= 1'b0;
+                    a_baddr <= a_baddr + 32'd16;
+                    a_left  <= a_left - 1;
+                    if (a_left == 1) begin
+                        a_in_burst <= 1'b0;
+                        a_ready    <= 1'b1;   // one completion per write
+                    end
+                end
+            end
         end else if (a_req_valid && !a_ready) begin
             if (a_lat >= MEM_LATENCY) begin
-                a_ready <= 1'b1;
-                DMEM[((a_req_addr - DMA_BASE) >> 2) + 0] <= a_wline[31:0];
-                DMEM[((a_req_addr - DMA_BASE) >> 2) + 1] <= a_wline[63:32];
-                DMEM[((a_req_addr - DMA_BASE) >> 2) + 2] <= a_wline[95:64];
-                DMEM[((a_req_addr - DMA_BASE) >> 2) + 3] <= a_wline[127:96];
-                dma_lines <= dma_lines + 1;
-                a_lat <= 0;
+                a_write_l  <= a_req_write;
+                a_baddr    <= a_req_addr;
+                a_left     <= (a_req_lines == 8'd0) ? 32'd1 : {24'd0, a_req_lines};
+                a_in_burst <= 1'b1;
+                a_phase    <= 1'b0;
+                a_lat      <= 0;
             end else a_lat <= a_lat + 1;
         end else begin
             a_ready <= 1'b0;
+            a_wnext <= 1'b0;
         end
     end
 
@@ -115,6 +161,13 @@ module tb_mm_accel_bench;
         .m_axi_rdata(m_rdata), .m_axi_rresp(m_rresp), .m_axi_rvalid(m_rvalid), .m_axi_rready(m_rready)
     );
 
+    // mm_accel's port is split; accel_port_join below re-serialises it onto the
+    // single-port model this bench already had, which is therefore unchanged.
+    wire        aj_rd_valid, aj_wr_valid, aj_wnext, aj_rd_ready, aj_wr_ready;
+    wire [31:0] aj_rd_addr,  aj_wr_addr;
+    wire [7:0]  aj_rd_lines, aj_wr_lines;
+    wire [127:0] aj_wline, aj_rline;
+
     mm_accel ACCEL (
         .clk(clk), .rst(rst),
         .s_axi_awaddr(m_awaddr), .s_axi_awvalid(m_awvalid), .s_axi_awready(m_awready),
@@ -122,10 +175,12 @@ module tb_mm_accel_bench;
         .s_axi_bresp(m_bresp), .s_axi_bvalid(m_bvalid), .s_axi_bready(m_bready),
         .s_axi_araddr(m_araddr), .s_axi_arvalid(m_arvalid), .s_axi_arready(m_arready),
         .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready),
-        .mem_req_valid(a_req_valid), .mem_req_write(a_req_write),
-        .mem_req_addr(a_req_addr), .mem_wline(a_wline),
-        .mem_req_lines(),
-        .mem_rline(128'b0), .mem_ready(a_ready)
+        .mem_rd_req_valid(aj_rd_valid), .mem_rd_req_addr(aj_rd_addr),
+        .mem_rd_req_lines(aj_rd_lines), .mem_rd_ready(aj_rd_ready),
+        .mem_rline(aj_rline),
+        .mem_wr_req_valid(aj_wr_valid), .mem_wr_req_addr(aj_wr_addr),
+        .mem_wr_req_lines(aj_wr_lines), .mem_wline(aj_wline),
+        .mem_wnext(aj_wnext), .mem_wr_ready(aj_wr_ready)
     );
 
     task do_write(input [31:0] addr, input [31:0] data);
@@ -394,4 +449,19 @@ module tb_mm_accel_bench;
         $display("TIMEOUT");
         $finish;
     end
+
+    accel_port_join AJ (
+        .clk(clk), .rst(rst),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines), .accel_rd_ready(aj_rd_ready),
+        .accel_rline(aj_rline),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline),
+        .accel_wnext(aj_wnext), .accel_wr_ready(aj_wr_ready),
+        .mem_req_valid(a_req_valid), .mem_req_write(a_req_write),
+        .mem_req_addr(a_req_addr), .mem_req_lines(a_req_lines),
+        .mem_wline(a_wline), .mem_ready(a_ready),
+        .mem_wnext(a_wnext), .mem_rline(128'b0)
+    );
+
 endmodule

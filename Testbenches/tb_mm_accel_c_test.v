@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `include "../src/cpu.v"
+`include "../src/accel_port_join.v"
 
 // Sim pre-check for the accelerator's C driver before handing it to hardware -
 // same mock memory harness as tb_coremark_sim.v, UART output captured the
@@ -58,6 +59,16 @@ module tb_mm_accel_c_test;
     wire debug_id_predicted_taken;
     wire debug_cache_ready;
 
+    // cpu_pipelined's accelerator port is split; accel_port_join below
+    // re-serialises it onto the single-port model this bench already had, which
+    // is therefore unchanged.
+    wire        aj_rd_valid, aj_wr_valid, aj_wnext_o, aj_rd_ready, aj_wr_ready;
+    wire [31:0] aj_rd_addr,  aj_wr_addr;
+    wire [7:0]  aj_rd_lines, aj_wr_lines;
+    wire [127:0] aj_wline_o;
+
+    wire [127:0] aj_rline_w;
+
     cpu_pipelined DUT (
         .clk(clk), .rst(rst),
         .uart_tx(uart_tx_line),
@@ -79,14 +90,17 @@ module tb_mm_accel_c_test;
         .dcache_mem_read_data_block(dcache_mem_read_data_block),
         .dcache_mem_ready(dcache_mem_ready),
 
-        .accel_mem_req_valid(accel_mem_req_valid),
-        .accel_mem_req_write(accel_mem_req_write),
-        .accel_mem_req_addr(accel_mem_req_addr),
-        .accel_mem_req_lines(accel_mem_req_lines),
-        .accel_mem_wnext(accel_mem_wnext),
-        .accel_mem_wline(accel_mem_wline),
-        .accel_mem_ready(accel_mem_ready),
-        .accel_mem_rline(accel_mem_rline),
+        .accel_mem_rd_req_valid(aj_rd_valid),
+        .accel_mem_rd_req_addr(aj_rd_addr),
+        .accel_mem_rd_req_lines(aj_rd_lines),
+        .accel_mem_rd_ready(aj_rd_ready),
+        .accel_mem_wr_req_valid(aj_wr_valid),
+        .accel_mem_wr_req_addr(aj_wr_addr),
+        .accel_mem_wr_req_lines(aj_wr_lines),
+        .accel_mem_wnext(aj_wnext_o),
+        .accel_mem_wline(aj_wline_o),
+        .accel_mem_wr_ready(aj_wr_ready),
+        .accel_mem_rline(aj_rline_w),
 
         .debug_pc(debug_pc),
         .debug_instr(debug_instr),
@@ -144,7 +158,11 @@ module tb_mm_accel_c_test;
         if (rst) begin
             d_busy <= 1'b0;
             d_lat_cnt <= 0;
-        end else if (!d_busy && dcache_mem_req_valid) begin
+        // Same rule as the accelerator model above: never accept on the cycle
+        // dcache_mem_ready is asserted. Harmless here only because these
+        // transactions are single-line and a replay rewrites identical data to
+        // the same address - it is still the same defect.
+        end else if (!d_busy && dcache_mem_req_valid && !dcache_mem_ready) begin
             d_busy <= 1'b1;
             d_lat_cnt <= LINE_LATENCY;
             d_addr_latched <= dmem_req_addr;
@@ -234,7 +252,15 @@ module tb_mm_accel_c_test;
                         if (a_write_latched) a_wr_done <= 1'b1;
                     end
                 end
-            end else if (!a_busy && accel_mem_req_valid) begin
+            // NOT on a completion cycle. a_wr_done/a_rd_pulse drive
+            // accel_mem_ready, and the requester still holds mem_req_valid while
+            // it observes that ready - so accepting here re-latches the request
+            // that just finished and REPLAYS the whole burst. The replay runs
+            // against a drained line FIFO with accel_mem_wline frozen at line 0,
+            // which stamped line 0's bytes over all 16 result lines and was the
+            // "DMA mismatches=60" failure. The design was never at fault.
+            end else if (!a_busy && accel_mem_req_valid &&
+                         !a_wr_done && !a_rd_pulse) begin
                 a_busy          <= 1'b1;
                 a_lat_cnt       <= 3;
                 a_addr_latched  <= accel_mem_req_addr;
@@ -306,5 +332,20 @@ module tb_mm_accel_c_test;
         $display("\n[TIMEOUT] Simulation time budget exhausted");
         $finish;
     end
+
+
+    accel_port_join AJ (
+        .clk(clk), .rst(rst),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines), .accel_rd_ready(aj_rd_ready),
+        .accel_rline(aj_rline_w),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline_o),
+        .accel_wnext(aj_wnext_o), .accel_wr_ready(aj_wr_ready),
+        .mem_req_valid(accel_mem_req_valid), .mem_req_write(accel_mem_req_write),
+        .mem_req_addr(accel_mem_req_addr), .mem_req_lines(accel_mem_req_lines),
+        .mem_wline(accel_mem_wline), .mem_ready(accel_mem_ready),
+        .mem_wnext(accel_mem_wnext), .mem_rline(accel_mem_rline)
+    );
 
 endmodule

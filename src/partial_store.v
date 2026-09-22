@@ -1,3 +1,6 @@
+`ifndef _PARTIAL_STORE_V_
+`define _PARTIAL_STORE_V_
+
 module partial_store (
     input wire [31:0] inst, mem_address, data_from_reg,
     input wire mem_rw,
@@ -48,3 +51,5 @@ module partial_store (
     assign mem_write_mask = temp & {{4{mem_rw}}};
 
 endmodule
+
+`endif // _PARTIAL_STORE_V_

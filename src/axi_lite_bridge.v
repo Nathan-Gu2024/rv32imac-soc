@@ -1,3 +1,6 @@
+`ifndef _AXI_LITE_BRIDGE_V_
+`define _AXI_LITE_BRIDGE_V_
+
 `timescale 1ns/1ps
 
 // Converts the CPU-facing single-shot d_req/d_we/d_addr/d_wdata/d_rdata/
@@ -139,3 +142,5 @@ module axi_lite_bridge (
         end
     end
 endmodule
+
+`endif // _AXI_LITE_BRIDGE_V_

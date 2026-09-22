@@ -1,3 +1,6 @@
+`ifndef _IMMGEN_V_
+`define _IMMGEN_V_
+
 module immgen (
     input wire [31:0]inst,    
     input wire [2:0] imm_sel, 
@@ -21,3 +24,5 @@ module immgen (
         endcase
     end
 endmodule
+
+`endif // _IMMGEN_V_

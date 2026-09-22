@@ -1,3 +1,23 @@
+// A frozen snapshot of cpu.v, kept so tb_coremark_sim_baseline.v can measure
+// an A/B against the current core.
+//
+// IT DOES NOT COMPILE TODAY, and the reason is structural rather than a typo:
+// this file is a frozen COPY of the pipeline but it `include`s the LIVE src/
+// modules below. src/icache.v and src/dcache.v were since rewritten onto
+// icache_bram/dcache_bram and no longer take the NUM_WAYS parameter this file
+// passes them (NUM_WAYS now lives only in src/cache_core.v, the older
+// set-associative core). So the snapshot rots silently every time a module it
+// instantiates changes its interface - nothing tests it, and it produces no A/B
+// numbers at all, which is worse than producing suspect ones because its
+// absence is easy to mistake for "the baseline agreed".
+//
+// Repairing it is a decision, not a fix: either snapshot the matching
+// icache.v/dcache.v alongside it, or re-snapshot the whole baseline from the
+// current cpu.v and accept that the old number is gone. Left for the owner.
+//
+// The trap_controller instantiation below has been kept current in the
+// meantime, so whoever repairs the cache side does not also inherit six
+// dangling inputs reading X.
 `include "../src/regfile.v"
 `include "../src/alu.v"
 `include "../src/div_unit.v"
@@ -136,6 +156,12 @@ module cpu_pipelined_baseline (
     wire [31:0] mepc_out;
     wire [31:0] trap_cause;
     wire [31:0] trap_pc;
+    // Driven by trap_controller and fed to csr_file's mtval. The baseline
+    // raises no faults, so it always reads 0 here - but it is wired rather
+    // than dropped, because leaving csr_file's trap_val input unconnected is
+    // exactly the bug that shipped in cpu.v: mtval latched X on every trap in
+    // hardware while every module-level test passed.
+    wire [31:0] trap_val_unused;
     wire [31:0] trap_target_pc;
     wire [31:0] actual_ex_result;
     wire [6:0] ex_opcode;
@@ -712,8 +738,21 @@ module cpu_pipelined_baseline (
         .external_irq(external_fires),
         .mtvec_out(mtvec_out),
         .mepc_out(mepc_out),
+        // This is a BASELINE: it deliberately has no illegal-instruction or
+        // misaligned-access detection, so the fault inputs are tied off. They
+        // are tied off explicitly rather than left out, because an omitted
+        // named port reads X in Icarus with no error and no warning unless
+        // -Wall is passed, and trap_controller ANDs ex_valid into every fault
+        // term - which would make the baseline's trap priority select on X.
+        .mem_stall(global_mem_stall | stall),
+        .ex_valid(id_ex_valid),
+        .illegal_inst(1'b0),
+        .misalign_load(1'b0),
+        .misalign_store(1'b0),
+        .fault_addr(32'h0),
         .trap_taken(trap_taken),
         .trap_cause(trap_cause),
+        .trap_val(trap_val_unused),
         .trap_pc(trap_pc),
         .mret_exec(mret_exec),
         .flush_if(flush_if),
@@ -737,6 +776,7 @@ module cpu_pipelined_baseline (
         .trap_taken(trap_taken),
         .trap_pc(trap_pc),
         .trap_cause(trap_cause),
+        .trap_val(trap_val_unused),
         .mret_exec(mret_exec),
         .timer_pending(timer_interrupt),
         .external_pending(intc_irq_out),

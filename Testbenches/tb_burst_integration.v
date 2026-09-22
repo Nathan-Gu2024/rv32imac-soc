@@ -98,7 +98,11 @@ module tb_burst_integration;
     reg         rvalid = 1'b0, rlast = 1'b0, bvalid = 1'b0;
     reg  [1:0]  bresp = 2'b00;
 
-    axi_cache_adapter #(.AXI_DATA_WIDTH(AXI_W)) ADP (
+    // TIMEOUT_LIMIT is tiny here on purpose: at the 4000-cycle default a
+    // bench cannot reach the retry path at all, which is how it stayed
+    // untested. Every legitimate transaction in this bench finishes in well
+    // under 100 cycles, so only a deliberately forced stall trips it.
+    axi_cache_adapter #(.AXI_DATA_WIDTH(AXI_W), .TIMEOUT_LIMIT(16'd100)) ADP (
         .clk(clk), .rst(rst),
         .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
         .mem_req_addr(mem_req_addr), .mem_req_lines(mem_req_lines),
@@ -120,6 +124,30 @@ module tb_burst_integration;
     // accepted separately from W, WREADY is held for the whole data phase, and
     // the read channel can restart immediately after RLAST.
     integer beats_left, beats_seen, aw_seen, ar_seen, w_beats;
+    // Slave memory, indexed by 64-bit word. Test 6 asks where each line LANDED,
+    // not merely whether its bytes were transmitted, because the retry defect
+    // puts correct-looking data at the wrong address.
+    reg [AXI_W-1:0] mem64 [0:1023];
+    reg [31:0] wr_addr;             // running byte address through the data phase
+    reg        force_wstall = 1'b0; // test-forced indefinite WREADY stall
+    reg        force_bstall = 1'b0; // test-forced indefinite BVALID withhold
+    // Test 6 snapshot: memory as it stood when the adapter first reported the
+    // transfer complete. Checking later would measure the bench re-presenting the
+    // request, not the adapter's recovery.
+    reg         snap_arm = 1'b0;
+    reg         snap_taken = 1'b0;
+    reg [AXI_W-1:0] snap [0:7];
+    integer     si;
+    always @(posedge clk) begin
+        if (snap_arm && accel_ready && !snap_taken) begin
+            for (si = 0; si < 8; si = si + 1)
+                snap[si] <= mem64[(((32'h7100_0000 >> 3) + si) & 10'h3FF)];
+            snap_taken <= 1'b1;
+            $display("[snap t=%0t] retry=%0d w_beats=%0d m0=%h m1=%h m6=%h m7=%h",
+                     $time, ADP.retry_count, w_beats,
+                     mem64[0], mem64[1], mem64[6], mem64[7]);
+        end
+    end
     integer w_gap;
     reg [AXI_W-1:0] WBEAT [0:255];
     reg [63:0] beat_seed;
@@ -170,12 +198,15 @@ module tb_burst_integration;
                 aw_seen       <= aw_seen + 1;
                 wr_active     <= 1'b1;
                 wr_beats_left <= awlen + 1;
-                wready        <= 1'b1;      // held for the whole data phase
+                wr_addr       <= awaddr;    // INCR burst: advances per beat below
+                wready        <= !force_wstall;
             end
 
             // ---- write data ----
             if (wr_active && wvalid && wready) begin
                 WBEAT[w_beats] <= wdata;          // captured for the data check
+                mem64[wr_addr[12:3]] <= wdata;    // and placed where it belongs
+                wr_addr       <= wr_addr + (AXI_W/8);
                 w_beats       <= w_beats + 1;
                 wr_beats_left <= wr_beats_left - 1;
                 if (wlast || wr_beats_left == 1) begin
@@ -187,12 +218,20 @@ module tb_burst_integration;
                     w_gap  <= 0;
                 end
             end else if (wr_active && !wready && !bvalid) begin
-                if (w_gap >= `WGAP) wready <= 1'b1;
-                else                w_gap  <= w_gap + 1;
+                if (w_gap >= `WGAP && !force_wstall) wready <= 1'b1;
+                else                                 w_gap  <= w_gap + 1;
             end
+
+            // Last word on wready, so it overrides the assignments above. A slave
+            // may deassert WREADY at any time and for any length, which is what
+            // makes this a legal way to provoke the master's timeout.
+            if (force_wstall) wready <= 1'b0;
 
             // ---- write response ----
             if (bvalid && bready) bvalid <= 1'b0;
+            // Last word on bvalid: models the interconnect losing BRESP, which is
+            // the hang the adapter's timeout exists to escape.
+            if (force_bstall) bvalid <= 1'b0;
         end
     end
 
@@ -426,6 +465,92 @@ module tb_burst_integration;
                 if (WBEAT[2*n+1] !== {16'h1111, nn, 16'h2222, nn}) bad5 = bad5 + 1;
             end
             check(bad5 == 0, "every beat carried its OWN line's bytes");
+        end
+
+        // ---------------------------------------------------------------
+        $display("");
+        $display("--- Test 6: 4-line write, BRESP lost, timeout recovery ---");
+        // The adapter abandons a transaction that makes no progress and reissues
+        // it. That is transparent for a SINGLE-line request, which is what the
+        // logic was written for. On a multi-line burst it is not: the requester's
+        // FIFO has already advanced past the lines that were accepted, so a retry
+        // starting again from the original line address writes later lines over
+        // earlier addresses. Checking mem64 per line is what exposes it.
+        w_beats = 0;
+        clr_flags = 1'b1; @(posedge clk); clr_flags = 1'b0;
+        snap_arm = 1'b1; snap_taken = 1'b0;
+        @(negedge clk);
+        accel_req_valid = 1'b1;
+        accel_req_write = 1'b1;
+        accel_req_lines = 8'd4;
+        accel_req_addr  = 32'h7100_0000;
+
+        fork
+            begin : feed6
+                integer g;
+                reg [15:0] ln;
+                reg done6;
+                // done6 rather than saw_accel_ready: that flag is sticky across
+                // tests, and relying on it here made the loop exit before it ever
+                // advanced a line, so the requester presented line 0 four times.
+                done6 = 1'b0;
+                ln = 16'd0;
+                accel_wline = {16'hAAAA, ln, 16'hBBBB, ln,
+                               16'hCCCC, ln, 16'hDDDD, ln};
+                for (g = 0; g < 4000 && !done6; g = g + 1) begin
+                    @(posedge clk);
+                    #1;
+                    if (accel_wnext) begin
+                        ln = ln + 16'd1;
+                        accel_wline = {16'hAAAA, ln, 16'hBBBB, ln,
+                                       16'hCCCC, ln, 16'hDDDD, ln};
+                    end
+                    if (accel_ready) begin
+                        accel_req_valid = 1'b0;   // one transaction, then stop
+                        done6 = 1'b1;
+                    end
+                end
+            end
+            begin : stall6
+                integer g2;
+                // Let the whole data phase land, then swallow BRESP for longer
+                // than TIMEOUT_LIMIT. All four lines are in memory at this point;
+                // only the acknowledgement is missing, which is precisely the
+                // condition the adapter's comment describes.
+                force_bstall = 1'b1;
+                for (g2 = 0; g2 < 2000 && w_beats < 8; g2 = g2 + 1)
+                    @(posedge clk);
+                repeat (160) @(posedge clk);     // > TIMEOUT_LIMIT of 100
+                force_bstall = 1'b0;
+            end
+        join_any
+        // Give the recovery time to complete however it is going to.
+        repeat (400) @(posedge clk);
+        @(negedge clk); accel_req_valid = 1'b0; accel_req_write = 1'b0;
+
+        begin : chk6
+            integer n6, bad6;
+            reg [15:0] n6n;
+            reg [9:0]  base6;
+            bad6  = 0;
+            base6 = 10'h000;   // 0x71000000 >> 3, low bits only
+            base6 = (32'h7100_0000 >> 3);
+            for (n6 = 0; n6 < 4; n6 = n6 + 1) begin
+                n6n = n6[15:0];
+                if (snap[2*n6]   !== {16'hCCCC, n6n, 16'hDDDD, n6n})
+                    bad6 = bad6 + 1;
+                if (snap[2*n6+1] !== {16'hAAAA, n6n, 16'hBBBB, n6n})
+                    bad6 = bad6 + 1;
+            end
+            check(ADP.retry_count > 16'd0, "the timeout actually fired");
+            check(saw_accel_ready,
+                  "the requester was released rather than left hanging");
+            check(snap_taken, "a completion was reported, so memory was sampled");
+            check(bad6 == 0,
+                  "a lost BRESP did not corrupt already-written lines");
+            if (bad6 != 0)
+                $display("        %0d of 8 words wrong; retry_count=%0d",
+                         bad6, ADP.retry_count);
         end
 
         $display("");

@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `include "../src/axi_lite_bridge.v"
+`include "../src/accel_port_join.v"
 
 // Result-DMA test for the Chisel GEMM generator.
 //
@@ -134,6 +135,13 @@ module tb_mm_accel_dma;
         .m_axi_rdata(m_rdata), .m_axi_rresp(m_rresp), .m_axi_rvalid(m_rvalid), .m_axi_rready(m_rready)
     );
 
+    // mm_accel's port is split; accel_port_join below re-serialises it onto the
+    // single-port model this bench already had, which is therefore unchanged.
+    wire        aj_rd_valid, aj_wr_valid, aj_wnext, aj_rd_ready, aj_wr_ready;
+    wire [31:0] aj_rd_addr,  aj_wr_addr;
+    wire [7:0]  aj_rd_lines, aj_wr_lines;
+    wire [127:0] aj_wline, aj_rline;
+
     mm_accel ACCEL (
         .clk(clk), .rst(rst),
         .s_axi_awaddr(m_awaddr), .s_axi_awvalid(m_awvalid), .s_axi_awready(m_awready),
@@ -141,11 +149,12 @@ module tb_mm_accel_dma;
         .s_axi_bresp(m_bresp), .s_axi_bvalid(m_bvalid), .s_axi_bready(m_bready),
         .s_axi_araddr(m_araddr), .s_axi_arvalid(m_arvalid), .s_axi_arready(m_arready),
         .s_axi_rdata(m_rdata), .s_axi_rresp(m_rresp), .s_axi_rvalid(m_rvalid), .s_axi_rready(m_rready),
-        .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
-        .mem_req_addr(mem_req_addr), .mem_wline(mem_wline),
-        .mem_req_lines(mem_req_lines),
-        .mem_wnext(mem_wnext),
-        .mem_rline(128'b0), .mem_ready(mem_ready)
+        .mem_rd_req_valid(aj_rd_valid), .mem_rd_req_addr(aj_rd_addr),
+        .mem_rd_req_lines(aj_rd_lines), .mem_rd_ready(aj_rd_ready),
+        .mem_rline(aj_rline),
+        .mem_wr_req_valid(aj_wr_valid), .mem_wr_req_addr(aj_wr_addr),
+        .mem_wr_req_lines(aj_wr_lines), .mem_wline(aj_wline),
+        .mem_wnext(aj_wnext), .mem_wr_ready(aj_wr_ready)
     );
 
     task do_write(input [31:0] addr, input [31:0] data);
@@ -322,6 +331,57 @@ module tb_mm_accel_dma;
             $display("  strided writeback (stride=%0d bytes) checked", STRIDE);
         end
 
+        // ---- a store after SOFT_RST must still write its whole tile ----
+        //
+        // A REGRESSION GUARD, not fail-first evidence, and the difference is
+        // recorded deliberately. The theory this was written to prove was that
+        // SOFT_RST leaves dmaSent set, and since a store completes when
+        // `dmaSent + wBurstLines >= nGroupsEff`, the next store would finish
+        // early and silently write half a tile. That theory is WRONG: dmaSent is
+        // cleared unconditionally by the dmaStartAny block, so every store start
+        // wipes it. This test passes against the unfixed RTL too, which is how
+        // the theory was caught.
+        //
+        // It stays because the invariant is worth pinning: if anyone moves the
+        // dmaSent clear out of the start block, the truncation becomes real and
+        // this catches it.
+        //
+        // The aborted store is STRIDED on purpose. A contiguous store is a single
+        // transaction - wBurstLines equals nGroups - so dmaSent steps 0 -> 16 at
+        // completion, at the same moment dmaBusy clears, and mid-store it is
+        // still 0. Only a multi-transaction store leaves dmaSent nonzero while
+        // dmaBusy is high, which is the state the guard is about.
+        begin : softrst_case
+            integer sr_lines;
+            do_write(wr(10), DEST);            // DEST_ADDR
+            do_write(wr(11), STRIDE);          // DEST_STRIDE -> multi-transaction
+            do_write(wr(0), 32'd4);            // START_DMA
+            // Let at least one row's transaction retire, so dmaSent advances.
+            repeat (40) @(posedge clk);
+            do_write(wr(0), 32'd2);            // CTRL bit1 = SOFT_RST
+            // SOFT_RST stops the ACCELERATOR, not the memory model - the model
+            // is still mid-burst and keeps consuming lines until burst_left
+            // drains. Those writes must not be counted against the next store,
+            // or the test measures the model's tail rather than the accelerator.
+            while (in_burst) @(posedge clk);
+            repeat (8) @(posedge clk);
+
+            nlines_seen = 0;
+            do_write(wr(10), DEST);
+            do_write(wr(11), 32'd0);
+            do_write(wr(0), 32'd4);            // second, clean store
+            repeat (400) @(posedge clk);
+            sr_lines = nlines_seen;
+
+            if (sr_lines !== NLINE) begin
+                $display("  SOFT_RST TRUNCATED THE NEXT STORE: %0d lines, expected %0d",
+                         sr_lines, NLINE);
+                errors = errors + 1;
+            end else begin
+                $display("  store after SOFT_RST wrote all %0d lines", NLINE);
+            end
+        end
+
         $display("");
         if (errors == 0) $display("=== DIM=%0d K=%0d: DMA CORRECT (%0d lines) ===", DIM, KLEN, NLINE);
         else             $display("=== DIM=%0d K=%0d: %0d DMA ERROR(S) ===", DIM, KLEN, errors);
@@ -333,4 +393,19 @@ module tb_mm_accel_dma;
         $display("TIMEOUT - DMA never asserted DMA_DONE");
         $finish;
     end
+
+    accel_port_join AJ (
+        .clk(clk), .rst(rst),
+        .accel_rd_req_valid(aj_rd_valid), .accel_rd_req_addr(aj_rd_addr),
+        .accel_rd_req_lines(aj_rd_lines), .accel_rd_ready(aj_rd_ready),
+        .accel_rline(aj_rline),
+        .accel_wr_req_valid(aj_wr_valid), .accel_wr_req_addr(aj_wr_addr),
+        .accel_wr_req_lines(aj_wr_lines), .accel_wline(aj_wline),
+        .accel_wnext(aj_wnext), .accel_wr_ready(aj_wr_ready),
+        .mem_req_valid(mem_req_valid), .mem_req_write(mem_req_write),
+        .mem_req_addr(mem_req_addr), .mem_req_lines(mem_req_lines),
+        .mem_wline(mem_wline), .mem_ready(mem_ready),
+        .mem_wnext(mem_wnext), .mem_rline(128'b0)
+    );
+
 endmodule
