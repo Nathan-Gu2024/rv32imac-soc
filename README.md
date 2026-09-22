@@ -6,7 +6,7 @@ Xilinx Zynq-7020 FPGA and taken through an open-source ASIC flow. Includes a
 a Chisel-generated 8×8 INT8 systolic-array GEMM accelerator, and a Zephyr RTOS
 board port.
 
-**190.5 CoreMark @ 60 MHz — 3.17 CoreMark/MHz** on FPGA; a **105× measured
+**190.5 CoreMark @ 60 MHz — 3.17 CoreMark/MHz** on FPGA; a **135× measured
 speedup** on INT8 GEMM against the same core running the same kernel; and a
 **signed-off 10.58 mm² Sky130 GDSII** with eleven SRAM macros, LVS-clean and
 XOR-clean.
@@ -21,7 +21,7 @@ XOR-clean.
 |---|---|
 | CoreMark | **190.49 iterations/sec** @ 60 MHz (2000 iterations, validated run) |
 | CoreMark/MHz | **3.17** |
-| Fmax | 60 MHz, WNS +0.72 ns |
+| Fmax | 60 MHz, WNS +0.144 ns — critical path is reset-net routing (0 logic levels, 97.6% route, fanout 5222), not logic |
 | Utilization | 13% LUT · 6% FF · 22% BRAM · 2% DSP |
 | On-chip power | 1.51 W |
 | ISA | RV32IMAC + Zicsr + Zba, machine mode |
@@ -40,20 +40,68 @@ core. Every figure is a hardware measurement, not a projection.
 | \+ write bursts | 273 | 3.74 | 36.4× |
 | \+ `K_LEN` 16 → 64 | 444 | 9.22 | 77.8× |
 | \+ A-panel reuse | 346 | 11.8 | 99.8× |
-| **\+ INT8 requantized output** | **327** | **12.5** | **105×** |
+| \+ INT8 requantized output | 327 | 12.5 | 105× |
+| **\+ split read/write memory path** | **257** | **15.9** | **135×** |
 
 Rows after `K_LEN` 16 → 64 do four times the arithmetic per tile, which is why
 cycles per tile rise while throughput does.
+
+The last row is the modal value of three board runs, which gave 1030 / 1030 /
+1065 cycles for the 4-tile queued batch — so **257–266 cyc/tile and 130–135×**.
+Earlier rows are single runs and should be read with the same tolerance.
 
 **The comparison is MAC-for-MAC** — 4096 multiply-accumulates either way — but
 the final row writes INT8 where the scalar reference writes INT32, so it is a
 *requantized* INT8 GEMM, not a bare speedup over an identical computation.
 
-The array is busy 78 of those 327 cycles. What remains is memory: an operand
-panel and a result tile share one 128-bit port with both caches, and the port
-is idle while the array computes. Closing that needs two tiles in flight —
-issuing the next panel fetch before the current store — which is the largest
-remaining item and is not implemented.
+The array is busy 78 of those 257 cycles. What remained was memory: an operand panel
+and a result tile shared one 128-bit port with both caches, and the port sat idle
+while the array computed. Closing that needed two tiles in flight — issuing the
+next panel fetch before the current store — and the last row is that change. The
+accelerator's port is now split into independent read and write channels carried
+by `mem_arbiter_rw` and `axi_rw_engine` as independent AXI4 read and write
+transactions, so an operand fetch overlaps a result store.
+
+What is left is the result-write path, and there are two candidate explanations
+with different consequences. `fpga/tests/test_mm_accel.c` times the same 16
+result lines twice, contiguous (one AXI transaction) and strided (eight), because
+the two predict different ratios: a slow write *response*, which the accelerator
+merely waits on and can therefore overlap, scales with transactions (~5×); write
+*acceptance* the memory cannot sustain scales with beats (~3×).
+
+**Measured 3.02× on the board — acceptance-bound. So further overlapping cannot
+help; the next lever is a wider port or the accelerator's own AXI master.**
+
+That number took two attempts, and the first one was not evidence. A single store
+is smaller than the MMIO floor around it: what the test timed was a `CTRL` write
+plus a `STATUS` poll loop, and an AXI4-Lite read costs ~10.15 cycles here, so the
+ratio was really (S_strided + F)/(S_contig + F) — biased toward 1 by the floor F.
+It read 2.86×, which happened to point at the right answer for the wrong reason.
+Averaging each store over 16 repeats divides F out: the contiguous store fell
+116 → 76 cycles, i.e. by the ~40 the floor was estimated at, and the per-line cost
+with it from 7.25 to **4.75 cycles**.
+
+What makes 3.02× trustworthy is not the board alone. `tb_result_dma`, which has no
+DDR and no MMIO floor, independently reports **3.11×** — two models that share no
+error source agreeing to 3%. That matters because averaging introduced a bias of
+its own: 16 back-to-back stores into one buffer enjoy DDR page locality a cold
+single store would not, and the strided figure fell by 102 cycles rather than the
+40 the floor explains. Simulation has no DRAM at all, so its agreement is what
+bounds that bias.
+
+The same floor produced one outright false reading, kept here because it is the
+cheaper lesson. INT8 writeback measured **slower** than INT32 — 127 then 143
+cycles against 116 — despite moving a quarter of the bytes in the same single
+transaction (`nGroups8 = dim²/16` is 4 lines, and `wBurstLines` bursts all of
+them). Two runs of the identical binary differed by 16 cycles on that store while
+every figure above the floor reproduced exactly, which is the floor measuring
+itself: the whole "penalty" was one to two 10.15-cycle poll iterations.
+`scripts/sweep_int8_store.sh` sweeps write-response latency against WREADY
+backpressure over nine combinations and cannot invert the order under any of
+them — backpressure is a per-beat cost, and INT8 moves 8 beats against INT32's
+32, so it makes INT8 relatively *better*. Averaged, the board agrees: **51 vs 76
+cycles, INT8 1.49× faster**, against simulation's 1.8×. Nothing was wrong with
+the design; the measurement could not resolve the difference it was asked about.
 
 ### ASIC — OpenLane / Sky130, RTL-to-GDSII
 
@@ -135,11 +183,14 @@ frequency, which partly self-cancels in this metric.
          SRAM macros, from the same RTL — see "SRAM macros on ASIC" below
                 └──────────────┬───────────────────────┘
                        ┌───────▼────────┐      ┌──────────────────────────────┐
-                       │  mem_arbiter   │      │ MMIO: UART · CLINT · INTC    │
-                       └───────┬────────┘      │       LEDs · MM accelerator  │
-                       ┌───────▼────────┐      └──────────────────────────────┘
-                       │ AXI4 adapter   │──▶ Zynq PS7 / DDR
-                       └────────────────┘
+                       │ mem_arbiter_rw │      │ MMIO: UART · CLINT · INTC    │
+                       │  read · write  │      │       LEDs · MM accelerator  │
+                       └───────┬────────┘      └──────────────────────────────┘
+                       ┌───────▼────────┐    the accelerator is a requester here
+                       │ axi_rw_engine  │    too, on both channels, so an operand
+                       │ AR/R  ·  AW/W  │    fetch overlaps a result store
+                       └───────┬────────┘
+                               └──▶ Zynq PS7 / DDR
 ```
 
 ### Core
@@ -154,6 +205,11 @@ frequency, which partly self-cancels in this metric.
 - **Zba** (`sh1add`/`sh2add`/`sh3add`), selected by profiling which
   bit-manipulation instructions GCC actually emits
 - Machine-mode CSRs, traps, and interrupts (timer + external via CLINT/INTC)
+- **Precise exceptions** with `mcause`/`mepc`/`mtval`: illegal instruction,
+  misaligned load, misaligned store, ECALL and MRET. `mepc` holds the *faulting*
+  instruction rather than the one after it, so a handler that fixes the cause can
+  resume by returning, and `mtval` carries the offending address or instruction
+  word. Confirmed on hardware, not only in simulation.
 
 ### Memory system
 Both L1 caches are **Block RAM-backed**. Their arrays are read synchronously
@@ -208,9 +264,12 @@ It has two interfaces, and the split is the whole design:
 - an **AXI4-Lite slave** for control — a constant-size 23-word register map
   indexed by lane and accumulator rather than one word per element, so the
   window does not grow with `DIM`
-- a **128-bit line port** as a third requester on `mem_arbiter`, sharing the
-  cache path to DRAM, over which it fetches its own operands and writes its own
-  results
+- **two independent 128-bit line ports**, one read and one write, as requesters
+  on `mem_arbiter_rw`, sharing the cache path to DRAM, over which it fetches its
+  own operands and writes its own results. They are separate so that an operand
+  fetch can overlap a result store; `MEM_PATH_RW = 0` in `fpga/rtl/fpga_top.v`
+  rejoins them onto the older single-port path, which is how the two are
+  A/B-compared in simulation and on hardware
 
 Everything that mattered for throughput lives on the second one. Driving 64
 accumulators out through a 32-bit register window costs ~5 cycles of protocol
@@ -223,6 +282,7 @@ existed.
 | INCR bursts, up to 32 lines | one AXI round trip per panel instead of per line |
 | 4-panel B scratchpad | a strip of tiles reloads nothing |
 | Double-buffered panel load | the next panel fills while the current one feeds a run |
+| Queue-driven operand prefetch | tile N+1's B panel loads during tile N's compute — 21% off an A-reuse batch (469 → 371 cyc) |
 | Descriptor queue (8 deep) | a batch of tiles runs with one kick and one poll |
 | A-panel reuse (`bOnly`) | a row of tiles shares one A panel — half the operand traffic |
 | INT8 requantized output | shift/round/saturate on the way out; a tile is 4 lines, not 16 |
@@ -250,6 +310,12 @@ upload, not per tile.
 | Test | Coverage |
 |---|---|
 | `tb_coremark_sim.v` | Full CoreMark against golden CRCs, plus branch/RAS/stall instrumentation |
+| `tb_cpu_trap.v` | Trap delivery at CPU level: illegal instruction, misaligned load/store, and a misaligned load whose result the **next instruction consumes** — the case that coincides with the load-use interlock. Asserts control *reached the handler*, not merely that `mcause` was written |
+| `tb_cpu_b2b.v` | Back-to-back divide, AMO and JALR with **different** operands — same-operand pairs pass against the divide bug |
+| `tb_cpu_interlock.v` | Counts interlock stall cycles, so removing false stalls is proven not to remove real ones |
+| `tb_illegal_inst.v` | Undefined encodings trap instead of decoding as `add` |
+| `tb_trap_stall.v`, `tb_stall_watchdog.v` | Traps taken under memory stalls; watchdog on a pipeline that stops retiring |
+| `tb_echo_ddr.v` | DDR-resident code, both caches, a driven RX pin and a TX echo — the intersection `tb_coremark_sim` (TX only, no interrupts) and `tb_uart_rx` (TCM, no I-cache) each miss |
 | `tb_amo_test.v` | All 9 AMO ops — returned old value and committed memory value (18 checks) |
 | `tb_dcache_hazard.v` | Store→load bypass, byte/halfword merge, dirty eviction + writeback (7 checks) |
 | `tb_alu_mul.v` | MUL/MULH/MULHSU/MULHU, including operands where all three high-forms differ |
@@ -262,7 +328,10 @@ upload, not per tile.
 | `tb_mm_accel_queue.v` | Descriptor queue, and A-panel reuse with the A source **poisoned** in memory |
 | `tb_mem_arbiter.v` | Three-port arbitration, round-robin, burst passthrough |
 | `tb_burst_integration.v` | `mem_arbiter` + `axi_cache_adapter` + an AXI slave, multi-line both directions |
-| `tb_result_dma.v` | Real accelerator through real arbiter and adapter, against a slave with configurable latency and WREADY stalls |
+| `tb_arbiter_rw.v` | `mem_arbiter_rw`'s split rotations, incl. an accelerator read concurrent with an accelerator write |
+| `tb_rw_engine.v` | `axi_rw_engine`'s independent read/write FSMs, and a held `req_valid` across completion producing exactly one transaction |
+| `tb_accel_join.v` | `accel_port_join` re-serialising the split port onto one request, for the `MEM_PATH_RW = 0` fallback |
+| `tb_result_dma.v` | Real accelerator through real arbiter and adapter, against a slave with configurable latency and WREADY stalls. `-DRW_SPLIT` rebuilds the identical stimulus against the `MEM_PATH_RW = 1` chain, so the two hardware configurations are one bench's A/B rather than two loosely related tests |
 
 The cache benches run in **both** memory configurations — inferred Block RAM
 and SRAM macros — from one source, via `-DUSE_SRAM`. At matched geometry the
