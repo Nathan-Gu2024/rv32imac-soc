@@ -45,4 +45,22 @@ config NUM_2ND_LEVEL_AGGREGATORS
 config NUM_IRQS
 	default 20
 
+# Cache maintenance. The GEMM accelerator's DMA moves lines on
+# mem_arbiter's third port, behind the write-back D-cache, so any thread
+# driving it needs flush/invalidate or it reads stale data. There are no
+# cache-maintenance instructions in this core at all, so the implementation
+# is set displacement - see drivers/cache/cache_rv32_5stage.c.
+config CACHE_MANAGEMENT
+	default y
+
+choice CACHE_TYPE
+	default EXTERNAL_CACHE
+endchoice
+
+# dcache_bram.v: LINE_BYTES = 16. Also carried on the cpu@0 node as
+# d-cache-line-size, which is where the arch Kconfig default reads it from;
+# set here too so the value does not depend on which one is consulted first.
+config DCACHE_LINE_SIZE
+	default 16
+
 endif # SOC_RV32_5STAGE

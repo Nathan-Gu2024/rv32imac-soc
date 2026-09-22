@@ -1,0 +1,50 @@
+# Custom RV32IMC 5-stage pipelined RISC-V CPU (Zynq-7020 FPGA soft-core)
+# Cache maintenance by set displacement (src/dcache_bram.v).
+# SPDX-License-Identifier: Apache-2.0
+
+config CACHE_RV32_5STAGE
+	bool "RV32 5-stage set-displacement cache maintenance"
+	default y
+	depends on EXTERNAL_CACHE
+	help
+	  Implements Zephyr's external cache interface for a SoC that has no
+	  cache-maintenance instructions at all - no cbo.*, no fence.i, no
+	  maintenance CSR and no uncached DRAM window.
+
+	  The D-cache is direct-mapped and write-back, so touching an address
+	  that maps to the same set as a target line displaces it and the
+	  existing writeback path pushes it to DRAM. That is the only
+	  mechanism available, and it is what makes the GEMM accelerator's DMA
+	  coherent with CPU-visible memory.
+
+	  Note that invalidate cannot be separated from flush here: a
+	  displacement always writes a dirty line back. See the comment at the
+	  top of cache_rv32_5stage.c for the call ordering that makes DMA
+	  destinations safe.
+
+if CACHE_RV32_5STAGE
+
+config CACHE_RV32_5STAGE_DCACHE_BYTES
+	int "Total D-cache size in bytes"
+	default 16384
+	help
+	  DC_NUM_SETS * 16 from src/cpu.v: 16384 for the FPGA build (1024
+	  sets, the default) and 8192 for the ASIC build, which sets
+	  DC_NUM_SETS=512 via SYNTH_PARAMETERS.
+
+	  This value is the address offset that maps to the same cache set, so
+	  the displacement walk depends on it exactly. Getting it wrong is not
+	  symmetric:
+
+	    too LARGE  - still correct, as long as it is a MULTIPLE of the real
+	                 size. 16384 works on an 8 KB cache because 16384 =
+	                 2 * 8192, so the alias still lands in the same set.
+	    too SMALL  - silently broken. The alias lands in a different set,
+	                 displaces nothing, and the DMA reads stale data with
+	                 no error anywhere.
+
+	  So when in doubt round UP to the largest geometry the RTL is ever
+	  built with. The default is deliberately the FPGA size for that
+	  reason - it is also valid for the ASIC build.
+
+endif # CACHE_RV32_5STAGE

@@ -72,6 +72,33 @@ static void rv32_5stage_intc_intr_enable(const struct device *dev, unsigned int 
 	const struct rv32_5stage_intc_config *cfg = dev->config;
 	uint32_t enable = sys_read32(cfg->base + RV32_5STAGE_INTC_ENABLE_REG);
 
+	/* Discard any edge this source latched while it was masked, BEFORE
+	 * unmasking it.
+	 *
+	 * intc.v latches edges unconditionally, independent of ENABLE, so a
+	 * source that fired while masked leaves PENDING set and the very first
+	 * enable delivers that stale event immediately. The concrete case in this
+	 * SoC: the accelerator's irq_dma goes high once per tile during a queued
+	 * batch and software deliberately leaves source 3 masked (see cpu.v's
+	 * note), so PENDING[3] accumulates edges from every batch ever run. The
+	 * first time anything enables source 3 for a standalone DMA, the ISR would
+	 * fire before that DMA even started and signal completion on a buffer
+	 * nothing had written.
+	 *
+	 * This is deliberately fixed here rather than by gating intc.v's latch
+	 * with ENABLE, which looks equivalent and is not. irq_edge is
+	 * `irq_in & ~irq_in_prev`, and irq_in_prev advances every cycle whether
+	 * the source is enabled or not - so for a STICKY-LEVEL source (every DONE
+	 * bit in this design) an assertion during the masked window would set
+	 * irq_in_prev, produce no edge after unmasking, and the interrupt would be
+	 * lost permanently. Losing an event is worse than replaying a stale one,
+	 * and intc.v's "never missed" guarantee is worth keeping.
+	 *
+	 * Write-1-to-clear, and intc.v:78 merges the clear with the same cycle's
+	 * new edges, so a genuine event arriving exactly here is not dropped.
+	 */
+	sys_write32(BIT(irq), cfg->base + RV32_5STAGE_INTC_PENDING_REG);
+
 	sys_write32(enable | BIT(irq), cfg->base + RV32_5STAGE_INTC_ENABLE_REG);
 }
 
