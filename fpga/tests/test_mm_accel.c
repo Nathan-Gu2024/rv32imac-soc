@@ -212,7 +212,17 @@ static int8_t dma_bq[QTILES][16 * KSTAGE] __attribute__((aligned(PANEL_ALIGN)));
  * (1024 sets x 16 B = 16 KB). */
 #define DC_SETS  1024
 #define DC_LINE  16
-static volatile uint8_t evict_buf[DC_SETS * DC_LINE] __attribute__((aligned(16)));
+/* Aligned to the WHOLE cache, not merely to a line.
+ *
+ * The full walk below does not care: it touches DC_SETS consecutive lines, so
+ * it covers every set whatever offset it starts at. The RANGE walk does care,
+ * because it indexes by set number - evict_buf[set * DC_LINE] only lands in
+ * `set` if the buffer itself starts at set 0. At 16-byte alignment it starts
+ * at an arbitrary set, every range flush displaces the wrong one, and nothing
+ * reports an error: the load succeeds, the target line stays dirty, and the
+ * accelerator reads stale operands. */
+static volatile uint8_t evict_buf[DC_SETS * DC_LINE]
+    __attribute__((aligned(DC_SETS * DC_LINE)));
 
 /* Force dirty lines back to DRAM by displacing them.
  *
@@ -227,6 +237,32 @@ static void dcache_evict(void) {
     volatile uint8_t sink = 0;
     for (int i = 0; i < DC_SETS * DC_LINE; i += DC_LINE)
         sink ^= evict_buf[i];
+    (void)sink;
+}
+
+/* Same mechanism, bounded to the sets a given range actually occupies.
+ *
+ * The cache is direct-mapped, so an address's set is just a slice of it and
+ * only the sets the buffer covers can be holding its lines. Walking all 1024
+ * regardless is O(cache) work for what is nearly always an O(range) problem:
+ * a dim=8 result tile is 256 bytes = 16 lines, so this is 16 displacements
+ * rather than 1024.
+ *
+ * Whether that is worth much depends entirely on the range - 64x fewer lines
+ * for a result tile, 16x for the operand panels, 4x for the four queued B
+ * panels - so it is not one speedup number, and the per-site figures are
+ * reported below where they are measured.
+ *
+ * Note this takes a length in bytes and rounds the start DOWN to a line, so a
+ * partially-covered first line is still flushed. */
+static void dcache_flush_range(const void *p, unsigned int len) {
+    volatile uint8_t sink = 0;
+    uintptr_t a   = (uintptr_t)p & ~((uintptr_t)DC_LINE - 1u);
+    uintptr_t end = (uintptr_t)p + len;
+    for (; a < end; a += DC_LINE) {
+        unsigned int set = (unsigned int)((a / DC_LINE) & (DC_SETS - 1u));
+        sink ^= evict_buf[set * DC_LINE];
+    }
     (void)sink;
 }
 
@@ -317,7 +353,7 @@ int main() {
      * DRAM behind the cache, so whatever the cache holds for those addresses is
      * stale by construction - and "untouched therefore uncached" stopped being
      * true once a cache-sized buffer joined .bss. */
-    dcache_evict();
+    dcache_flush_range((const void *)RESULT_BUF, (unsigned int)(dim * dim * 4));
 
     /* The pointer dump and the buf[0..3] trace that used to sit here were for
      * diagnosing the coherence failure described above, which is now fixed and
@@ -397,19 +433,27 @@ int main() {
     t1 = CLINT_MTIME;
     uint32_t c_mmio = t1 - t0 - probe;
 
+    /* Every store below is timed over this many repeats and divided. See
+     * scripts/amortize_store_timing.py: one store is smaller than the MMIO
+     * floor around it, and two wrong conclusions came out of measuring it
+     * once. */
+    #define STORE_REPS 16
+
     /* Readback through the 128-bit DMA line port.
      *
      * Timed WITHOUT reading the destination back. The transfer time is what is
      * being measured, and reading would pull 64 lines into the D-cache, which
      * both perturbs a repeat measurement and runs into the coherence
      * constraint documented above. Correctness was already proven earlier. */
-    t0 = CLINT_MTIME;
     ACCEL_DEST_ADDR   = RESULT_BUF;
     ACCEL_DEST_STRIDE = dim * 4;
-    ACCEL_CTRL        = CTRL_START_DMA;
-    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    t0 = CLINT_MTIME;
+    for (int r = 0; r < STORE_REPS; r++) {
+        ACCEL_CTRL = CTRL_START_DMA;
+        while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    }
     t1 = CLINT_MTIME;
-    uint32_t c_dma = t1 - t0 - probe;
+    uint32_t c_dma = (t1 - t0 - probe) / STORE_REPS;
 
     /* Same 16 lines, STRIDED destination - the discriminator for why a result
      * write costs ~3x more per line than an operand read.
@@ -427,13 +471,15 @@ int main() {
      * overlap; the second is bandwidth that simply is not there. Measuring
      * only the contiguous case cannot separate them, which is exactly why this
      * second measurement exists. */
-    t0 = CLINT_MTIME;
     ACCEL_DEST_ADDR   = RESULT_BUF;
     ACCEL_DEST_STRIDE = dim * 4 * 2;
-    ACCEL_CTRL        = CTRL_START_DMA;
-    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    t0 = CLINT_MTIME;
+    for (int r = 0; r < STORE_REPS; r++) {
+        ACCEL_CTRL = CTRL_START_DMA;
+        while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    }
     t1 = CLINT_MTIME;
-    uint32_t c_dma_strided = t1 - t0 - probe;
+    uint32_t c_dma_strided = (t1 - t0 - probe) / STORE_REPS;
     ACCEL_DEST_STRIDE = dim * 4;      /* restore contiguous for later tests */
 
     /* Requantized INT8 writeback of the SAME accumulators.
@@ -450,17 +496,19 @@ int main() {
      * the expected value is (i+1)*(j+1) - 1..64, inside INT8 with no clipping,
      * and different in every position so a mis-packed line cannot pass. */
     ACCEL_OUT_CTRL    = OUT_INT8 | 6u;
-    t0 = CLINT_MTIME;
     ACCEL_DEST_ADDR   = RESULT_BUF;
     ACCEL_DEST_STRIDE = 0;
-    ACCEL_CTRL        = CTRL_START_DMA;
-    while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    t0 = CLINT_MTIME;
+    for (int r = 0; r < STORE_REPS; r++) {
+        ACCEL_CTRL = CTRL_START_DMA;
+        while (!(ACCEL_STATUS & ST_DMA_DONE)) {}
+    }
     t1 = CLINT_MTIME;
-    uint32_t c_dma8 = t1 - t0 - probe;
+    uint32_t c_dma8 = (t1 - t0 - probe) / STORE_REPS;
     ACCEL_OUT_CTRL    = 0;                /* back to INT32 for what follows */
     ACCEL_DEST_STRIDE = dim * 4;
 
-    dcache_evict();
+    dcache_flush_range((const void *)RESULT_BUF, (unsigned int)(dim * dim));
     volatile int8_t *r8 = (volatile int8_t *)RESULT_BUF;
     int bad_q = 0;
     for (int i = 0; i < dim; i++)
@@ -475,7 +523,8 @@ int main() {
     uart_print("operand load        "); uart_print_int32((int32_t)c_load); uart_print("\r\n");
     uart_print("compute             "); uart_print_int32((int32_t)c_comp); uart_print("\r\n");
     uart_print("readback (MMIO)     "); uart_print_int32((int32_t)c_mmio); uart_print("\r\n");
-    uart_print("readback (DMA)      "); uart_print_int32((int32_t)c_dma);  uart_print("\r\n");
+    uart_print("readback (DMA)      "); uart_print_int32((int32_t)c_dma);
+    uart_print("   (mean of 16; a single store is below the MMIO floor)\r\n");
 
     uart_print("readback (DMA,int8)  "); uart_print_int32((int32_t)c_dma8);
     uart_print("\r\n");
@@ -635,6 +684,20 @@ int main() {
     t1 = CLINT_MTIME;
     uint32_t c_evict = t1 - t0 - probe;
 
+    /* Same work, bounded walk. The operands have to be dirtied again first:
+     * the walk above already displaced them, so timing the range version on a
+     * clean cache would measure nothing and flatter it enormously. */
+    for (int lane = 0; lane < dim; lane++)
+        for (int k = 0; k < lane_pitch; k++) {
+            dma_a[lane * lane_pitch + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
+            dma_b[lane * lane_pitch + k] = (int8_t)((k < kperf) ? (lane + 1) : 0);
+        }
+    t0 = CLINT_MTIME;
+    dcache_flush_range(dma_a, (unsigned int)(dim * lane_pitch));
+    dcache_flush_range(dma_b, (unsigned int)(dim * lane_pitch));
+    t1 = CLINT_MTIME;
+    uint32_t c_evict_range = t1 - t0 - probe;
+
     ACCEL_A_SRC      = (uint32_t)(uintptr_t)dma_a;
     ACCEL_B_SRC      = (uint32_t)(uintptr_t)dma_b;
     ACCEL_SRC_STRIDE = lane_pitch;      /* packed -> single burst per panel */
@@ -676,7 +739,13 @@ int main() {
         uart_print_int32((int32_t)((c_load * 100) / c_opdma));
         uart_print("\r\n");
     }
-    uart_print("cache evict (once)  "); uart_print_int32((int32_t)c_evict); uart_print("\r\n");
+    uart_print("cache evict (full)  "); uart_print_int32((int32_t)c_evict); uart_print("\r\n");
+    uart_print("cache evict (range) "); uart_print_int32((int32_t)c_evict_range); uart_print("\r\n");
+    if (c_evict_range) {
+        uart_print("  range cheaper x100 ");
+        uart_print_int32((int32_t)((c_evict * 100) / c_evict_range));
+        uart_print("\r\n");
+    }
 
     /* ---- double buffering: prefetch panel 1 while computing from panel 0 ----
      * B-only load (CTRL bit4) leaves aRowBuf alone, which is what makes it safe
@@ -749,7 +818,10 @@ int main() {
                 dma_bq[p][lane * lane_pitch + k] =
                     (int8_t)((k < kperf) ? (lane + 1 + p) : 0);
 
-    dcache_evict();
+    /* dma_a plus the four staged B panels - everything the queue will read. */
+    dcache_flush_range(dma_a, (unsigned int)(dim * lane_pitch));
+    for (int p = 0; p < QTILES; p++)
+        dcache_flush_range(dma_bq[p], (unsigned int)(dim * lane_pitch));
 
     /* ---- STEPPED: software drives every phase, as before ---- */
     t0 = CLINT_MTIME;
@@ -807,8 +879,13 @@ int main() {
     t1 = CLINT_MTIME;
     uint32_t c_queued = t1 - t0 - probe;
 
-    /* The DMA wrote DRAM behind the cache, so evict before reading it back. */
-    dcache_evict();
+    /* The DMA wrote DRAM behind the cache, so displace before reading it back.
+     * The tiles are 0x1000 apart, so one range call per tile rather than one
+     * spanning call - a single range covering all four would be 16 KB, i.e.
+     * the whole cache, and no cheaper than the full walk. */
+    for (int p = 0; p < QTILES; p++)
+        dcache_flush_range((const void *)(QRESULT_BUF + p * 0x1000),
+                           (unsigned int)(dim * dim));
 
     int q_bad = 0;
     for (int p = 0; p < QTILES; p++) {
